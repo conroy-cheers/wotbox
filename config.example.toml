@@ -1,0 +1,20 @@
+listen_address = "127.0.0.1"
+port = 8780
+base_path = "/"
+database_path = "./wotbox.sqlite"
+
+[trackers.ops]
+kind = "ops"
+base_url = "https://orpheus.network"
+token_file = "./ops-token"
+
+[download_clients.music]
+kind = "qbittorrent"
+base_url = "http://127.0.0.1:8001"
+api_key_file = "./qbit-api-key"
+
+[download_profiles.ops]
+client = "music"
+save_path = "/mnt/media/Downloads/torrent/complete/ops"
+tag = "ops"
+start_paused = false

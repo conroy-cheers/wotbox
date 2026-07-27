@@ -1,0 +1,13 @@
+/target
+/frontend/node_modules
+/frontend/dist
+/.env
+/.direnv
+/.envrc.local
+/.playwright-cli
+/.state
+/output/playwright
+/result
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
