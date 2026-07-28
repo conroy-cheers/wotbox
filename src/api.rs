@@ -24,14 +24,15 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::{
     config::{Config, DownloadClientKind, TrackerKind},
     db::{Cached, Database},
+    dedupe::{compute_raw_coverage, track_index_from_group},
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
         ArtistCredit, ArtistCreditSource, ArtistRole, CanonicalDownload, CanonicalTorrent,
-        ClientDownloadState, CreateDownload, DownloadJob, DownloadProfile, DownloadState,
-        DownloadsPage, LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage,
-        LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState,
-        LiveDownloadStatus, Provenance, PublicConfig, ReleaseDetail, ReleaseSummary,
-        RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant,
+        ClientDownloadState, CreateDownload, DeduplicationIndexStatus, DownloadJob,
+        DownloadProfile, DownloadState, DownloadsPage, LibraryArtistPage, LibraryArtistSummary,
+        LibraryArtistsPage, LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease,
+        LibraryVariantState, LiveDownloadStatus, Provenance, PublicConfig, ReleaseDetail,
+        ReleaseSummary, RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant,
     },
     qbittorrent::{DownloadClient, QbittorrentClient},
     tracker::{
@@ -109,6 +110,7 @@ impl AppState {
             announce_hosts,
         });
         state.db.recover_resolving_links().await?;
+        state.db.recover_track_indexes().await?;
         seed_existing_job_links(&state).await?;
         Ok(state)
     }
@@ -292,6 +294,7 @@ async fn search(
     {
         let mut response = envelope(tracker_name, cached, false);
         enrich_search_downloads(&state, &mut response.data).await?;
+        enrich_search_deduplication(&state, tracker_name, &mut response.data).await?;
         return Ok(Json(response));
     }
     match tracker.search(&request).await {
@@ -308,6 +311,7 @@ async fn search(
             )
             .await?;
             enrich_search_downloads(&state, &mut value).await?;
+            enrich_search_deduplication(&state, tracker_name, &mut value).await?;
             Ok(Json(ApiEnvelope {
                 data: value,
                 provenance: provenance(tracker_name, cached.fetched_at, false),
@@ -318,6 +322,7 @@ async fn search(
                 .await?
                 .0;
             enrich_search_downloads(&state, &mut response.data).await?;
+            enrich_search_deduplication(&state, tracker_name, &mut response.data).await?;
             Ok(Json(response))
         }
     }
@@ -353,6 +358,9 @@ async fn group(
     }
     match tracker.group(id).await {
         Ok((mut value, raw)) => {
+            let track_index = track_index_from_group(&tracker_name, &value, &raw);
+            state.db.enqueue_track_index(&tracker_name, id).await?;
+            state.db.put_track_index(&track_index).await?;
             cache_release_detail(&state.db, &value).await?;
             let cached = store(
                 &state.db,
@@ -623,6 +631,7 @@ async fn load_library_releases(state: &AppState) -> Result<Vec<LibraryRelease>, 
             }
         })
         .collect::<Vec<_>>();
+    enrich_release_coverages(state, &mut releases).await?;
     sort_library_releases(&mut releases, "year_desc");
     Ok(releases)
 }
@@ -726,6 +735,7 @@ fn artist_summary(
 }
 
 fn build_artist_summaries<'a>(releases: &'a [LibraryRelease]) -> Vec<LibraryArtistSummary> {
+    type ArtistGroupKey = (String, String, String, Option<i64>, ArtistCreditSource);
     let primary_artists = releases
         .iter()
         .filter(|release| !is_compilation(&release.release))
@@ -733,10 +743,7 @@ fn build_artist_summaries<'a>(releases: &'a [LibraryRelease]) -> Vec<LibraryArti
         .filter(|artist| artist.role == ArtistRole::Primary)
         .map(|artist| (artist.tracker.to_ascii_lowercase(), artist.key.clone()))
         .collect::<HashSet<_>>();
-    let mut grouped: HashMap<
-        (String, String, String, Option<i64>, ArtistCreditSource),
-        Vec<&'a LibraryRelease>,
-    > = HashMap::new();
+    let mut grouped: HashMap<ArtistGroupKey, Vec<&'a LibraryRelease>> = HashMap::new();
     for release in releases
         .iter()
         .filter(|release| !is_compilation(&release.release))
@@ -813,6 +820,33 @@ async fn library_index_status(
     state: &AppState,
     releases: &[LibraryRelease],
 ) -> Result<LibraryIndexStatus, AppError> {
+    let mut deduplication = DeduplicationIndexStatus::default();
+    for release in releases.iter().filter(|release| {
+        release
+            .release
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+    }) {
+        deduplication.total += 1;
+        if release.release.album_coverage.is_some() {
+            deduplication.checked += 1;
+            deduplication.hidden += 1;
+            continue;
+        }
+        match state
+            .db
+            .get_single_coverage(&release.release.tracker, release.release.group_id)
+            .await?
+            .map(|stored| stored.state)
+            .as_deref()
+        {
+            Some("ready") => deduplication.checked += 1,
+            Some("resolving") => deduplication.resolving += 1,
+            Some("failed") => deduplication.failed += 1,
+            _ => deduplication.pending += 1,
+        }
+    }
     Ok(LibraryIndexStatus {
         last_successful_scan_at: state.db.last_successful_download_scan().await?,
         unresolved_credits: releases
@@ -825,6 +859,7 @@ async fn library_index_status(
                     .all(|artist| artist.source == ArtistCreditSource::DisplayFallback)
             })
             .count(),
+        deduplication,
     })
 }
 
@@ -1422,6 +1457,275 @@ pub fn spawn_download_indexer(state: Arc<AppState>) {
     });
 }
 
+pub fn spawn_deduplication_indexer(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = resolve_due_track_indexes(&state).await {
+                tracing::warn!(%error, "single deduplication indexing pass failed");
+            }
+            if let Err(error) = recompute_single_coverages(&state).await {
+                tracing::warn!(%error, "single album coverage recomputation failed");
+            }
+        }
+    });
+}
+
+async fn seed_catalog_deduplication(
+    state: &AppState,
+    tracker: &str,
+    catalog: &ArtistCatalogPage,
+) -> Result<()> {
+    state
+        .db
+        .replace_catalog_memberships(tracker, catalog)
+        .await?;
+    for group in catalog.groups.iter().filter(|group| {
+        group.roles.contains(&ArtistCatalogRole::Primary)
+            && group.listed_on_tracker
+            && !group.variants.is_empty()
+            && group.release.release_type.as_deref().is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("single") || kind.eq_ignore_ascii_case("album")
+            })
+    }) {
+        let is_album = group
+            .release
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("album"));
+        state
+            .db
+            .enqueue_track_index_with_priority(
+                tracker,
+                group.release.group_id,
+                if is_album { 20 } else { 0 },
+            )
+            .await?;
+        if group
+            .release
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        {
+            state
+                .db
+                .ensure_single_coverage(tracker, group.release.group_id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn seed_single_deduplication(state: &AppState, tracker: &str, group_id: i64) -> Result<()> {
+    state.db.enqueue_track_index(tracker, group_id).await?;
+    state.db.ensure_single_coverage(tracker, group_id).await
+}
+
+async fn resolve_due_track_indexes(state: &Arc<AppState>) -> Result<()> {
+    for job in state.db.due_track_indexes(1).await? {
+        let Some(tracker) = state.trackers.get(&job.tracker) else {
+            continue;
+        };
+        state
+            .db
+            .set_track_index_resolving(&job.tracker, job.group_id)
+            .await?;
+        let result: Result<()> = async {
+            let (detail, raw) = tracker.group(job.group_id).await?;
+            let index = track_index_from_group(&job.tracker, &detail, &raw);
+            cache_release_detail(&state.db, &detail).await?;
+            let now = Utc::now();
+            state
+                .db
+                .put_snapshot(
+                    &job.tracker,
+                    "group",
+                    &job.group_id.to_string(),
+                    &detail,
+                    &raw,
+                    now,
+                    now + ChronoDuration::hours(24),
+                )
+                .await?;
+            state.db.put_track_index(&index).await?;
+
+            if detail
+                .release
+                .release_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+            {
+                state
+                    .db
+                    .ensure_single_coverage(&job.tracker, job.group_id)
+                    .await?;
+                let artist_ids = detail
+                    .release
+                    .artists
+                    .iter()
+                    .filter(|artist| artist.role == ArtistRole::Primary)
+                    .filter_map(|artist| artist.artist_id)
+                    .collect::<HashSet<_>>();
+                for artist_id in artist_ids {
+                    let key = artist_id.to_string();
+                    let catalog = if let Some(cached) = state
+                        .db
+                        .get_snapshot::<ArtistCatalogPage>(&job.tracker, "artist", &key)
+                        .await?
+                        .filter(|cached| cached.expires_at > Utc::now())
+                    {
+                        cached.value
+                    } else {
+                        let (catalog, raw) = tracker.artist_catalog(artist_id).await?;
+                        cache_artist_catalog(&state.db, &catalog).await?;
+                        let now = Utc::now();
+                        state
+                            .db
+                            .put_snapshot(
+                                &job.tracker,
+                                "artist",
+                                &key,
+                                &catalog,
+                                &raw,
+                                now,
+                                now + ChronoDuration::hours(24),
+                            )
+                            .await?;
+                        catalog
+                    };
+                    seed_catalog_deduplication(state, &job.tracker, &catalog).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let rate_limited = error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("rate limit");
+            state
+                .db
+                .fail_track_index(&job.tracker, job.group_id, &error.to_string())
+                .await?;
+            tracing::warn!(
+                tracker = %job.tracker,
+                group_id = job.group_id,
+                %error,
+                "release track indexing failed"
+            );
+            if rate_limited {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn recompute_single_coverages(state: &Arc<AppState>) -> Result<()> {
+    let memberships = state.db.list_catalog_memberships().await?;
+    let indexes = state
+        .db
+        .list_track_indexes()
+        .await?
+        .into_iter()
+        .map(|index| ((index.tracker.clone(), index.group_id), index))
+        .collect::<HashMap<_, _>>();
+    let mut groups: HashMap<(String, i64), (ArtistCatalogRelease, HashSet<i64>)> = HashMap::new();
+    for membership in memberships
+        .into_iter()
+        .filter(|membership| membership.group.roles.contains(&ArtistCatalogRole::Primary))
+    {
+        let key = (
+            membership.group.release.tracker.clone(),
+            membership.group.release.group_id,
+        );
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| (membership.group.clone(), HashSet::new()));
+        entry.1.insert(membership.artist_id);
+    }
+    let albums = groups
+        .iter()
+        .filter(|(_, (group, _))| {
+            group.listed_on_tracker
+                && !group.variants.is_empty()
+                && group
+                    .release
+                    .release_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("album"))
+        })
+        .collect::<Vec<_>>();
+    for ((tracker, group_id), (_single, single_artists)) in
+        groups.iter().filter(|(_, (group, _))| {
+            group.listed_on_tracker
+                && group
+                    .release
+                    .release_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        })
+    {
+        state.db.ensure_single_coverage(tracker, *group_id).await?;
+        let candidates = albums
+            .iter()
+            .filter(|((album_tracker, _), (_, artists))| {
+                album_tracker.eq_ignore_ascii_case(tracker) && !single_artists.is_disjoint(artists)
+            })
+            .collect::<Vec<_>>();
+        let required = std::iter::once((tracker.clone(), *group_id))
+            .chain(candidates.iter().map(|(key, _)| (*key).clone()))
+            .collect::<Vec<_>>();
+        let states = required
+            .iter()
+            .filter_map(|key| indexes.get(key))
+            .map(|index| index.state.as_str())
+            .collect::<Vec<_>>();
+        if states.len() != required.len()
+            || states
+                .iter()
+                .any(|state| matches!(*state, "pending" | "resolving"))
+        {
+            state
+                .db
+                .put_single_coverage(tracker, *group_id, "pending", None)
+                .await?;
+            continue;
+        }
+        if states.contains(&"failed") {
+            state
+                .db
+                .put_single_coverage(tracker, *group_id, "failed", None)
+                .await?;
+            continue;
+        }
+        let Some(single_index) = indexes
+            .get(&(tracker.clone(), *group_id))
+            .and_then(|index| index.index.as_ref())
+        else {
+            continue;
+        };
+        let album_indexes = candidates
+            .iter()
+            .filter_map(|(key, (group, _))| {
+                indexes
+                    .get(*key)
+                    .and_then(|index| index.index.clone())
+                    .map(|index| (index, group.clone()))
+            })
+            .collect::<Vec<_>>();
+        let coverage = compute_raw_coverage(single_index, &album_indexes);
+        state
+            .db
+            .put_single_coverage(tracker, *group_id, "ready", Some(&coverage))
+            .await?;
+    }
+    Ok(())
+}
+
 async fn scan_download_clients(state: &Arc<AppState>) -> Result<()> {
     const PAGE_SIZE: u32 = 200;
     for (name, client) in &state.download_clients {
@@ -1474,7 +1778,7 @@ async fn resolve_due_links(state: &Arc<AppState>) -> Result<()> {
             .or_insert_with(Vec::new)
             .push(link);
     }
-    for ((tracker_name, info_hash), links) in batches.into_iter().take(25) {
+    for ((tracker_name, info_hash), links) in batches.into_iter().take(5) {
         let Some(tracker) = state.trackers.get(&tracker_name) else {
             continue;
         };
@@ -1583,6 +1887,7 @@ async fn cache_search_canonical(db: &Database, tracker: &str, page: &SearchPage)
             year: group.year,
             artwork: group.image.clone(),
             release_type: group.release_type.clone(),
+            album_coverage: None,
         };
         for torrent in &group.torrents {
             let canonical = CanonicalTorrent {
@@ -1801,6 +2106,115 @@ async fn enrich_artist_catalog(
         .filter(|group| group.roles.contains(&ArtistCatalogRole::Primary))
         .count();
     catalog.appearance_count = catalog.groups.len().saturating_sub(catalog.primary_count);
+    seed_catalog_deduplication(state, tracker, catalog).await?;
+    let preferences = state.db.get_runtime_preferences().await?;
+    let mut status = DeduplicationIndexStatus::default();
+    for group in &mut catalog.groups {
+        if group
+            .release
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        {
+            annotate_single_coverage(
+                state,
+                tracker,
+                group.release.group_id,
+                &preferences.release,
+                &mut group.release.album_coverage,
+                &mut status,
+            )
+            .await?;
+        }
+    }
+    catalog.deduplication = status;
+    Ok(())
+}
+
+async fn enrich_release_coverages(
+    state: &AppState,
+    releases: &mut [LibraryRelease],
+) -> Result<(), AppError> {
+    let preferences = state.db.get_runtime_preferences().await?;
+    let mut ignored = DeduplicationIndexStatus::default();
+    for release in releases {
+        if release
+            .release
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        {
+            let tracker = release.release.tracker.clone();
+            annotate_single_coverage(
+                state,
+                &tracker,
+                release.release.group_id,
+                &preferences.release,
+                &mut release.release.album_coverage,
+                &mut ignored,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn enrich_search_deduplication(
+    state: &AppState,
+    tracker: &str,
+    page: &mut SearchPage,
+) -> Result<(), AppError> {
+    let preferences = state.db.get_runtime_preferences().await?;
+    let mut status = DeduplicationIndexStatus::default();
+    for group in &mut page.groups {
+        if group
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        {
+            annotate_single_coverage(
+                state,
+                tracker,
+                group.group_id,
+                &preferences.release,
+                &mut group.album_coverage,
+                &mut status,
+            )
+            .await?;
+        }
+    }
+    page.deduplication = status;
+    Ok(())
+}
+
+async fn annotate_single_coverage(
+    state: &AppState,
+    tracker: &str,
+    group_id: i64,
+    preferences: &crate::model::ReleasePreferences,
+    target: &mut Option<crate::model::AlbumCoverage>,
+    status: &mut DeduplicationIndexStatus,
+) -> Result<(), AppError> {
+    status.total += 1;
+    seed_single_deduplication(state, tracker, group_id).await?;
+    let Some(stored) = state.db.get_single_coverage(tracker, group_id).await? else {
+        status.pending += 1;
+        return Ok(());
+    };
+    match stored.state.as_str() {
+        "ready" => {
+            status.checked += 1;
+            *target = stored
+                .coverage
+                .and_then(|coverage| coverage.resolve(preferences));
+            if target.is_some() {
+                status.hidden += 1;
+            }
+        }
+        "resolving" => status.resolving += 1,
+        "failed" => status.failed += 1,
+        _ => status.pending += 1,
+    }
     Ok(())
 }
 
@@ -1957,6 +2371,9 @@ async fn refresh_group(state: Arc<AppState>, tracker_name: String, id: i64) -> R
         .get(&tracker_name)
         .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
     let (detail, raw) = tracker.group(id).await?;
+    let track_index = track_index_from_group(&tracker_name, &detail, &raw);
+    state.db.enqueue_track_index(&tracker_name, id).await?;
+    state.db.put_track_index(&track_index).await?;
     cache_release_detail(&state.db, &detail).await?;
     let now = Utc::now();
     state
@@ -1980,6 +2397,7 @@ async fn refresh_artist_catalog(state: Arc<AppState>, tracker_name: String, id: 
         .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
     let (catalog, raw) = tracker.artist_catalog(id).await?;
     cache_artist_catalog(&state.db, &catalog).await?;
+    seed_catalog_deduplication(&state, &tracker_name, &catalog).await?;
     let now = Utc::now();
     state
         .db
@@ -2238,6 +2656,7 @@ mod tests {
                 year: None,
                 artwork: None,
                 release_type: None,
+                album_coverage: None,
             },
             variants: Vec::new(),
             availability: LibraryAvailability::Present,

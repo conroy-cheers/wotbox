@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -62,7 +62,7 @@ impl GazelleTrackerClient {
             base_url,
             token: read_secret(&config.token_file)?,
             client,
-            limiter: Arc::new(RateLimiter::new(5, Duration::from_secs(10))),
+            limiter: Arc::new(RateLimiter::new(1, Duration::from_secs(2))),
         })
     }
 
@@ -143,6 +143,7 @@ impl TrackerClient for GazelleTrackerClient {
             total_pages: value_i64(&response, &["pages"]).unwrap_or(1),
             total_results: value_i64(&response, &["resultsCount", "totalResults"]),
             groups,
+            deduplication: Default::default(),
         };
         Ok((page, sanitized(raw)))
     }
@@ -266,6 +267,7 @@ fn normalize_group(value: &Value) -> Option<SearchGroup> {
         image: value_string(value, &["cover", "image"]),
         tags,
         torrents,
+        album_coverage: None,
     })
 }
 
@@ -335,6 +337,7 @@ fn normalize_artist_catalog(
         groups,
         primary_count,
         appearance_count,
+        deduplication: Default::default(),
     })
 }
 
@@ -509,6 +512,7 @@ fn normalize_release_summary(tracker: &str, group_id: i64, group: &Value) -> Rel
         year: value_i64(group, &["year", "groupYear"]),
         artwork: value_string(group, &["wikiImage", "cover", "image"]),
         release_type: value_string(group, &["releaseTypeName", "releaseType"]),
+        album_coverage: None,
     }
 }
 
@@ -678,7 +682,7 @@ fn tracker_error(body: &Value) -> String {
 }
 
 pub fn search_cache_key(request: &SearchRequest) -> String {
-    let mut values = HashMap::new();
+    let mut values = BTreeMap::new();
     values.insert("query", request.query.clone().unwrap_or_default());
     values.insert("artist", request.artist.clone().unwrap_or_default());
     values.insert(
@@ -709,6 +713,16 @@ mod tests {
     use crate::config::{TrackerConfig, TrackerKind};
 
     use super::*;
+
+    #[test]
+    fn search_cache_keys_are_deterministic() {
+        let request = SearchRequest {
+            query: Some("Rockabye".into()),
+            artist: Some("Clean Bandit".into()),
+            ..Default::default()
+        };
+        assert_eq!(search_cache_key(&request), search_cache_key(&request));
+    }
 
     #[test]
     fn normalizes_browse_groups() {

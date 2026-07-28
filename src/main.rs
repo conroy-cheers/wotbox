@@ -1,12 +1,15 @@
 mod api;
 mod config;
 mod db;
+mod dedupe;
 mod model;
 mod qbittorrent;
 mod tracker;
 
 use anyhow::{Context, Result};
-use api::{AppState, router, spawn_download_indexer, spawn_reconciler};
+use api::{
+    AppState, router, spawn_deduplication_indexer, spawn_download_indexer, spawn_reconciler,
+};
 use clap::Parser;
 use config::{Cli, Config};
 use tower_http::{
@@ -24,6 +27,7 @@ async fn main() -> Result<()> {
     let state = AppState::new(&config).await?;
     spawn_reconciler(state.clone());
     spawn_download_indexer(state.clone());
+    spawn_deduplication_indexer(state.clone());
 
     let app = router(state)
         .layer(CompressionLayer::new())

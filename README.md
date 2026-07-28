@@ -45,6 +45,14 @@ completed releases. Artist membership comes only from structured Gazelle
 primary and guest credits, with the tracker's exact display artist used as a
 temporary fallback while group metadata is enriched.
 
+Browsing views progressively suppress Singles whose complete tracker file
+lists are covered by one or more quality-eligible Albums from the same primary
+artist. Matching is exact after conservative filename normalization, with only
+bounded typo tolerance; version qualifiers and numbered parts remain distinct.
+Unresolved matches stay visible, and each release list can temporarily reveal
+confirmed matches and their covering Albums. Operational Downloads and
+Dashboard views are never filtered.
+
 ## Development
 
 For ordinary local development against the music qBittorrent instance on

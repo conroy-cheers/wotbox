@@ -4,6 +4,7 @@
   import { Disc3, Search as SearchIcon, SlidersHorizontal } from "@lucide/svelte";
   import { api, appPath, type Envelope, type PublicConfig, type SearchGroup, type SearchPage, type SearchTorrent } from "../lib/api";
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
+  import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import StaleNotice from "../lib/StaleNotice.svelte";
@@ -26,6 +27,7 @@
   let tracker = $state(initialValues.tracker);
   let submitted = $state(initialValues.submitted);
   let selected = $state<{ group: SearchGroup; torrent: SearchTorrent } | null>(null);
+  let showRedundantSingles = $state(false);
 
   const config = createQuery({
     queryKey: ["config"],
@@ -43,7 +45,8 @@
     return {
       queryKey: ["search", values],
       queryFn: () => api<Envelope<SearchPage>>(`/api/v1/search?${params}`),
-      enabled: Boolean(values.submitted)
+      enabled: Boolean(values.submitted),
+      refetchInterval: 5_000
     };
   });
   const results = createQuery(resultOptions);
@@ -59,7 +62,20 @@
     if (media) params.set("media", media);
     if (tracker) params.set("tracker", tracker);
     history.replaceState(null, "", `${location.pathname}?${params}`);
+    showRedundantSingles = false;
     searchValues.set({ submitted, query, artist, year, format, media, tracker });
+  }
+
+  function visibleGroups(groups: SearchGroup[]): SearchGroup[] {
+    return showRedundantSingles ? groups : groups.filter((group) => !group.albumCoverage);
+  }
+
+  function coveredCount(groups: SearchGroup[]): number {
+    return groups.filter((group) => group.albumCoverage).length;
+  }
+
+  function coverageTitle(group: SearchGroup): string {
+    return group.albumCoverage?.albums.map((album) => album.title).join(", ") ?? "";
   }
 </script>
 
@@ -114,6 +130,13 @@
 
 <StaleNotice provenance={$results.data?.provenance} />
 
+{#if $results.data?.data.deduplication}
+  <DeduplicationProgress
+    status={$results.data.data.deduplication}
+    detail="Singles remain visible until their tracker track lists are confidently matched."
+  />
+{/if}
+
 {#if !submitted}
   <div class="search-welcome">
     <SlidersHorizontal size={32} />
@@ -129,10 +152,17 @@
 {:else if $results.data?.data.groups.length}
   <div class="result-summary">
     <span>{$results.data.data.totalResults?.toLocaleString() ?? $results.data.data.groups.length} results</span>
-    <span>Page {$results.data.data.currentPage} of {$results.data.data.totalPages}</span>
+    <div class="result-summary-actions">
+      {#if coveredCount($results.data.data.groups)}
+        <button class="secondary-button compact-button" onclick={() => showRedundantSingles = !showRedundantSingles}>
+          {showRedundantSingles ? "Hide" : "Show"} {coveredCount($results.data.data.groups)} album-covered {coveredCount($results.data.data.groups) === 1 ? "single" : "singles"}
+        </button>
+      {/if}
+      <span>Page {$results.data.data.currentPage} of {$results.data.data.totalPages}</span>
+    </div>
   </div>
   <div class="result-list">
-    {#each $results.data.data.groups as group}
+    {#each visibleGroups($results.data.data.groups) as group}
       <article class="release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(group.releaseType)}`}>
         <div class="cover">
           <Disc3 size={36} />
@@ -151,7 +181,19 @@
             <div>
               <p>{group.artist ?? "Various artists"}</p>
               <h2><a href={appPath(`/releases/${$results.data.provenance.tracker}/${group.groupId}`)}>{group.name}</a></h2>
-              <span>{[group.year, group.releaseType].filter(Boolean).join(" · ")}</span>
+              <span>
+                {[group.year, group.releaseType].filter(Boolean).join(" · ")}
+                {#if group.albumCoverage}
+                  <span class="album-coverage-badge" title={`Covered by ${coverageTitle(group)}`}>
+                    {group.albumCoverage.confidence === "fuzzy" ? "Likely included on albums" : "Included on albums"}
+                  </span>
+                  <span class="album-coverage-links">
+                    {#each group.albumCoverage.albums as album, index}
+                      {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}`)}>{album.title}</a>
+                    {/each}
+                  </span>
+                {/if}
+              </span>
             </div>
             <div class="tag-list">
               {#each group.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}

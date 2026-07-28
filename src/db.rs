@@ -10,9 +10,10 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+use crate::dedupe::{CatalogMembership, RawSingleCoverage, ReleaseTrackIndex};
 use crate::model::{
-    ArtistCreditSource, CanonicalTorrent, DownloadIndexCounts, DownloadJob, DownloadState,
-    LiveDownloadStatus, RuntimePreferences,
+    ArtistCatalogPage, ArtistCreditSource, CanonicalTorrent, DownloadIndexCounts, DownloadJob,
+    DownloadState, LiveDownloadStatus, RuntimePreferences,
 };
 
 #[derive(Clone)]
@@ -44,6 +45,24 @@ pub struct LibraryRecord {
     pub completed_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub missing_since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackIndexJob {
+    pub tracker: String,
+    pub group_id: i64,
+}
+
+pub struct StoredTrackIndex {
+    pub tracker: String,
+    pub group_id: i64,
+    pub state: String,
+    pub index: Option<ReleaseTrackIndex>,
+}
+
+pub struct StoredCoverage {
+    pub state: String,
+    pub coverage: Option<RawSingleCoverage>,
 }
 
 impl Database {
@@ -117,6 +136,273 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn enqueue_track_index(&self, tracker: &str, group_id: i64) -> Result<()> {
+        self.enqueue_track_index_with_priority(tracker, group_id, 10)
+            .await
+    }
+
+    pub async fn enqueue_track_index_with_priority(
+        &self,
+        tracker: &str,
+        group_id: i64,
+        priority: i64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO release_track_indexes (tracker, group_id, state, priority, updated_at)
+             VALUES (?, ?, 'pending', ?, ?)
+             ON CONFLICT (tracker, group_id) DO UPDATE SET
+                priority = MAX(release_track_indexes.priority, excluded.priority),
+                state = CASE
+                    WHEN release_track_indexes.expires_at IS NOT NULL
+                     AND release_track_indexes.expires_at <= excluded.updated_at
+                    THEN 'pending'
+                    ELSE release_track_indexes.state
+                END,
+                next_retry_at = CASE
+                    WHEN release_track_indexes.expires_at IS NOT NULL
+                     AND release_track_indexes.expires_at <= excluded.updated_at
+                    THEN NULL
+                    ELSE release_track_indexes.next_retry_at
+                END,
+                updated_at = CASE
+                    WHEN release_track_indexes.expires_at IS NOT NULL
+                     AND release_track_indexes.expires_at <= excluded.updated_at
+                    THEN excluded.updated_at
+                    ELSE release_track_indexes.updated_at
+                END",
+        )
+        .bind(tracker)
+        .bind(group_id)
+        .bind(priority)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn ensure_single_coverage(&self, tracker: &str, group_id: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO single_album_coverages
+                (tracker, single_group_id, state, updated_at)
+             VALUES (?, ?, 'pending', ?)
+             ON CONFLICT (tracker, single_group_id) DO NOTHING",
+        )
+        .bind(tracker)
+        .bind(group_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn due_track_indexes(&self, limit: i64) -> Result<Vec<TrackIndexJob>> {
+        let rows = sqlx::query(
+            "SELECT tracker, group_id FROM release_track_indexes
+             WHERE state IN ('pending', 'failed')
+               AND (next_retry_at IS NULL OR next_retry_at <= ?)
+             ORDER BY priority DESC, updated_at ASC LIMIT ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TrackIndexJob {
+                tracker: row.get("tracker"),
+                group_id: row.get("group_id"),
+            })
+            .collect())
+    }
+
+    pub async fn set_track_index_resolving(&self, tracker: &str, group_id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE release_track_indexes
+             SET state = 'resolving', updated_at = ?
+             WHERE tracker = ? AND group_id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(tracker)
+        .bind(group_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn put_track_index(&self, index: &ReleaseTrackIndex) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE release_track_indexes SET
+                state = 'indexed', index_json = ?, attempts = 0,
+                next_retry_at = NULL, error_message = NULL,
+                fetched_at = ?, expires_at = ?, updated_at = ?
+             WHERE tracker = ? AND group_id = ?",
+        )
+        .bind(serde_json::to_string(index)?)
+        .bind(now.to_rfc3339())
+        .bind((now + chrono::Duration::hours(24)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(&index.tracker)
+        .bind(index.group_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn fail_track_index(
+        &self,
+        tracker: &str,
+        group_id: i64,
+        message: &str,
+    ) -> Result<()> {
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT attempts FROM release_track_indexes WHERE tracker = ? AND group_id = ?",
+        )
+        .bind(tracker)
+        .bind(group_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let delay = chrono::Duration::seconds((30_i64 * (1_i64 << attempts.min(7))).min(3600));
+        sqlx::query(
+            "UPDATE release_track_indexes SET
+                state = 'failed', attempts = attempts + 1,
+                next_retry_at = ?, error_message = ?, updated_at = ?
+             WHERE tracker = ? AND group_id = ?",
+        )
+        .bind((Utc::now() + delay).to_rfc3339())
+        .bind(message.chars().take(500).collect::<String>())
+        .bind(Utc::now().to_rfc3339())
+        .bind(tracker)
+        .bind(group_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn recover_track_indexes(&self) -> Result<()> {
+        sqlx::query(
+            "UPDATE release_track_indexes
+             SET state = 'pending', next_retry_at = NULL, updated_at = ?
+             WHERE state = 'resolving'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn replace_catalog_memberships(
+        &self,
+        tracker: &str,
+        catalog: &ArtistCatalogPage,
+    ) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM dedupe_catalog_memberships WHERE tracker = ? AND artist_id = ?")
+            .bind(tracker)
+            .bind(catalog.artist.artist_id)
+            .execute(&mut *transaction)
+            .await?;
+        let now = Utc::now().to_rfc3339();
+        for group in &catalog.groups {
+            sqlx::query(
+                "INSERT INTO dedupe_catalog_memberships
+                    (tracker, artist_id, group_id, group_json, updated_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(tracker)
+            .bind(catalog.artist.artist_id)
+            .bind(group.release.group_id)
+            .bind(serde_json::to_string(group)?)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_catalog_memberships(&self) -> Result<Vec<CatalogMembership>> {
+        let rows = sqlx::query("SELECT artist_id, group_json FROM dedupe_catalog_memberships")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(CatalogMembership {
+                    artist_id: row.get("artist_id"),
+                    group: serde_json::from_str(row.get("group_json"))?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_track_indexes(&self) -> Result<Vec<StoredTrackIndex>> {
+        let rows =
+            sqlx::query("SELECT tracker, group_id, state, index_json FROM release_track_indexes")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|row| {
+                let value: Option<&str> = row.get("index_json");
+                Ok(StoredTrackIndex {
+                    tracker: row.get("tracker"),
+                    group_id: row.get("group_id"),
+                    state: row.get("state"),
+                    index: value.map(serde_json::from_str).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn put_single_coverage(
+        &self,
+        tracker: &str,
+        group_id: i64,
+        state: &str,
+        coverage: Option<&RawSingleCoverage>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO single_album_coverages
+                (tracker, single_group_id, state, coverage_json, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (tracker, single_group_id) DO UPDATE SET
+                state = excluded.state,
+                coverage_json = excluded.coverage_json,
+                updated_at = excluded.updated_at",
+        )
+        .bind(tracker)
+        .bind(group_id)
+        .bind(state)
+        .bind(coverage.map(serde_json::to_string).transpose()?)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_single_coverage(
+        &self,
+        tracker: &str,
+        group_id: i64,
+    ) -> Result<Option<StoredCoverage>> {
+        let row = sqlx::query(
+            "SELECT state, coverage_json FROM single_album_coverages
+             WHERE tracker = ? AND single_group_id = ?",
+        )
+        .bind(tracker)
+        .bind(group_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let value: Option<&str> = row.get("coverage_json");
+            Ok(StoredCoverage {
+                state: row.get("state"),
+                coverage: value.map(serde_json::from_str).transpose()?,
+            })
+        })
+        .transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1003,6 +1289,7 @@ mod tests {
                 year: Some(2020),
                 artwork: None,
                 release_type: Some("Album".into()),
+                album_coverage: None,
             },
             variant: TorrentVariant {
                 tracker: "ops".into(),

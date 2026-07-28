@@ -41,6 +41,8 @@ pub struct SearchPage {
     pub total_pages: i64,
     pub total_results: Option<i64>,
     pub groups: Vec<SearchGroup>,
+    #[serde(default)]
+    pub deduplication: DeduplicationIndexStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -54,6 +56,42 @@ pub struct SearchGroup {
     pub image: Option<String>,
     pub tags: Vec<String>,
     pub torrents: Vec<SearchTorrent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_coverage: Option<AlbumCoverage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumReference {
+    pub tracker: String,
+    pub group_id: i64,
+    pub title: String,
+    pub year: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageConfidence {
+    Exact,
+    Fuzzy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumCoverage {
+    pub albums: Vec<AlbumReference>,
+    pub confidence: CoverageConfidence,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeduplicationIndexStatus {
+    pub checked: usize,
+    pub total: usize,
+    pub pending: usize,
+    pub resolving: usize,
+    pub failed: usize,
+    pub hidden: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -278,6 +316,8 @@ pub struct ReleaseSummary {
     pub year: Option<i64>,
     pub artwork: Option<String>,
     pub release_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_coverage: Option<AlbumCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
@@ -429,6 +469,8 @@ pub struct LibraryArtistSummary {
 pub struct LibraryIndexStatus {
     pub last_successful_scan_at: Option<DateTime<Utc>>,
     pub unresolved_credits: usize,
+    #[serde(default)]
+    pub deduplication: DeduplicationIndexStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -491,6 +533,8 @@ pub struct ArtistCatalogPage {
     pub groups: Vec<ArtistCatalogRelease>,
     pub primary_count: usize,
     pub appearance_count: usize,
+    #[serde(default)]
+    pub deduplication: DeduplicationIndexStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -620,7 +664,7 @@ pub fn value_bool(value: &Value, keys: &[&str]) -> bool {
 
 #[cfg(test)]
 mod preference_tests {
-    use super::ReleasePreferences;
+    use super::{DeduplicationIndexStatus, ReleasePreferences};
 
     #[test]
     fn default_cutoff_accepts_lossless_and_hi_res_only() {
@@ -640,5 +684,17 @@ mod preference_tests {
         let mut preferences = ReleasePreferences::default();
         preferences.media_tiers[1].push("web".into());
         assert!(preferences.validate().is_err());
+    }
+
+    #[test]
+    fn old_deduplication_statuses_default_new_progress_fields() {
+        let status: DeduplicationIndexStatus =
+            serde_json::from_str(r#"{"pending":3,"resolving":1,"failed":0,"hidden":2}"#)
+                .expect("old cached status should remain readable");
+
+        assert_eq!(status.checked, 0);
+        assert_eq!(status.total, 0);
+        assert_eq!(status.pending, 3);
+        assert_eq!(status.hidden, 2);
     }
 }

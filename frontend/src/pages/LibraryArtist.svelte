@@ -9,12 +9,14 @@
   import { derived, writable } from "svelte/store";
   import { untrack } from "svelte";
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
+  import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import StaleNotice from "../lib/StaleNotice.svelte";
   import {
     api,
     appPath,
+    type ArtistCatalogPage,
     type ArtistCatalogRelease,
     type ArtistCatalogRole,
     type DownloadSelection,
@@ -29,6 +31,7 @@
   const format = writable("");
   const ownership = writable("all");
   const sort = writable("year_desc");
+  const showRedundantSingles = writable(false);
   let selected = $state<DownloadSelection | null>(null);
 
   const artist = createQuery({
@@ -43,16 +46,17 @@
     const artistId = $artist.data?.artist.artistId;
     return {
       queryKey: ["artist-catalog", initialTracker, artistId] as const,
-      queryFn: () => api<Envelope<{ artist: { tracker: string; artistId: number; name: string; artwork?: string }; groups: ArtistCatalogRelease[]; primaryCount: number; appearanceCount: number }>>(
+      queryFn: () => api<Envelope<ArtistCatalogPage>>(
         `/api/v1/artists/${encodeURIComponent(initialTracker)}/${artistId}/releases`
       ),
       enabled: artistId != null,
-      staleTime: 60_000
+      staleTime: 60_000,
+      refetchInterval: 5_000
     };
   });
   const catalog = createQuery(catalogOptions);
 
-  const groups = derived(
+  const filteredGroups = derived(
     [artist, catalog, search, format, ownership, sort],
     ([$artist, $catalog, $search, $format, $ownership, $sort]) => {
       const catalogGroups = $catalog.data?.data.groups;
@@ -104,6 +108,16 @@
       }
       return items;
     }
+  );
+  const hiddenSingles = derived(filteredGroups, ($groups) =>
+    $groups.filter((group) => group.release.albumCoverage).length
+  );
+  const groups = derived(
+    [filteredGroups, showRedundantSingles],
+    ([$groups, $showRedundantSingles]) =>
+      $showRedundantSingles
+        ? $groups
+        : $groups.filter((group) => !group.release.albumCoverage)
   );
   const primaryGroups = derived(groups, ($groups) =>
     $groups.filter((group) => group.roles.includes("primary"))
@@ -188,6 +202,13 @@
 
   <StaleNotice provenance={$catalog.data?.provenance} />
 
+  {#if $catalog.data?.data.deduplication}
+    <DeduplicationProgress
+      status={$catalog.data.data.deduplication}
+      detail="Singles remain visible until their tracker track lists are confidently matched."
+    />
+  {/if}
+
   <section class="library-controls artist-controls" aria-label="Artist release filters">
     <label class="library-search">
       <Search size={17} />
@@ -224,14 +245,21 @@
   </section>
 
   {#snippet releaseSection(title: string, items: ArtistCatalogRelease[], appearances = false)}
-    {#if items.length}
+    {#if items.length || (!appearances && $hiddenSingles)}
       <section class="artist-discography">
         <div class="discography-heading">
           <div>
             <p class="eyebrow">{appearances ? "Collaborations and credits" : "Discography"}</p>
             <h2>{title}</h2>
           </div>
-          <span>{items.length} {items.length === 1 ? "release" : "releases"}</span>
+          <div class="discography-actions">
+            {#if !appearances && $hiddenSingles}
+              <button class="secondary-button compact-button" onclick={() => $showRedundantSingles = !$showRedundantSingles}>
+                {$showRedundantSingles ? "Hide" : "Show"} {$hiddenSingles} album-covered {$hiddenSingles === 1 ? "single" : "singles"}
+              </button>
+            {/if}
+            <span>{items.length} {items.length === 1 ? "release" : "releases"}</span>
+          </div>
         </div>
         <div class="result-list artist-catalog-list">
           {#each items as group}
@@ -251,7 +279,19 @@
                       {#if !group.listedOnTracker}<span class="availability-warning"><AlertTriangle size={12} /> Library only</span>{/if}
                     </p>
                     <h3><a href={appPath(`/releases/${group.release.tracker}/${group.release.groupId}?from=library`)}>{group.release.title}</a></h3>
-                    <span>{[group.release.year, group.release.releaseType].filter(Boolean).join(" · ") || "Release details unavailable"}</span>
+                    <span>
+                      {[group.release.year, group.release.releaseType].filter(Boolean).join(" · ") || "Release details unavailable"}
+                      {#if group.release.albumCoverage}
+                        <span class="album-coverage-badge" title={`Covered by ${group.release.albumCoverage.albums.map((album) => album.title).join(", ")}`}>
+                          {group.release.albumCoverage.confidence === "fuzzy" ? "Likely included on albums" : "Included on albums"}
+                        </span>
+                        <span class="album-coverage-links">
+                          {#each group.release.albumCoverage.albums as album, index}
+                            {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}?from=library`)}>{album.title}</a>
+                          {/each}
+                        </span>
+                      {/if}
+                    </span>
                   </div>
                   <div class="tag-list">
                     {#each group.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}
@@ -276,7 +316,7 @@
   {@render releaseSection("Primary releases", $primaryGroups)}
   {@render releaseSection("Appearances", $appearanceGroups, true)}
 
-  {#if !$groups.length}
+  {#if !$groups.length && !$hiddenSingles}
     <div class="search-welcome">
       <Disc3 size={34} />
       <h2>No releases match these filters</h2>

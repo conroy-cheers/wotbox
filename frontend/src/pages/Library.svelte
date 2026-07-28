@@ -11,6 +11,7 @@
     type LibraryAvailability,
     type PublicConfig
   } from "../lib/api";
+  import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
 
   const search = writable("");
@@ -18,6 +19,7 @@
   const format = writable("");
   const availability = writable("all");
   const limit = writable(1000);
+  let showRedundantSingles = $state(false);
 
   const config = createQuery({
     queryKey: ["config"],
@@ -34,7 +36,8 @@
       return {
         queryKey: ["library", $search, $tracker, $format, $availability, $limit] as const,
         queryFn: () => api<LibraryArtistsPage>(`/api/v1/library/artists?${params}`),
-        staleTime: 30_000
+        staleTime: 30_000,
+        refetchInterval: 5_000
       };
     }
   );
@@ -59,6 +62,14 @@
     if (value === "partial") return "Partially missing";
     if (value === "missing") return "Missing";
     return "Available";
+  }
+
+  function visibleReleases(items: LibraryArtistsPage["releases"]) {
+    return showRedundantSingles ? items : items.filter((item) => !item.release.albumCoverage);
+  }
+
+  function coveredCount(items: LibraryArtistsPage["releases"]): number {
+    return items.filter((item) => item.release.albumCoverage).length;
   }
 </script>
 
@@ -116,6 +127,13 @@
       {$library.data.index.unresolvedCredits === 1 ? "release" : "releases"}
     {/if}
   </p>
+{/if}
+
+{#if $library.data?.index.deduplication}
+  <DeduplicationProgress
+    status={$library.data.index.deduplication}
+    detail="Unresolved singles remain visible while tracker track lists are indexed."
+  />
 {/if}
 
 {#if $library.isError}
@@ -187,10 +205,15 @@
     <section class="section">
       <div class="section-heading">
         <div><p class="eyebrow">Release matches</p><h2>{$library.data.releaseTotal} {$library.data.releaseTotal === 1 ? "release" : "releases"}</h2></div>
+        {#if coveredCount($library.data.releases)}
+          <button class="secondary-button compact-button" onclick={() => showRedundantSingles = !showRedundantSingles}>
+            {showRedundantSingles ? "Hide" : "Show"} {coveredCount($library.data.releases)} album-covered {coveredCount($library.data.releases) === 1 ? "single" : "singles"}
+          </button>
+        {/if}
       </div>
-      {#if $library.data.releases.length}
+      {#if visibleReleases($library.data.releases).length}
         <div class="library-release-grid">
-          {#each $library.data.releases as item}
+          {#each visibleReleases($library.data.releases) as item}
             <article class="library-release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
               <a class="cover" href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?from=library`)}>
                 <Disc3 size={28} />
@@ -200,7 +223,19 @@
               </a>
               <div>
                 <h3><a href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?from=library`)}>{item.release.title}</a></h3>
-                <p>{item.release.artist ?? "Unknown artist"} · {[item.release.year, item.release.releaseType].filter(Boolean).join(" · ")}</p>
+                <p>
+                  {item.release.artist ?? "Unknown artist"} · {[item.release.year, item.release.releaseType].filter(Boolean).join(" · ")}
+                  {#if item.release.albumCoverage}
+                    <span class="album-coverage-badge" title={`Covered by ${item.release.albumCoverage.albums.map((album) => album.title).join(", ")}`}>
+                      {item.release.albumCoverage.confidence === "fuzzy" ? "Likely included on albums" : "Included on albums"}
+                    </span>
+                    <span class="album-coverage-links">
+                      {#each item.release.albumCoverage.albums as album, index}
+                        {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}?from=library`)}>{album.title}</a>
+                      {/each}
+                    </span>
+                  {/if}
+                </p>
                 <div class="variant-chips">
                   {#each item.variants as variant}
                     <a href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?torrent=${variant.torrentId}&from=library`)}>

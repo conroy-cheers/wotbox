@@ -54,6 +54,7 @@ export type SearchGroup = {
   image?: string;
   tags: string[];
   torrents: SearchTorrent[];
+  albumCoverage?: AlbumCoverage;
 };
 
 export type SearchPage = {
@@ -61,6 +62,28 @@ export type SearchPage = {
   totalPages: number;
   totalResults?: number;
   groups: SearchGroup[];
+  deduplication: DeduplicationIndexStatus;
+};
+
+export type AlbumReference = {
+  tracker: string;
+  groupId: number;
+  title: string;
+  year?: number;
+};
+
+export type AlbumCoverage = {
+  albums: AlbumReference[];
+  confidence: "exact" | "fuzzy";
+};
+
+export type DeduplicationIndexStatus = {
+  checked: number;
+  total: number;
+  pending: number;
+  resolving: number;
+  failed: number;
+  hidden: number;
 };
 
 export type DownloadProfile = {
@@ -117,6 +140,7 @@ export type ReleaseSummary = {
   year?: number;
   artwork?: string;
   releaseType?: string;
+  albumCoverage?: AlbumCoverage;
 };
 
 export type ArtistCredit = {
@@ -212,6 +236,7 @@ export type LibraryArtistSummary = {
 export type LibraryIndexStatus = {
   lastSuccessfulScanAt?: string;
   unresolvedCredits: number;
+  deduplication: DeduplicationIndexStatus;
 };
 
 export type LibraryArtistsPage = {
@@ -259,6 +284,7 @@ export type ArtistCatalogPage = {
   groups: ArtistCatalogRelease[];
   primaryCount: number;
   appearanceCount: number;
+  deduplication: DeduplicationIndexStatus;
 };
 
 export type DownloadState =

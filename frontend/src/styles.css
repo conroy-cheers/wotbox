@@ -125,6 +125,7 @@ main { margin-left: 240px; width: min(1220px, calc(100% - 240px)); padding: 54px
   border-radius: 8px; padding: 9px 10px; outline: 0;
 }
 .result-summary { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin: 24px 3px 10px; }
+.result-summary-actions, .discography-actions { display: flex; align-items: center; gap: 9px; }
 .result-list { display: grid; gap: 0; margin-top: 16px; }
 .result-summary + .result-list { margin-top: 0; }
 .release-card { display: flex; gap: 8px; padding: 7px 9px; border: 1px solid var(--line); border-bottom-width: 0; border-radius: 0; background: var(--panel); }
@@ -207,6 +208,14 @@ main { margin-left: 240px; width: min(1220px, calc(100% - 240px)); padding: 54px
 .library-badge { color: #8fd8b3; background: rgba(110,214,160,.1); }
 .missing-badge { color: #e2c77d; background: rgba(148,111,36,.12); }
 .role-badge { margin-left: 5px; color: #c4b6ff; background: rgba(168,149,255,.12); }
+.album-coverage-badge {
+  display: inline-flex; margin-left: 6px; padding: 2px 5px; border: 1px solid rgba(74, 222, 128, .22);
+  border-radius: 999px; color: #9deeb7; background: rgba(74, 222, 128, .08);
+  font-size: 8px; font-weight: 800; letter-spacing: .025em; text-transform: uppercase; vertical-align: 1px;
+}
+.album-coverage-links { margin-left: 5px; color: var(--muted); font-size: 9px; }
+.album-coverage-links::before { content: "on "; }
+.album-coverage-links a { color: var(--muted-strong); text-decoration: underline; text-decoration-color: rgba(255,255,255,.18); }
 .download-button {
   display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--line);
   border-radius: 8px; background: #1d202a; cursor: pointer;
@@ -465,10 +474,20 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
 .index-banner p { margin: 0; font-size: 11px; line-height: 1.5; }
 .index-banner strong { color: var(--text); margin-right: 5px; }
 .index-pulse { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 rgba(168,149,255,.45); animation: pulse 1.8s infinite; }
+.deduplication-progress { align-items: flex-start; }
+.deduplication-progress .index-pulse { margin-top: 4px; }
+.deduplication-progress-body { flex: 1; min-width: 0; }
+.deduplication-progress-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.deduplication-progress-heading > span { flex: 0 0 auto; color: var(--text); font-size: 10px; font-variant-numeric: tabular-nums; }
+.deduplication-progress-track { height: 4px; margin-top: 8px; overflow: hidden; border-radius: 99px; background: #292d37; }
+.deduplication-progress-track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#7664d5,#b4a6ff); transition: width .25s ease; }
+.deduplication-progress-meta { display: flex; gap: 10px; margin-top: 5px; color: var(--muted); font-size: 9px; }
+.deduplication-progress-meta .warning { color: #e2c77d; }
 .artist-discography { margin-top: 24px; }
 .discography-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 15px; margin: 0 2px 10px; }
 .discography-heading h2 { margin: 2px 0 0; font-size: 23px; letter-spacing: -.025em; }
 .discography-heading > span { color: var(--muted); font-size: 10px; }
+.discography-actions > span { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .artist-catalog-list { margin-top: 0; }
 .catalog-release-card .cover { width: 40px; height: 40px; }
 .compact-button { justify-self: end; padding: 6px 8px; font-size: 9px; }
