@@ -23,7 +23,14 @@
   let useToken = $state(false);
   let selectedProfile = $state("");
   let initializedTorrent = $state<number | null>(null);
+  let submittedJob = $state<DownloadJob | null>(null);
+  let monitorError = $state("");
+  let monitorGeneration = 0;
   const queryClient = useQueryClient();
+  const processing = $derived(
+    submittedJob !== null
+      && ["queued", "fetching_metadata", "submitting"].includes(submittedJob.state)
+  );
 
   const profiles = createQuery({
     queryKey: ["download-profiles"],
@@ -52,19 +59,78 @@
         headers: { "Idempotency-Key": crypto.randomUUID() },
         body: JSON.stringify(request)
       }),
-    onSuccess: async () => {
-      initializedTorrent = null;
-      onclose();
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["downloads"] }),
-        queryClient.invalidateQueries({ queryKey: ["library-artist"] }),
-        queryClient.invalidateQueries({ queryKey: ["artist-catalog"] }),
-        queryClient.invalidateQueries({ queryKey: ["search"] })
-      ]);
+    onSuccess: (job) => {
+      submittedJob = job;
+      monitorError = "";
+      void monitorDownload(job);
     }
   });
 
+  function statusMessage(state: DownloadJob["state"]): string {
+    switch (state) {
+      case "queued": return "Queued for processing…";
+      case "fetching_metadata": return "Checking release metadata…";
+      case "submitting": return "Submitting to qBittorrent…";
+      default: return "Waiting for qBittorrent…";
+    }
+  }
+
+  async function monitorDownload(initial: DownloadJob) {
+    const generation = ++monitorGeneration;
+    let job = initial;
+    try {
+      while (["queued", "fetching_metadata", "submitting"].includes(job.state)) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        if (generation !== monitorGeneration) return;
+        job = await api<DownloadJob>(`/api/v1/download-jobs/${job.id}`);
+        if (generation !== monitorGeneration) return;
+        submittedJob = job;
+      }
+      if (job.state === "active" || job.state === "complete") {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["downloads"] }),
+          queryClient.invalidateQueries({ queryKey: ["library-artist"] }),
+          queryClient.invalidateQueries({ queryKey: ["artist-catalog"] }),
+          queryClient.invalidateQueries({ queryKey: ["search"] })
+        ]);
+        if (generation === monitorGeneration) finish();
+      } else if (job.state !== "failed") {
+        monitorError = "Wotbox returned an unknown download state. The download may not have been submitted.";
+      }
+    } catch (error) {
+      if (generation === monitorGeneration) {
+        monitorError = error instanceof Error
+          ? `Could not confirm the download status: ${error.message}`
+          : "Could not confirm the download status.";
+      }
+    }
+  }
+
+  function submit() {
+    if (!selection || !selectedProfile || processing) return;
+    submittedJob = null;
+    monitorError = "";
+    $addDownload.mutate({
+      tracker,
+      torrentId: selection.torrent.torrentId,
+      profile: selectedProfile,
+      useToken
+    });
+  }
+
+  function finish() {
+    monitorGeneration++;
+    submittedJob = null;
+    monitorError = "";
+    initializedTorrent = null;
+    onclose();
+  }
+
   function close() {
+    if (processing) return;
+    monitorGeneration++;
+    submittedJob = null;
+    monitorError = "";
     initializedTorrent = null;
     onclose();
   }
@@ -114,20 +180,53 @@
             </small>
           </span>
         </label>
-        {#if $addDownload.isError}<div class="error-panel compact">{$addDownload.error.message}</div>{/if}
+        {#if processing && submittedJob}
+          <div class="submission-status" role="status" aria-live="polite">
+            <span class="submission-spinner" aria-hidden="true"></span>
+            <span>
+              <strong>Adding download</strong>
+              <small>{statusMessage(submittedJob.state)}</small>
+            </span>
+          </div>
+        {/if}
+        {#if submittedJob?.state === "failed"}
+          <div class="error-panel compact submission-error" role="alert">
+            <span>
+              <strong>Download failed</strong>
+              <small>{submittedJob.errorMessage ?? "Wotbox could not submit this torrent to qBittorrent."}</small>
+            </span>
+          </div>
+        {:else if monitorError}
+          <div class="error-panel compact submission-error" role="alert">
+            <span>
+              <strong>Download status unavailable</strong>
+              <small>{monitorError}</small>
+            </span>
+          </div>
+        {:else if $addDownload.isError}
+          <div class="error-panel compact submission-error" role="alert">
+            <span>
+              <strong>Could not start download</strong>
+              <small>{$addDownload.error.message}</small>
+            </span>
+          </div>
+        {/if}
         <div class="dialog-actions">
-          <button class="secondary-button" onclick={close}>Cancel</button>
+          <button class="secondary-button" disabled={processing} onclick={close}>
+            {submittedJob?.state === "failed" || monitorError || $addDownload.isError ? "Close" : "Cancel"}
+          </button>
           <button
             class="primary-button"
-            disabled={$addDownload.isPending || !selectedProfile}
-            onclick={() => $addDownload.mutate({
-              tracker,
-              torrentId: selection!.torrent.torrentId,
-              profile: selectedProfile,
-              useToken
-            })}
+            disabled={$addDownload.isPending || processing || !selectedProfile}
+            onclick={submit}
           >
-            {$addDownload.isPending ? "Adding…" : "Add download"}
+            {#if $addDownload.isPending || processing}
+              Adding…
+            {:else if submittedJob?.state === "failed"}
+              Retry download
+            {:else}
+              Add download
+            {/if}
           </button>
         </div>
       {/if}

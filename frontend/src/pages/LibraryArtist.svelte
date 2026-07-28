@@ -23,16 +23,40 @@
     type Envelope,
     type LibraryArtistPage
   } from "../lib/api";
+  import {
+    closeOverlay,
+    integerSet,
+    navigateView,
+    oneOf,
+    optionalPositiveInteger,
+    replaceView,
+    type ViewQuery
+  } from "../lib/routing";
 
   let { tracker, artistKey }: { tracker: string; artistKey: string } = $props();
   const initialTracker = untrack(() => tracker);
   const initialArtistKey = untrack(() => artistKey);
-  const search = writable("");
-  const format = writable("");
-  const ownership = writable("all");
-  const sort = writable("year_desc");
-  const showRedundantSingles = writable(false);
+  const routePath = `/library/artists/${encodeURIComponent(initialTracker)}/${encodeURIComponent(initialArtistKey)}`;
+  const initial = new URLSearchParams(location.search);
+  const search = writable(initial.get("q") ?? "");
+  const format = writable(initial.get("format") ?? "");
+  const ownership = writable(oneOf(
+    initial,
+    "ownership",
+    ["all", "available", "library", "downloading", "missing"] as const,
+    "all"
+  ));
+  const sort = writable(oneOf(
+    initial,
+    "sort",
+    ["year_desc", "title", "added_desc"] as const,
+    "year_desc"
+  ));
+  const showRedundantSingles = writable(initial.get("covered") === "1");
+  let expandedGroups = $state(integerSet(initial, "expanded"));
+  const requestedAddTorrent = optionalPositiveInteger(initial, "add");
   let selected = $state<DownloadSelection | null>(null);
+  let urlSyncReady = false;
 
   const artist = createQuery({
     queryKey: ["library-artist", initialTracker, initialArtistKey],
@@ -126,6 +150,24 @@
     $groups.filter((group) => !group.roles.includes("primary"))
   );
 
+  function viewQuery(overrides: ViewQuery = {}): ViewQuery {
+    return {
+      q: $search.trim(),
+      format: $format,
+      ownership: $ownership === "all" ? undefined : $ownership,
+      sort: $sort === "year_desc" ? undefined : $sort,
+      covered: $showRedundantSingles,
+      expanded: [...expandedGroups],
+      ...overrides
+    };
+  }
+
+  $effect(() => {
+    const query = viewQuery();
+    if (urlSyncReady) replaceView(routePath, query);
+    else urlSyncReady = true;
+  });
+
   function isAddable(variant: ArtistCatalogRelease["variants"][number]): boolean {
     return variant.downloads.length === 0
       && variant.library?.availability !== "present";
@@ -143,13 +185,36 @@
     return primaryCount > 3 ? "Various artists" : group.release.artist ?? "Various artists";
   }
 
-  function choose(group: ArtistCatalogRelease, torrent: ArtistCatalogRelease["variants"][number]) {
-    selected = {
-      name: group.release.title,
-      artist: displayArtist(group),
-      torrent
-    };
+  function choose(torrent: ArtistCatalogRelease["variants"][number]) {
+    navigateView(routePath, viewQuery({ add: torrent.torrentId }));
   }
+
+  function toggleExpanded(groupId: number, expanded: boolean) {
+    const next = new Set(expandedGroups);
+    if (expanded) next.add(groupId);
+    else next.delete(groupId);
+    expandedGroups = next;
+  }
+
+  function closeAddDialog() {
+    closeOverlay(routePath, viewQuery({ add: undefined }));
+  }
+
+  $effect(() => {
+    if (!requestedAddTorrent || selected) return;
+    const candidates = $catalog.data?.data.groups ?? $filteredGroups;
+    for (const group of candidates) {
+      const torrent = group.variants.find((candidate) => candidate.torrentId === requestedAddTorrent);
+      if (torrent) {
+        selected = {
+          name: group.release.title,
+          artist: displayArtist(group),
+          torrent
+        };
+        break;
+      }
+    }
+  });
 </script>
 
 <svelte:head><title>{$artist.data?.artist.name ?? "Artist"} · Library · Wotbox</title></svelte:head>
@@ -302,8 +367,10 @@
                   tracker={group.release.tracker}
                   groupId={group.release.groupId}
                   title={group.release.title}
-                  fromLibrary={true}
-                  onadd={(torrent) => choose(group, torrent as ArtistCatalogRelease["variants"][number])}
+                  source="library"
+                  expanded={expandedGroups.has(group.release.groupId)}
+                  onexpandedchange={(expanded) => toggleExpanded(group.release.groupId, expanded)}
+                  onadd={(torrent) => choose(torrent as ArtistCatalogRelease["variants"][number])}
                 />
               </div>
             </article>
@@ -328,5 +395,5 @@
 <AddDownloadDialog
   selection={selected}
   tracker={initialTracker}
-  onclose={() => selected = null}
+  onclose={closeAddDialog}
 />

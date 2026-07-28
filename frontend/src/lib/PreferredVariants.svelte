@@ -3,7 +3,6 @@
   import { ArrowDownToLine, ChevronDown, ChevronUp, Users } from "@lucide/svelte";
   import {
     api,
-    appPath,
     formatBytes,
     type RuntimePreferences
   } from "./api";
@@ -13,6 +12,7 @@
     rankVariants,
     type DisplayVariant
   } from "./releasePreferences";
+  import { releaseViewPath, type ReleaseSource } from "./routing";
   import StatusPill from "./StatusPill.svelte";
 
   let {
@@ -21,7 +21,9 @@
     groupId,
     title,
     requestedTorrentId,
-    fromLibrary = false,
+    source = "search",
+    expanded: controlledExpanded,
+    onexpandedchange,
     onadd
   }: {
     variants: DisplayVariant[];
@@ -29,11 +31,14 @@
     groupId: number;
     title: string;
     requestedTorrentId?: number;
-    fromLibrary?: boolean;
+    source?: ReleaseSource;
+    expanded?: boolean;
+    onexpandedchange?: (expanded: boolean) => void;
     onadd?: (variant: DisplayVariant) => void;
   } = $props();
 
-  let expanded = $state(false);
+  let localExpanded = $state(false);
+  const expanded = $derived(controlledExpanded ?? localExpanded);
   const preferences = createQuery({
     queryKey: ["preferences"],
     queryFn: () => api<RuntimePreferences>("/api/v1/preferences"),
@@ -68,12 +73,32 @@
     }
     return media ? `${quality} · ${media}` : quality;
   }
+
+  function toggleExpanded() {
+    const next = !expanded;
+    if (onexpandedchange) onexpandedchange(next);
+    else localExpanded = next;
+  }
+
+  function variantPath(variant: DisplayVariant): string {
+    const download = variant.downloads[0];
+    return releaseViewPath(
+      tracker,
+      groupId,
+      variant.torrentId,
+      source,
+      download
+        ? { client: download.client, infoHash: download.infoHash }
+        : undefined,
+      expanded
+    );
+  }
 </script>
 
 {#snippet toggleButton()}
   <button
     class="variant-toggle"
-    onclick={() => expanded = !expanded}
+    onclick={toggleExpanded}
     aria-expanded={expanded}
     aria-label={expanded ? "Hide other formats" : `Show ${remaining.length} other ${remaining.length === 1 ? "format" : "formats"}`}
     title={expanded ? "Hide other formats" : `${remaining.length} other ${remaining.length === 1 ? "format" : "formats"}`}
@@ -107,11 +132,11 @@
     </div>
     <div class="variant-actions">
       {#if variant.downloads.length}
-        <a class="download-status-link" href={appPath(`/releases/${tracker}/${groupId}?torrent=${variant.torrentId}${fromLibrary ? "&from=library" : ""}`)}>
+        <a class="download-status-link" href={variantPath(variant)}>
           <StatusPill state={variant.downloads[0].state} />
         </a>
       {:else if library?.availability === "present" || !onadd}
-        <a class="secondary-button compact-button" href={appPath(`/releases/${tracker}/${groupId}?torrent=${variant.torrentId}${fromLibrary ? "&from=library" : ""}`)}>View</a>
+        <a class="secondary-button compact-button" href={variantPath(variant)}>View</a>
       {:else}
         <button
           class="download-button catalog-add-button"

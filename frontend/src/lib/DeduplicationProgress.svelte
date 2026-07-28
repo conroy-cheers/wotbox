@@ -9,8 +9,14 @@
     detail: string;
   } = $props();
 
+  const progressValue = $derived(
+    status.tracklistsTotal > 0 ? status.tracklistsIndexed : status.checked
+  );
+  const progressTotal = $derived(
+    status.tracklistsTotal > 0 ? status.tracklistsTotal : status.total
+  );
   const percentage = $derived(
-    status.total > 0 ? Math.round((status.checked / status.total) * 100) : 0
+    progressTotal > 0 ? Math.round((progressValue / progressTotal) * 100) : 0
   );
 </script>
 
@@ -20,23 +26,38 @@
     <div class="deduplication-progress-body">
       <div class="deduplication-progress-heading">
         <p><strong>Checking album overlap</strong> {detail}</p>
-        <span>{status.checked.toLocaleString()} / {status.total.toLocaleString()}</span>
+        <span>
+          {status.checked.toLocaleString()} / {status.total.toLocaleString()}
+          {status.total === 1 ? "Single" : "Singles"}
+        </span>
       </div>
       <div
         class="deduplication-progress-track"
         role="progressbar"
-        aria-label="Deduplication progress"
+        aria-label="Tracklist indexing progress"
         aria-valuemin="0"
-        aria-valuemax={status.total}
-        aria-valuenow={status.checked}
+        aria-valuemax={progressTotal}
+        aria-valuenow={progressValue}
       >
         <span style={`width: ${percentage}%`}></span>
       </div>
       <div class="deduplication-progress-meta">
-        <span>{percentage}% checked</span>
-        {#if status.resolving}<span>{status.resolving.toLocaleString()} resolving</span>{/if}
-        {#if status.pending}<span>{status.pending.toLocaleString()} queued</span>{/if}
-        {#if status.failed}<span class="warning">{status.failed.toLocaleString()} retrying</span>{/if}
+        <span>
+          {status.tracklistsIndexed.toLocaleString()} /
+          {status.tracklistsTotal.toLocaleString()} tracklists indexed
+        </span>
+        {#if status.tracklistsResolving}
+          <span>{status.tracklistsResolving.toLocaleString()} active</span>
+        {/if}
+        {#if status.tracklistsPending}
+          <span>{status.tracklistsPending.toLocaleString()} queued</span>
+        {/if}
+        {#if status.tracklistsFailed}
+          <span class="warning">{status.tracklistsFailed.toLocaleString()} retrying</span>
+        {/if}
+      </div>
+      <div class="deduplication-discovery-note">
+        The queue may grow while more artist catalogs are discovered.
       </div>
     </div>
   </div>

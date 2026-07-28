@@ -37,7 +37,7 @@ use crate::{
     qbittorrent::{DownloadClient, QbittorrentClient},
     tracker::{
         GazelleTrackerClient, SearchRequest, TrackerClient, fallback_artist_credit,
-        search_cache_key,
+        search_cache_key, torrent_info_hash,
     },
 };
 
@@ -141,7 +141,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(library_artist),
         )
         .route("/api/v1/downloads", get(downloads).post(create_download))
-        .route("/api/v1/downloads/{client}/{info_hash}", get(download))
+        .route("/api/v1/download-jobs/{id}", get(download_job))
         .route(
             "/api/v1/downloads/{client}/{info_hash}/retry",
             axum::routing::post(retry_download_link),
@@ -328,10 +328,26 @@ async fn search(
     }
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+struct GroupQuery {
+    #[serde(default)]
+    refresh: bool,
+    torrent: Option<i64>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/groups/{tracker}/{id}",
+    params(
+        ("tracker" = String, Path, description = "Configured tracker name"),
+        ("id" = i64, Path, description = "Tracker release group ID"),
+        GroupQuery
+    ),
+    responses((status = 200, body = inline(ApiEnvelope<ReleaseDetail>)))
+)]
 async fn group(
     State(state): State<Arc<AppState>>,
     Path((tracker_name, id)): Path<(String, i64)>,
-    Query(query): Query<RefreshQuery>,
+    Query(query): Query<GroupQuery>,
 ) -> Result<Json<ApiEnvelope<ReleaseDetail>>, AppError> {
     let (_, tracker) = get_tracker(&state, Some(&tracker_name))?;
     let key = id.to_string();
@@ -343,6 +359,14 @@ async fn group(
     {
         let stale = cached.expires_at <= Utc::now();
         let mut response = envelope(&tracker_name, cached, stale);
+        enrich_requested_variant(
+            &state,
+            &tracker_name,
+            id,
+            query.torrent,
+            &mut response.data.variants,
+        )
+        .await?;
         enrich_variant_downloads(&state, &mut response.data.variants).await?;
         enrich_variant_library(&state, &tracker_name, id, &mut response.data.variants).await?;
         if stale {
@@ -372,6 +396,14 @@ async fn group(
                 86_400,
             )
             .await?;
+            enrich_requested_variant(
+                &state,
+                &tracker_name,
+                id,
+                query.torrent,
+                &mut value.variants,
+            )
+            .await?;
             enrich_variant_downloads(&state, &mut value.variants).await?;
             enrich_variant_library(&state, &tracker_name, id, &mut value.variants).await?;
             Ok(Json(ApiEnvelope {
@@ -383,6 +415,15 @@ async fn group(
             let mut response =
                 stale_or_error::<ReleaseDetail>(&state.db, &tracker_name, "group", &key, error)
                     .await?;
+            enrich_requested_variant(
+                &state,
+                &tracker_name,
+                id,
+                query.torrent,
+                &mut response.0.data.variants,
+            )
+            .await?;
+            enrich_variant_downloads(&state, &mut response.0.data.variants).await?;
             enrich_variant_library(&state, &tracker_name, id, &mut response.0.data.variants)
                 .await?;
             Ok(response)
@@ -847,6 +888,7 @@ async fn library_index_status(
             _ => deduplication.pending += 1,
         }
     }
+    enrich_deduplication_queue_status(state, &mut deduplication).await?;
     Ok(LibraryIndexStatus {
         last_successful_scan_at: state.db.last_successful_download_scan().await?,
         unresolved_credits: releases
@@ -1101,86 +1143,6 @@ async fn downloads(
     }))
 }
 
-#[utoipa::path(
-    get, path = "/api/v1/downloads/{client}/{info_hash}",
-    params(
-        ("client" = String, Path, description = "Configured download client name"),
-        ("info_hash" = String, Path, description = "Torrent info hash")
-    ),
-    responses(
-        (status = 200, body = CanonicalDownload),
-        (status = 404, description = "Torrent is missing or its tracker release is unresolved")
-    )
-)]
-async fn download(
-    State(state): State<Arc<AppState>>,
-    Path((client_name, info_hash)): Path<(String, String)>,
-) -> Result<Json<CanonicalDownload>, AppError> {
-    let client = state.download_clients.get(&client_name).ok_or_else(|| {
-        AppError::bad_request("unknown_download_client", "Unknown download client")
-    })?;
-    let observed = client
-        .download(&info_hash)
-        .await
-        .map_err(|error| AppError::unavailable("download_client_unavailable", error))?
-        .ok_or_else(|| {
-            AppError::not_found(
-                "download_not_found",
-                "Torrent is not present in the download client",
-            )
-        })?;
-    observe_download(&state, &observed).await?;
-    let link = state
-        .db
-        .get_link(&client_name, &info_hash)
-        .await?
-        .filter(|link| link.resolution_state == "linked")
-        .ok_or_else(|| {
-            AppError::not_found(
-                "release_unresolved",
-                "The tracker release for this torrent has not been resolved",
-            )
-        })?;
-    let canonical = state
-        .db
-        .get_canonical(
-            link.tracker.as_deref().unwrap_or_default(),
-            link.torrent_id.unwrap_or_default(),
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::not_found(
-                "release_unresolved",
-                "The tracker release for this torrent has not been resolved",
-            )
-        })?;
-    let stale = canonical.expires_at <= Utc::now();
-    if stale {
-        let refresh_state = state.clone();
-        let refresh_tracker = link.tracker.clone().unwrap_or_default();
-        let refresh_hash = observed.live.info_hash.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                refresh_canonical_by_hash(refresh_state, refresh_tracker, refresh_hash).await
-            {
-                tracing::warn!(%error, "asynchronous canonical torrent refresh failed");
-            }
-        });
-    }
-    let mut variant = canonical.value.variant.clone();
-    variant.downloads = vec![observed.live.clone()];
-    Ok(Json(CanonicalDownload {
-        release: canonical.value.release,
-        variant,
-        download: observed.live,
-        provenance: provenance(
-            link.tracker.as_deref().unwrap_or_default(),
-            canonical.fetched_at,
-            stale,
-        ),
-    }))
-}
-
 async fn retry_download_link(
     State(state): State<Arc<AppState>>,
     Path((client_name, info_hash)): Path<(String, String)>,
@@ -1256,6 +1218,23 @@ async fn create_download(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/download-jobs/{id}",
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = DownloadJob))
+)]
+async fn download_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<DownloadJob>, AppError> {
+    state
+        .db
+        .get_job(id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| AppError::not_found("download_job_not_found", "Download job not found"))
+}
+
 async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> {
     state
         .db
@@ -1274,7 +1253,7 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .get(&profile.client)
         .ok_or_else(|| anyhow!("download client disappeared from configuration"))?;
 
-    let (metadata, canonical, raw) = tracker.torrent(job.torrent_id).await?;
+    let (mut metadata, mut canonical, raw) = tracker.torrent(job.torrent_id).await?;
     let preferences = state.db.get_runtime_preferences().await?;
     if !preferences.release.allows(
         canonical.variant.format.as_deref(),
@@ -1292,6 +1271,29 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
     if job.use_token && metadata.token_eligibility_known && !metadata.can_use_token {
         return Err(anyhow!("torrent is not eligible for a freeleech token"));
     }
+    let mut payload = None;
+    let mut submission_started = false;
+    let info_hash = if let Some(info_hash) = metadata
+        .info_hash
+        .clone()
+        .or_else(|| canonical.variant.info_hash.clone())
+    {
+        info_hash.to_ascii_lowercase()
+    } else {
+        state
+            .db
+            .set_job_state(job.id, DownloadState::Submitting, None)
+            .await?;
+        submission_started = true;
+        let bytes = tracker.download_torrent(job.torrent_id, false).await?;
+        let info_hash = torrent_info_hash(&bytes)?;
+        if !job.use_token {
+            payload = Some(bytes);
+        }
+        info_hash
+    };
+    metadata.info_hash = Some(info_hash.clone());
+    canonical.variant.info_hash = Some(info_hash.clone());
     state
         .db
         .put_snapshot(
@@ -1314,18 +1316,13 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .await?;
     state
         .db
-        .update_job_metadata(
-            job.id,
-            metadata.group_id,
-            &metadata.info_hash,
-            &metadata.name,
-        )
+        .update_job_metadata(job.id, metadata.group_id, &info_hash, &metadata.name)
         .await?;
     state
         .db
         .seed_download_link(
             &profile.client,
-            &metadata.info_hash,
+            &info_hash,
             &job.tracker,
             metadata.group_id,
             metadata.torrent_id,
@@ -1333,7 +1330,7 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         )
         .await?;
 
-    if let Some(existing) = client.download(&metadata.info_hash).await? {
+    if let Some(existing) = client.download(&info_hash).await? {
         let state_value = if existing.live.progress >= 1.0 {
             DownloadState::Complete
         } else {
@@ -1353,13 +1350,19 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         return Ok(());
     }
 
-    state
-        .db
-        .set_job_state(job.id, DownloadState::Submitting, None)
-        .await?;
-    let bytes = tracker
-        .download_torrent(job.torrent_id, job.use_token)
-        .await?;
+    let bytes = if let Some(payload) = payload {
+        payload
+    } else {
+        if !submission_started {
+            state
+                .db
+                .set_job_state(job.id, DownloadState::Submitting, None)
+                .await?;
+        }
+        tracker
+            .download_torrent(job.torrent_id, job.use_token)
+            .await?
+    };
     let mut temporary = tempfile::NamedTempFile::new()?;
     temporary.write_all(&bytes)?;
     temporary.flush()?;
@@ -2127,6 +2130,7 @@ async fn enrich_artist_catalog(
             .await?;
         }
     }
+    enrich_deduplication_queue_status(state, &mut status).await?;
     catalog.deduplication = status;
     Ok(())
 }
@@ -2183,7 +2187,22 @@ async fn enrich_search_deduplication(
             .await?;
         }
     }
+    enrich_deduplication_queue_status(state, &mut status).await?;
     page.deduplication = status;
+    Ok(())
+}
+
+async fn enrich_deduplication_queue_status(
+    state: &AppState,
+    status: &mut DeduplicationIndexStatus,
+) -> Result<(), AppError> {
+    let progress = state.db.track_index_progress().await?;
+    status.tracklists_indexed = progress.indexed;
+    status.tracklists_pending = progress.pending;
+    status.tracklists_resolving = progress.resolving;
+    status.tracklists_failed = progress.failed;
+    status.tracklists_total =
+        progress.indexed + progress.pending + progress.resolving + progress.failed;
     Ok(())
 }
 
@@ -2260,6 +2279,47 @@ async fn enrich_variant_downloads(
             .unwrap_or_default();
     }
     Ok(())
+}
+
+async fn enrich_requested_variant(
+    state: &Arc<AppState>,
+    tracker: &str,
+    group_id: i64,
+    torrent_id: Option<i64>,
+    variants: &mut Vec<TorrentVariant>,
+) -> Result<(), AppError> {
+    let Some(torrent_id) = torrent_id else {
+        return Ok(());
+    };
+    if variants
+        .iter()
+        .any(|variant| variant.torrent_id == torrent_id)
+    {
+        return Ok(());
+    }
+    let Some(cached) = state.db.get_canonical(tracker, torrent_id).await? else {
+        return Ok(());
+    };
+    append_requested_variant(variants, tracker, group_id, cached.value);
+    Ok(())
+}
+
+fn append_requested_variant(
+    variants: &mut Vec<TorrentVariant>,
+    tracker: &str,
+    group_id: i64,
+    canonical: CanonicalTorrent,
+) -> bool {
+    if !canonical.release.tracker.eq_ignore_ascii_case(tracker)
+        || canonical.release.group_id != group_id
+        || variants
+            .iter()
+            .any(|variant| variant.torrent_id == canonical.variant.torrent_id)
+    {
+        return false;
+    }
+    variants.push(canonical.variant);
+    true
 }
 
 async fn enrich_variant_library(
@@ -2482,7 +2542,8 @@ async fn ui(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Respons
     if path.starts_with("api/") || path.starts_with("health/") {
         return AppError::not_found("route_not_found", "Route not found").into_response();
     }
-    let asset = UI.get_file(path).or_else(|| UI.get_file("index.html"));
+    let requested_asset = UI.get_file(path);
+    let asset = requested_asset.or_else(|| UI.get_file("index.html"));
     let Some(asset) = asset else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2504,6 +2565,9 @@ async fn ui(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Respons
     };
     let mime = mime_guess::from_path(asset.path()).first_or_octet_stream();
     let mut response = Response::new(body);
+    if requested_asset.is_none() && !is_ui_route(path) {
+        *response.status_mut() = StatusCode::NOT_FOUND;
+    }
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(mime.as_ref())
@@ -2528,6 +2592,23 @@ async fn ui(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Respons
         );
     }
     response
+}
+
+fn is_ui_route(path: &str) -> bool {
+    let segments: Vec<_> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(
+        segments.as_slice(),
+        [] | ["search"]
+            | ["library"]
+            | ["library", "artists", _, _]
+            | ["downloads"]
+            | ["preferences"]
+            | ["releases", _, _]
+    )
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2609,7 +2690,8 @@ fn truncate(value: &str, max: usize) -> String {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        live, ready, preferences, update_preferences, account, search, downloads, download, create_download,
+        live, ready, preferences, update_preferences, account, search, group, downloads, create_download,
+        download_job,
         library_artists, library_artist, artist_catalog
     ),
     components(schemas(
@@ -2665,6 +2747,28 @@ mod tests {
         }
     }
 
+    fn torrent_variant(torrent_id: i64, group_id: i64) -> TorrentVariant {
+        TorrentVariant {
+            tracker: "ops".into(),
+            torrent_id,
+            group_id,
+            info_hash: Some(format!("HASH{torrent_id}")),
+            format: Some("FLAC".into()),
+            encoding: Some("Lossless".into()),
+            media: Some("WEB".into()),
+            size: Some(1_000),
+            seeders: Some(1),
+            leechers: Some(0),
+            snatched: Some(1),
+            freeleech: false,
+            can_use_token: false,
+            token_eligibility_known: true,
+            remaster_title: None,
+            downloads: Vec::new(),
+            library: None,
+        }
+    }
+
     #[test]
     fn library_artist_index_excludes_guest_only_and_compilation_only_artists() {
         let mut compilation = library_release(
@@ -2715,5 +2819,88 @@ mod tests {
         );
         various_artists.release.artist = Some("Various artists".into());
         assert!(is_compilation(&various_artists.release));
+    }
+
+    #[test]
+    fn ui_route_inventory_accepts_only_real_application_views() {
+        for path in [
+            "",
+            "search",
+            "library",
+            "library/artists/ops/id%3A6536",
+            "downloads",
+            "preferences",
+            "releases/ops/445818",
+        ] {
+            assert!(is_ui_route(path), "{path} should be a UI route");
+        }
+        for path in [
+            "unknown",
+            "library/artists/ops",
+            "downloads/music",
+            "downloads/music/abc123",
+            "preferences/advanced",
+            "releases/ops",
+        ] {
+            assert!(!is_ui_route(path), "{path} should not be a UI route");
+        }
+    }
+
+    #[test]
+    fn requested_canonical_variant_is_appended_only_to_its_release() {
+        let release = library_release(176023, Vec::new()).release;
+        let canonical = CanonicalTorrent {
+            release,
+            variant: torrent_variant(345678, 176023),
+            tags: Vec::new(),
+            description: None,
+            record_label: None,
+        };
+        let mut variants = vec![torrent_variant(111, 176023)];
+        assert!(append_requested_variant(
+            &mut variants,
+            "OPS",
+            176023,
+            canonical.clone()
+        ));
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant.torrent_id)
+                .collect::<Vec<_>>(),
+            vec![111, 345678]
+        );
+        assert!(!append_requested_variant(
+            &mut variants,
+            "ops",
+            176023,
+            canonical.clone()
+        ));
+        assert!(!append_requested_variant(
+            &mut Vec::new(),
+            "ops",
+            999,
+            canonical
+        ));
+    }
+
+    #[test]
+    fn openapi_exposes_release_detail_instead_of_legacy_download_detail() {
+        let document = serde_json::to_value(ApiDoc::openapi()).expect("serialize OpenAPI");
+        assert!(
+            document["paths"]
+                .get("/api/v1/groups/{tracker}/{id}")
+                .is_some()
+        );
+        assert!(
+            document["paths"]
+                .get("/api/v1/downloads/{client}/{info_hash}")
+                .is_none()
+        );
+        assert!(
+            document["paths"]
+                .get("/api/v1/download-jobs/{id}")
+                .is_some()
+        );
     }
 }

@@ -92,6 +92,11 @@ pub struct DeduplicationIndexStatus {
     pub resolving: usize,
     pub failed: usize,
     pub hidden: usize,
+    pub tracklists_indexed: usize,
+    pub tracklists_total: usize,
+    pub tracklists_pending: usize,
+    pub tracklists_resolving: usize,
+    pub tracklists_failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -121,7 +126,7 @@ pub struct TorrentMetadata {
     pub torrent_id: i64,
     pub group_id: Option<i64>,
     pub name: String,
-    pub info_hash: String,
+    pub info_hash: Option<String>,
     pub can_use_token: bool,
     #[serde(default)]
     pub token_eligibility_known: bool,
@@ -696,5 +701,6 @@ mod preference_tests {
         assert_eq!(status.total, 0);
         assert_eq!(status.pending, 3);
         assert_eq!(status.hidden, 2);
+        assert_eq!(status.tracklists_indexed, 0);
     }
 }

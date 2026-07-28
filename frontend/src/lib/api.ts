@@ -84,6 +84,11 @@ export type DeduplicationIndexStatus = {
   resolving: number;
   failed: number;
   hidden: number;
+  tracklistsIndexed: number;
+  tracklistsTotal: number;
+  tracklistsPending: number;
+  tracklistsResolving: number;
+  tracklistsFailed: number;
 };
 
 export type DownloadProfile = {

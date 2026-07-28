@@ -7,9 +7,20 @@
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
+  import {
+    browserViewPath,
+    closeOverlay,
+    integerSet,
+    navigateView,
+    optionalPositiveInteger,
+    positiveInteger,
+    replaceView,
+    type ViewQuery
+  } from "../lib/routing";
   import StaleNotice from "../lib/StaleNotice.svelte";
 
   const initial = new URLSearchParams(location.search);
+  const initialPage = positiveInteger(initial, "page", 1);
   const initialValues = {
     query: initial.get("query") ?? "",
     artist: initial.get("artist") ?? "",
@@ -17,7 +28,9 @@
     format: initial.get("format") ?? "",
     media: initial.get("media") ?? "",
     tracker: initial.get("tracker") ?? "",
-    submitted: initial.get("query") ?? initial.get("artist") ?? ""
+    page: initialPage,
+    submitted: ["query", "artist", "year", "format", "media", "tracker", "page"]
+      .some((key) => initial.has(key))
   };
   let query = $state(initialValues.query);
   let artist = $state(initialValues.artist);
@@ -25,9 +38,11 @@
   let format = $state(initialValues.format);
   let media = $state(initialValues.media);
   let tracker = $state(initialValues.tracker);
-  let submitted = $state(initialValues.submitted);
+  let submitted = $state(Boolean(initialValues.submitted));
   let selected = $state<{ group: SearchGroup; torrent: SearchTorrent } | null>(null);
-  let showRedundantSingles = $state(false);
+  let showRedundantSingles = $state(initial.get("covered") === "1");
+  let expandedGroups = $state(integerSet(initial, "expanded"));
+  const requestedAddTorrent = optionalPositiveInteger(initial, "add");
 
   const config = createQuery({
     queryKey: ["config"],
@@ -42,6 +57,7 @@
     if (values.format) params.set("format", values.format);
     if (values.media) params.set("media", values.media);
     if (values.tracker) params.set("tracker", values.tracker);
+    if (values.page > 1) params.set("page", String(values.page));
     return {
       queryKey: ["search", values],
       queryFn: () => api<Envelope<SearchPage>>(`/api/v1/search?${params}`),
@@ -51,19 +67,24 @@
   });
   const results = createQuery(resultOptions);
 
+  function viewQuery(overrides: ViewQuery = {}): ViewQuery {
+    return {
+      query,
+      artist,
+      year,
+      format,
+      media,
+      tracker,
+      page: initialValues.page > 1 ? initialValues.page : undefined,
+      covered: showRedundantSingles,
+      expanded: [...expandedGroups],
+      ...overrides
+    };
+  }
+
   function submit(event: SubmitEvent) {
     event.preventDefault();
-    submitted = query || artist || "*";
-    const params = new URLSearchParams();
-    if (query) params.set("query", query);
-    if (artist) params.set("artist", artist);
-    if (year) params.set("year", year);
-    if (format) params.set("format", format);
-    if (media) params.set("media", media);
-    if (tracker) params.set("tracker", tracker);
-    history.replaceState(null, "", `${location.pathname}?${params}`);
-    showRedundantSingles = false;
-    searchValues.set({ submitted, query, artist, year, format, media, tracker });
+    navigateView("/search", viewQuery({ page: undefined, covered: undefined, add: undefined }));
   }
 
   function visibleGroups(groups: SearchGroup[]): SearchGroup[] {
@@ -77,6 +98,38 @@
   function coverageTitle(group: SearchGroup): string {
     return group.albumCoverage?.albums.map((album) => album.title).join(", ") ?? "";
   }
+
+  function toggleCovered() {
+    showRedundantSingles = !showRedundantSingles;
+    replaceView("/search", viewQuery());
+  }
+
+  function toggleExpanded(groupId: number, expanded: boolean) {
+    const next = new Set(expandedGroups);
+    if (expanded) next.add(groupId);
+    else next.delete(groupId);
+    expandedGroups = next;
+    replaceView("/search", viewQuery());
+  }
+
+  function choose(torrent: SearchTorrent) {
+    navigateView("/search", viewQuery({ add: torrent.torrentId }));
+  }
+
+  function closeAddDialog() {
+    closeOverlay("/search", viewQuery({ add: undefined }));
+  }
+
+  $effect(() => {
+    if (!requestedAddTorrent || selected || !$results.data) return;
+    for (const group of $results.data.data.groups) {
+      const torrent = group.torrents.find((candidate) => candidate.torrentId === requestedAddTorrent);
+      if (torrent) {
+        selected = { group, torrent };
+        break;
+      }
+    }
+  });
 </script>
 
 <svelte:head><title>Search · Wotbox</title></svelte:head>
@@ -154,7 +207,7 @@
     <span>{$results.data.data.totalResults?.toLocaleString() ?? $results.data.data.groups.length} results</span>
     <div class="result-summary-actions">
       {#if coveredCount($results.data.data.groups)}
-        <button class="secondary-button compact-button" onclick={() => showRedundantSingles = !showRedundantSingles}>
+        <button class="secondary-button compact-button" onclick={toggleCovered}>
           {showRedundantSingles ? "Hide" : "Show"} {coveredCount($results.data.data.groups)} album-covered {coveredCount($results.data.data.groups) === 1 ? "single" : "singles"}
         </button>
       {/if}
@@ -180,7 +233,7 @@
           <div class="release-heading">
             <div>
               <p>{group.artist ?? "Various artists"}</p>
-              <h2><a href={appPath(`/releases/${$results.data.provenance.tracker}/${group.groupId}`)}>{group.name}</a></h2>
+              <h2><a href={appPath(`/releases/${$results.data.provenance.tracker}/${group.groupId}?from=search`)}>{group.name}</a></h2>
               <span>
                 {[group.year, group.releaseType].filter(Boolean).join(" · ")}
                 {#if group.albumCoverage}
@@ -189,7 +242,7 @@
                   </span>
                   <span class="album-coverage-links">
                     {#each group.albumCoverage.albums as album, index}
-                      {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}`)}>{album.title}</a>
+                      {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}?from=search`)}>{album.title}</a>
                     {/each}
                   </span>
                 {/if}
@@ -204,12 +257,40 @@
             tracker={$results.data.provenance.tracker}
             groupId={group.groupId}
             title={group.name}
-            onadd={(torrent) => selected = { group, torrent: torrent as SearchTorrent }}
+            expanded={expandedGroups.has(group.groupId)}
+            onexpandedchange={(expanded) => toggleExpanded(group.groupId, expanded)}
+            source="search"
+            onadd={(torrent) => choose(torrent as SearchTorrent)}
           />
         </div>
       </article>
     {/each}
   </div>
+  {#if $results.data.data.totalPages > 1}
+    <nav class="pagination" aria-label="Search result pages">
+      {#if $results.data.data.currentPage > 1}
+        <a
+          class="secondary-button compact-button"
+          rel="prev"
+          href={browserViewPath("/search", viewQuery({
+            page: $results.data.data.currentPage - 1,
+            add: undefined
+          }))}
+        >Previous</a>
+      {/if}
+      <span>Page {$results.data.data.currentPage} of {$results.data.data.totalPages}</span>
+      {#if $results.data.data.currentPage < $results.data.data.totalPages}
+        <a
+          class="secondary-button compact-button"
+          rel="next"
+          href={browserViewPath("/search", viewQuery({
+            page: $results.data.data.currentPage + 1,
+            add: undefined
+          }))}
+        >Next</a>
+      {/if}
+    </nav>
+  {/if}
 {:else}
   <div class="search-welcome">
     <SearchIcon size={32} />
@@ -225,5 +306,5 @@
     torrent: selected.torrent
   } : null}
   tracker={$results.data?.provenance.tracker ?? tracker}
-  onclose={() => selected = null}
+  onclose={closeAddDialog}
 />

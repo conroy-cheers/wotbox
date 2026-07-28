@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use gazelle_api::RateLimiter;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use url::Url;
 
 use crate::{
@@ -173,9 +174,8 @@ impl TrackerClient for GazelleTrackerClient {
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         let torrent = response.get("torrent").unwrap_or(&response);
         let group = response.get("group").unwrap_or(&Value::Null);
-        let info_hash = value_string(torrent, &["infoHash", "info_hash"])
-            .ok_or_else(|| anyhow!("tracker response omitted torrent info hash"))?
-            .to_ascii_lowercase();
+        let info_hash =
+            value_string(torrent, &["infoHash", "info_hash"]).map(|hash| hash.to_ascii_lowercase());
         let metadata = TorrentMetadata {
             torrent_id: value_i64(torrent, &["id", "torrentId"]).unwrap_or(id),
             group_id: value_i64(group, &["id", "groupId"])
@@ -230,6 +230,97 @@ impl TrackerClient for GazelleTrackerClient {
         }
         Ok(bytes.to_vec())
     }
+}
+
+pub fn torrent_info_hash(payload: &[u8]) -> Result<String> {
+    if payload.first() != Some(&b'd') {
+        bail!("torrent payload is not a bencoded dictionary");
+    }
+    let mut offset = 1;
+    let mut info = None;
+    while payload.get(offset) != Some(&b'e') {
+        let key = parse_bencoded_bytes(payload, &mut offset)?;
+        let value_start = offset;
+        skip_bencoded_value(payload, &mut offset, 0)?;
+        if key == b"info" {
+            if info.is_some() {
+                bail!("torrent payload contains more than one info dictionary");
+            }
+            info = Some(&payload[value_start..offset]);
+        }
+    }
+    offset += 1;
+    if offset != payload.len() {
+        bail!("torrent payload contains trailing data");
+    }
+    let info = info.ok_or_else(|| anyhow!("torrent payload omitted its info dictionary"))?;
+    Ok(hex::encode(Sha1::digest(info)))
+}
+
+fn parse_bencoded_bytes<'a>(payload: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
+    let length_start = *offset;
+    while payload.get(*offset).is_some_and(u8::is_ascii_digit) {
+        *offset += 1;
+    }
+    if *offset == length_start || payload.get(*offset) != Some(&b':') {
+        bail!("invalid bencoded byte string");
+    }
+    if *offset - length_start > 1 && payload[length_start] == b'0' {
+        bail!("invalid bencoded byte string length");
+    }
+    let length = std::str::from_utf8(&payload[length_start..*offset])?
+        .parse::<usize>()
+        .context("invalid bencoded byte string length")?;
+    *offset += 1;
+    let end = offset
+        .checked_add(length)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| anyhow!("truncated bencoded byte string"))?;
+    let value = &payload[*offset..end];
+    *offset = end;
+    Ok(value)
+}
+
+fn skip_bencoded_value(payload: &[u8], offset: &mut usize, depth: usize) -> Result<()> {
+    if depth > 128 {
+        bail!("bencoded value exceeds maximum nesting depth");
+    }
+    match payload.get(*offset).copied() {
+        Some(b'0'..=b'9') => {
+            parse_bencoded_bytes(payload, offset)?;
+        }
+        Some(b'i') => {
+            *offset += 1;
+            let start = *offset;
+            if payload.get(*offset) == Some(&b'-') {
+                *offset += 1;
+            }
+            let digits = *offset;
+            while payload.get(*offset).is_some_and(u8::is_ascii_digit) {
+                *offset += 1;
+            }
+            if *offset == digits || payload.get(*offset) != Some(&b'e') {
+                bail!("invalid bencoded integer");
+            }
+            if payload[start] == b'-' && *offset == start + 1 {
+                bail!("invalid bencoded integer");
+            }
+            *offset += 1;
+        }
+        Some(b'l' | b'd') => {
+            let dictionary = payload[*offset] == b'd';
+            *offset += 1;
+            while payload.get(*offset) != Some(&b'e') {
+                if dictionary {
+                    parse_bencoded_bytes(payload, offset)?;
+                }
+                skip_bencoded_value(payload, offset, depth + 1)?;
+            }
+            *offset += 1;
+        }
+        _ => bail!("invalid or truncated bencoded value"),
+    }
+    Ok(())
 }
 
 fn push<'a>(target: &mut Vec<(&'a str, String)>, key: &'a str, value: Option<&String>) {
@@ -722,6 +813,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(search_cache_key(&request), search_cache_key(&request));
+    }
+
+    #[test]
+    fn derives_v1_info_hash_from_exact_bencoded_info_dictionary() {
+        let payload = b"d8:announce15:https://tracker4:infod4:name4:test6:lengthi42eee";
+        assert_eq!(
+            torrent_info_hash(payload).expect("valid torrent"),
+            "07e73c3f168e838c9e99635915f82fabe76208d8"
+        );
+    }
+
+    #[test]
+    fn rejects_torrent_payloads_without_a_valid_info_dictionary() {
+        assert!(torrent_info_hash(b"d8:announce15:https://trackere").is_err());
+        assert!(torrent_info_hash(b"not a torrent").is_err());
+        assert!(torrent_info_hash(b"d4:infod4:name4:testeejunk").is_err());
     }
 
     #[test]

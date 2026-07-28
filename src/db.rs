@@ -65,6 +65,13 @@ pub struct StoredCoverage {
     pub coverage: Option<RawSingleCoverage>,
 }
 
+pub struct TrackIndexProgress {
+    pub indexed: usize,
+    pub pending: usize,
+    pub resolving: usize,
+    pub failed: usize,
+}
+
 impl Database {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
@@ -356,6 +363,32 @@ impl Database {
             .collect()
     }
 
+    pub async fn track_index_progress(&self) -> Result<TrackIndexProgress> {
+        let rows = sqlx::query(
+            "SELECT state, COUNT(*) AS count
+             FROM release_track_indexes GROUP BY state",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut progress = TrackIndexProgress {
+            indexed: 0,
+            pending: 0,
+            resolving: 0,
+            failed: 0,
+        };
+        for row in rows {
+            let count = row.get::<i64, _>("count").max(0) as usize;
+            match row.get::<&str, _>("state") {
+                "indexed" => progress.indexed += count,
+                "pending" => progress.pending += count,
+                "resolving" => progress.resolving += count,
+                "failed" => progress.failed += count,
+                _ => {}
+            }
+        }
+        Ok(progress)
+    }
+
     pub async fn put_single_coverage(
         &self,
         tracker: &str,
@@ -447,7 +480,49 @@ impl Database {
         use_token: bool,
         idempotency_key: Option<&str>,
     ) -> Result<(DownloadJob, bool)> {
+        if let Some(idempotency_key) = idempotency_key
+            && let Some(existing) = self.find_job_by_idempotency_key(idempotency_key).await?
+        {
+            return Ok((existing, false));
+        }
         if let Some(existing) = self.find_job(tracker, torrent_id, profile).await? {
+            if existing.state == DownloadState::Failed {
+                let now = Utc::now();
+                sqlx::query(
+                    "UPDATE download_jobs SET
+                        idempotency_key = ?, use_token = ?, group_id = NULL, info_hash = NULL,
+                        name = NULL, state = 'queued', progress = 0, download_speed = 0,
+                        upload_speed = 0, eta = NULL, error_code = NULL, error_message = NULL,
+                        updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(idempotency_key)
+                .bind(use_token)
+                .bind(now.to_rfc3339())
+                .bind(existing.id.to_string())
+                .execute(&self.pool)
+                .await?;
+                self.add_event(existing.id, &DownloadState::Queued, None)
+                    .await?;
+                return Ok((
+                    DownloadJob {
+                        use_token,
+                        group_id: None,
+                        info_hash: None,
+                        name: None,
+                        state: DownloadState::Queued,
+                        progress: 0.0,
+                        download_speed: 0,
+                        upload_speed: 0,
+                        eta: None,
+                        error_code: None,
+                        error_message: None,
+                        updated_at: now,
+                        ..existing
+                    },
+                    true,
+                ));
+            }
             return Ok((existing, false));
         }
         let now = Utc::now();
@@ -563,6 +638,14 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(row_to_job).collect()
+    }
+
+    pub async fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>> {
+        let row = sqlx::query("SELECT * FROM download_jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_job).transpose()
     }
 
     pub async fn put_canonical(
@@ -1087,6 +1170,14 @@ impl Database {
         row.as_ref().map(row_to_job).transpose()
     }
 
+    async fn find_job_by_idempotency_key(&self, key: &str) -> Result<Option<DownloadJob>> {
+        let row = sqlx::query("SELECT * FROM download_jobs WHERE idempotency_key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_job).transpose()
+    }
+
     async fn add_event(&self, id: Uuid, state: &DownloadState, detail: Option<&str>) -> Result<()> {
         sqlx::query(
             "INSERT INTO download_events (job_id, state, detail, created_at) VALUES (?, ?, ?, ?)",
@@ -1228,6 +1319,51 @@ mod tests {
                 .await
                 .expect("load preferences"),
             preferences
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_download_jobs_can_be_retried_with_a_new_idempotency_key() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        let (job, created) = db
+            .create_job("ops", 3026589, "ops", false, Some("first-request"))
+            .await
+            .expect("create job");
+        assert!(created);
+        db.set_job_state(
+            job.id,
+            crate::model::DownloadState::Failed,
+            Some(("download_failed", "tracker omitted its info hash")),
+        )
+        .await
+        .expect("fail job");
+
+        let (replayed, created) = db
+            .create_job("ops", 3026589, "ops", false, Some("first-request"))
+            .await
+            .expect("replay job");
+        assert!(!created);
+        assert_eq!(replayed.state, crate::model::DownloadState::Failed);
+
+        let (retried, created) = db
+            .create_job("ops", 3026589, "ops", true, Some("retry-request"))
+            .await
+            .expect("retry job");
+        assert!(created);
+        assert_eq!(retried.id, job.id);
+        assert_eq!(retried.state, crate::model::DownloadState::Queued);
+        assert!(retried.use_token);
+        assert!(retried.error_message.is_none());
+        assert_eq!(
+            db.get_job(job.id)
+                .await
+                .expect("job lookup")
+                .expect("job")
+                .state,
+            crate::model::DownloadState::Queued
         );
     }
 

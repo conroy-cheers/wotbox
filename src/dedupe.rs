@@ -79,6 +79,8 @@ pub enum MatchKind {
 pub struct RawAlbumMatch {
     pub album: AlbumReference,
     pub variants: Vec<TorrentVariant>,
+    #[serde(default)]
+    pub matched_torrent_ids: Vec<i64>,
     pub kind: MatchKind,
 }
 
@@ -99,9 +101,16 @@ impl RawSingleCoverage {
             return None;
         }
         let eligible = |album: &RawAlbumMatch| {
-            album.variants.iter().any(|variant| {
-                preferences.allows(variant.format.as_deref(), variant.encoding.as_deref())
-            })
+            album
+                .variants
+                .iter()
+                .filter(|variant| {
+                    album.matched_torrent_ids.is_empty()
+                        || album.matched_torrent_ids.contains(&variant.torrent_id)
+                })
+                .any(|variant| {
+                    preferences.allows(variant.format.as_deref(), variant.encoding.as_deref())
+                })
         };
         if self
             .tracks
@@ -150,6 +159,13 @@ pub fn track_index_from_group(
     raw: &Value,
 ) -> ReleaseTrackIndex {
     let response = raw.get("response").unwrap_or(raw);
+    let artist_names = detail
+        .release
+        .artists
+        .iter()
+        .filter(|artist| artist.role == crate::model::ArtistRole::Primary)
+        .map(|artist| artist.name.as_str())
+        .collect::<Vec<_>>();
     let torrents = response
         .get("torrents")
         .and_then(Value::as_array)
@@ -163,7 +179,7 @@ pub fn track_index_from_group(
             let file_list = torrent.get("fileList").and_then(Value::as_str)?;
             Some(VariantTrackIndex {
                 torrent_id,
-                tracks: parse_file_list(file_list),
+                tracks: parse_file_list_for_artists(file_list, &artist_names),
             })
         })
         .collect();
@@ -196,16 +212,30 @@ pub fn compute_raw_coverage(
             .map(|track| {
                 let mut matches = Vec::new();
                 for (index, group) in albums {
-                    let best = index
+                    if !recording_versions_compatible(&single.title, &index.title) {
+                        continue;
+                    }
+                    let matching_variants = index
                         .variants
                         .iter()
-                        .flat_map(|variant| &variant.tracks)
-                        .filter_map(|candidate| match_fingerprints(track, candidate))
-                        .min_by_key(|kind| match kind {
-                            MatchKind::Exact => 0,
-                            MatchKind::Fuzzy => 1,
-                        });
+                        .filter_map(|variant| {
+                            variant
+                                .tracks
+                                .iter()
+                                .filter_map(|candidate| match_fingerprints(track, candidate))
+                                .min_by_key(match_priority)
+                                .map(|kind| (variant.torrent_id, kind))
+                        })
+                        .collect::<Vec<_>>();
+                    let best = matching_variants
+                        .iter()
+                        .map(|(_, kind)| *kind)
+                        .min_by_key(match_priority);
                     if let Some(kind) = best {
+                        let matched_torrent_ids = matching_variants
+                            .iter()
+                            .map(|(torrent_id, _)| *torrent_id)
+                            .collect::<Vec<_>>();
                         matches.push(RawAlbumMatch {
                             album: AlbumReference {
                                 tracker: group.release.tracker.clone(),
@@ -214,6 +244,7 @@ pub fn compute_raw_coverage(
                                 year: group.release.year,
                             },
                             variants: group.variants.clone(),
+                            matched_torrent_ids,
                             kind,
                         });
                     }
@@ -227,7 +258,12 @@ pub fn compute_raw_coverage(
     }
 }
 
+#[cfg(test)]
 pub fn parse_file_list(file_list: &str) -> Vec<TitleFingerprint> {
+    parse_file_list_for_artists(file_list, &[])
+}
+
+fn parse_file_list_for_artists(file_list: &str, artist_names: &[&str]) -> Vec<TitleFingerprint> {
     file_list
         .split("|||")
         .filter_map(|entry| {
@@ -238,12 +274,17 @@ pub fn parse_file_list(file_list: &str) -> Vec<TitleFingerprint> {
                 .to_ascii_lowercase();
             AUDIO_EXTENSIONS
                 .contains(&extension.as_str())
-                .then(|| fingerprint(path))
+                .then(|| fingerprint_for_artists(path, artist_names))
         })
         .collect()
 }
 
+#[cfg(test)]
 fn fingerprint(path: &str) -> TitleFingerprint {
+    fingerprint_for_artists(path, &[])
+}
+
+fn fingerprint_for_artists(path: &str, artist_names: &[&str]) -> TitleFingerprint {
     let display = Path::new(path)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -269,6 +310,20 @@ fn fingerprint(path: &str) -> TitleFingerprint {
             }
         }
     }
+    let artist_prefixes = artist_names
+        .iter()
+        .map(|artist| normalize_title(artist))
+        .filter(|artist| !artist.is_empty())
+        .collect::<Vec<_>>();
+    for value in values.clone() {
+        for artist in &artist_prefixes {
+            if let Some(title) = value.strip_prefix(&format!("{artist} "))
+                && !title.is_empty()
+            {
+                values.insert(title.to_owned());
+            }
+        }
+    }
     let candidates = values.into_iter().map(candidate).collect();
     TitleFingerprint {
         display,
@@ -277,7 +332,8 @@ fn fingerprint(path: &str) -> TitleFingerprint {
 }
 
 fn normalize_title(value: &str) -> String {
-    let folded = value
+    let prepared = value.replace(['\'', '’'], "").replace(['&', '+'], " and ");
+    let folded = prepared
         .nfkd()
         .filter(|character| !is_combining_mark(*character))
         .flat_map(char::to_lowercase)
@@ -301,7 +357,14 @@ fn normalize_title(value: &str) -> String {
     }) {
         words.remove(0);
     }
-    words.join(" ")
+    words
+        .into_iter()
+        .map(|word| match word {
+            "remastered" => "remaster",
+            _ => word,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn strip_featured_credit(value: &str) -> Option<String> {
@@ -316,8 +379,25 @@ fn candidate(value: String) -> TitleCandidate {
     let words = value.split_whitespace().collect::<Vec<_>>();
     let numbers = words
         .iter()
-        .filter(|word| word.chars().any(|character| character.is_ascii_digit()))
-        .map(|word| (*word).to_owned())
+        .enumerate()
+        .filter(|(index, word)| {
+            word.chars().any(|character| character.is_ascii_digit())
+                || (is_roman_numeral(word)
+                    && index.checked_sub(1).is_some_and(|previous| {
+                        matches!(
+                            words[previous],
+                            "act"
+                                | "book"
+                                | "chapter"
+                                | "disc"
+                                | "movement"
+                                | "part"
+                                | "vol"
+                                | "volume"
+                        )
+                    }))
+        })
+        .map(|(_, word)| (*word).to_owned())
         .collect();
     let qualifiers = words
         .iter()
@@ -334,6 +414,38 @@ fn candidate(value: String) -> TitleCandidate {
         qualifiers,
         value,
     }
+}
+
+fn is_roman_numeral(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 8
+        && value
+            .chars()
+            .all(|character| matches!(character, 'i' | 'v' | 'x' | 'l' | 'c'))
+}
+
+fn match_priority(kind: &MatchKind) -> u8 {
+    match kind {
+        MatchKind::Exact => 0,
+        MatchKind::Fuzzy => 1,
+    }
+}
+
+fn recording_versions_compatible(single_title: &str, album_title: &str) -> bool {
+    recording_version_markers(single_title) == recording_version_markers(album_title)
+}
+
+fn recording_version_markers(title: &str) -> BTreeSet<&'static str> {
+    let normalized = normalize_title(title);
+    [
+        ("taylors version", "taylors_version"),
+        ("re recorded", "re_recorded"),
+        ("rerecorded", "re_recorded"),
+        ("new recording", "new_recording"),
+    ]
+    .into_iter()
+    .filter_map(|(phrase, marker)| normalized.contains(phrase).then_some(marker))
+    .collect()
 }
 
 fn match_fingerprints(left: &TitleFingerprint, right: &TitleFingerprint) -> Option<MatchKind> {
@@ -369,8 +481,47 @@ fn fuzzy_match(left: &TitleCandidate, right: &TitleCandidate) -> bool {
         8..=19 => 1,
         _ => 2,
     };
+    if semantic_affix_difference(&left.value, &right.value) {
+        return false;
+    }
+    if left.alphanumeric_len == right.alphanumeric_len
+        && left
+            .value
+            .chars()
+            .zip(right.value.chars())
+            .filter(|(left, right)| left != right)
+            .count()
+            == 1
+    {
+        return false;
+    }
     left.alphanumeric_len.abs_diff(right.alphanumeric_len) <= limit
         && damerau_levenshtein(&left.value, &right.value) <= limit
+}
+
+fn semantic_affix_difference(left: &str, right: &str) -> bool {
+    let one_is_plural_of_other = |left: &str, right: &str| {
+        left.strip_suffix('s')
+            .is_some_and(|singular| singular == right)
+            || right
+                .strip_suffix('s')
+                .is_some_and(|singular| singular == left)
+    };
+    if one_is_plural_of_other(left, right) {
+        return true;
+    }
+    const SEMANTIC_PREFIXES: &[&str] = &["anti", "dis", "im", "in", "non", "re", "un"];
+    left.split_whitespace()
+        .zip(right.split_whitespace())
+        .any(|(left, right)| {
+            SEMANTIC_PREFIXES.iter().any(|prefix| {
+                left.strip_prefix(prefix)
+                    .is_some_and(|value| value == right)
+                    || right
+                        .strip_prefix(prefix)
+                        .is_some_and(|value| value == left)
+            })
+        })
 }
 
 fn damerau_levenshtein(left: &str, right: &str) -> usize {
@@ -403,6 +554,8 @@ mod tests {
     use crate::model::{
         ArtistCatalogRole, ArtistCreditSource, ArtistRole, LibraryVariantState, ReleaseSummary,
     };
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
 
     fn one(path: &str) -> TitleFingerprint {
         fingerprint(path)
@@ -573,5 +726,313 @@ mod tests {
         };
         let resolved = coverage.resolve(&preferences).expect("320 is now eligible");
         assert_eq!(resolved.confidence, CoverageConfidence::Fuzzy);
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ValidationCorpus {
+        schema_version: u32,
+        title_families: Vec<TitleFamily>,
+        coverage_cases: Vec<CoverageCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TitleFamily {
+        id: String,
+        category: String,
+        canonical: String,
+        #[serde(default)]
+        artist: Option<String>,
+        #[serde(default)]
+        exact: Vec<String>,
+        #[serde(default)]
+        fuzzy: Vec<String>,
+        #[serde(default)]
+        distinct: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CoverageCase {
+        id: String,
+        category: String,
+        #[serde(default)]
+        minimum_quality: Option<String>,
+        single: ValidationRelease,
+        albums: Vec<ValidationRelease>,
+        expected_covered: bool,
+        expected_confidence: Option<String>,
+        expected_album_ids: Vec<i64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ValidationRelease {
+        id: i64,
+        title: String,
+        artist: String,
+        variants: Vec<ValidationVariant>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ValidationVariant {
+        torrent_id: i64,
+        #[serde(default = "default_format")]
+        format: String,
+        #[serde(default = "default_encoding")]
+        encoding: String,
+        tracks: Vec<String>,
+    }
+
+    fn default_format() -> String {
+        "FLAC".into()
+    }
+
+    fn default_encoding() -> String {
+        "Lossless".into()
+    }
+
+    fn validation_corpus() -> ValidationCorpus {
+        serde_json::from_str(include_str!("../tests/fixtures/dedupe_validation.json"))
+            .expect("validation corpus must be valid")
+    }
+
+    fn validation_index(release: &ValidationRelease, kind: &str) -> ReleaseTrackIndex {
+        let artist = ArtistCredit {
+            key: format!("name:{}", release.artist.to_lowercase()),
+            tracker: "ops".into(),
+            artist_id: Some(1),
+            name: release.artist.clone(),
+            role: ArtistRole::Primary,
+            source: ArtistCreditSource::Structured,
+        };
+        ReleaseTrackIndex {
+            tracker: "ops".into(),
+            group_id: release.id,
+            title: release.title.clone(),
+            release_type: Some(kind.into()),
+            artists: vec![artist],
+            variants: release
+                .variants
+                .iter()
+                .map(|variant| VariantTrackIndex {
+                    torrent_id: variant.torrent_id,
+                    tracks: variant
+                        .tracks
+                        .iter()
+                        .flat_map(|path| {
+                            parse_file_list_for_artists(
+                                &format!("{path}{{{{{{1}}}}}}"),
+                                &[release.artist.as_str()],
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn validation_album(release: &ValidationRelease) -> ArtistCatalogRelease {
+        let mut value = album(release.id, &release.title, "Lossless");
+        value.release.title = release.title.clone();
+        value.release.artist = Some(release.artist.clone());
+        value.variants = release
+            .variants
+            .iter()
+            .map(|variant| TorrentVariant {
+                tracker: "ops".into(),
+                torrent_id: variant.torrent_id,
+                group_id: release.id,
+                info_hash: None,
+                format: Some(variant.format.clone()),
+                encoding: Some(variant.encoding.clone()),
+                media: Some("WEB".into()),
+                size: None,
+                seeders: Some(1),
+                leechers: Some(0),
+                snatched: None,
+                freeleech: false,
+                can_use_token: false,
+                token_eligibility_known: true,
+                remaster_title: None,
+                downloads: Vec::new(),
+                library: None,
+            })
+            .collect();
+        value
+    }
+
+    #[test]
+    fn dedupe_validation_corpus_meets_accuracy_bars() {
+        let corpus = validation_corpus();
+        assert_eq!(corpus.schema_version, 1);
+
+        let mut true_positive = 0usize;
+        let mut false_positive = 0usize;
+        let mut true_negative = 0usize;
+        let mut false_negative = 0usize;
+        let mut kind_correct = 0usize;
+        let mut positive_total = 0usize;
+        let mut category_totals = BTreeMap::<String, usize>::new();
+        let mut failures = Vec::new();
+
+        for family in &corpus.title_families {
+            let artist_names = family.artist.iter().map(String::as_str).collect::<Vec<_>>();
+            let canonical = fingerprint_for_artists(&family.canonical, &artist_names);
+            for (expected, examples) in [
+                (Some(MatchKind::Exact), &family.exact),
+                (Some(MatchKind::Fuzzy), &family.fuzzy),
+                (None, &family.distinct),
+            ] {
+                for example in examples {
+                    *category_totals.entry(family.category.clone()).or_default() += 1;
+                    let actual = match_fingerprints(
+                        &canonical,
+                        &fingerprint_for_artists(example, &artist_names),
+                    );
+                    match (expected, actual) {
+                        (Some(expected_kind), Some(actual_kind)) => {
+                            true_positive += 1;
+                            positive_total += 1;
+                            if expected_kind == actual_kind {
+                                kind_correct += 1;
+                            } else {
+                                failures.push(format!(
+                                    "{}: expected {expected_kind:?}, got {actual_kind:?} for {:?} vs {:?}",
+                                    family.id, family.canonical, example
+                                ));
+                            }
+                        }
+                        (None, None) => true_negative += 1,
+                        (None, Some(actual_kind)) => {
+                            false_positive += 1;
+                            failures.push(format!(
+                                "{}: expected no match, got {actual_kind:?} for {:?} vs {:?}",
+                                family.id, family.canonical, example
+                            ));
+                        }
+                        (Some(expected_kind), None) => {
+                            false_negative += 1;
+                            positive_total += 1;
+                            failures.push(format!(
+                                "{}: expected {expected_kind:?}, got no match for {:?} vs {:?}",
+                                family.id, family.canonical, example
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = true_positive + false_positive + true_negative + false_negative;
+        assert!(
+            total >= 200,
+            "validation corpus is too small to be meaningful: {total}"
+        );
+        let precision = true_positive as f64 / (true_positive + false_positive) as f64;
+        let recall = true_positive as f64 / (true_positive + false_negative) as f64;
+        let specificity = true_negative as f64 / (true_negative + false_positive) as f64;
+        let kind_accuracy = kind_correct as f64 / positive_total as f64;
+        eprintln!(
+            "dedupe title validation: cases={total}, precision={precision:.3}, recall={recall:.3}, specificity={specificity:.3}, kind_accuracy={kind_accuracy:.3}, categories={category_totals:?}"
+        );
+        assert!(
+            precision >= 0.995,
+            "precision {precision:.3} is below 0.995\n{}",
+            failures.join("\n")
+        );
+        assert!(
+            recall >= 0.980,
+            "recall {recall:.3} is below 0.980\n{}",
+            failures.join("\n")
+        );
+        assert!(
+            specificity >= 0.995,
+            "specificity {specificity:.3} is below 0.995\n{}",
+            failures.join("\n")
+        );
+        assert!(
+            kind_accuracy >= 0.970,
+            "match-kind accuracy {kind_accuracy:.3} is below 0.970\n{}",
+            failures.join("\n")
+        );
+
+        let mut coverage_failures = Vec::new();
+        let mut coverage_categories = BTreeMap::<String, usize>::new();
+        for case in &corpus.coverage_cases {
+            *coverage_categories
+                .entry(case.category.clone())
+                .or_default() += 1;
+            let single = validation_index(&case.single, "Single");
+            let albums = case
+                .albums
+                .iter()
+                .map(|release| {
+                    (
+                        validation_index(release, "Album"),
+                        validation_album(release),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let coverage = compute_raw_coverage(&single, &albums);
+            let preferences = ReleasePreferences {
+                minimum_quality: case
+                    .minimum_quality
+                    .clone()
+                    .unwrap_or_else(|| ReleasePreferences::default().minimum_quality),
+                ..ReleasePreferences::default()
+            };
+            let resolved = coverage.resolve(&preferences);
+            if resolved.is_some() != case.expected_covered {
+                coverage_failures.push(format!(
+                    "{}: expected covered={}, got covered={}",
+                    case.id,
+                    case.expected_covered,
+                    resolved.is_some()
+                ));
+                continue;
+            }
+            if let Some(resolved) = resolved {
+                let actual_confidence = match resolved.confidence {
+                    CoverageConfidence::Exact => "exact",
+                    CoverageConfidence::Fuzzy => "fuzzy",
+                };
+                if case.expected_confidence.as_deref() != Some(actual_confidence) {
+                    coverage_failures.push(format!(
+                        "{}: expected confidence {:?}, got {actual_confidence}",
+                        case.id, case.expected_confidence
+                    ));
+                }
+                let mut actual_ids = resolved
+                    .albums
+                    .iter()
+                    .map(|album| album.group_id)
+                    .collect::<Vec<_>>();
+                actual_ids.sort_unstable();
+                let mut expected_ids = case.expected_album_ids.clone();
+                expected_ids.sort_unstable();
+                if actual_ids != expected_ids {
+                    coverage_failures.push(format!(
+                        "{}: expected album ids {expected_ids:?}, got {actual_ids:?}",
+                        case.id
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "dedupe coverage validation: cases={}, categories={coverage_categories:?}",
+            corpus.coverage_cases.len()
+        );
+        assert!(
+            corpus.coverage_cases.len() >= 20,
+            "coverage corpus is too small"
+        );
+        assert!(
+            coverage_failures.is_empty(),
+            "coverage validation failures:\n{}",
+            coverage_failures.join("\n")
+        );
     }
 }

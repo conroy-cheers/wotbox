@@ -13,13 +13,21 @@
   } from "../lib/api";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
+  import { oneOf, positiveInteger, replaceView } from "../lib/routing";
 
-  const search = writable("");
-  const tracker = writable("");
-  const format = writable("");
-  const availability = writable("all");
-  const limit = writable(1000);
-  let showRedundantSingles = $state(false);
+  const routeParams = new URLSearchParams(location.search);
+  const search = writable(routeParams.get("q") ?? "");
+  const tracker = writable(routeParams.get("tracker") ?? "");
+  const format = writable(routeParams.get("format") ?? "");
+  const availability = writable(oneOf(
+    routeParams,
+    "availability",
+    ["all", "present", "partial", "missing"] as const,
+    "all"
+  ));
+  const limit = writable(Math.min(positiveInteger(routeParams, "limit", 1000), 5000));
+  let showRedundantSingles = $state(routeParams.get("covered") === "1");
+  let urlSyncReady = false;
 
   const config = createQuery({
     queryKey: ["config"],
@@ -42,6 +50,19 @@
     }
   );
   const library = createQuery(options);
+
+  $effect(() => {
+    const query = {
+      q: $search.trim(),
+      tracker: $tracker,
+      format: $format,
+      availability: $availability === "all" ? undefined : $availability,
+      limit: $limit === 1000 ? undefined : $limit,
+      covered: showRedundantSingles
+    };
+    if (urlSyncReady) replaceView("/library", query);
+    else urlSyncReady = true;
+  });
 
   function initial(name: string): string {
     const sortable = name.trim().replace(/^the\s+/i, "");
@@ -70,6 +91,10 @@
 
   function coveredCount(items: LibraryArtistsPage["releases"]): number {
     return items.filter((item) => item.release.albumCoverage).length;
+  }
+
+  function toggleCovered() {
+    showRedundantSingles = !showRedundantSingles;
   }
 </script>
 
@@ -206,7 +231,7 @@
       <div class="section-heading">
         <div><p class="eyebrow">Release matches</p><h2>{$library.data.releaseTotal} {$library.data.releaseTotal === 1 ? "release" : "releases"}</h2></div>
         {#if coveredCount($library.data.releases)}
-          <button class="secondary-button compact-button" onclick={() => showRedundantSingles = !showRedundantSingles}>
+          <button class="secondary-button compact-button" onclick={toggleCovered}>
             {showRedundantSingles ? "Hide" : "Show"} {coveredCount($library.data.releases)} album-covered {coveredCount($library.data.releases) === 1 ? "single" : "singles"}
           </button>
         {/if}

@@ -5,6 +5,7 @@
   import StatusPill from "../lib/StatusPill.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
+  import { releaseViewPath } from "../lib/routing";
 
   const account = createQuery({
     queryKey: ["account"],
@@ -77,7 +78,7 @@
       <p class="eyebrow">Recent activity</p>
       <h2>Downloads</h2>
     </div>
-    <a class="text-link" href="downloads">View all</a>
+    <a class="text-link" href={appPath("/downloads")}>View all</a>
   </div>
   <div class="panel-list">
     {#if $downloads.isPending}
@@ -90,7 +91,13 @@
           <div class="release-mark">{item.release.title.slice(0, 1).toUpperCase()}</div>
           <div class="activity-copy">
             <strong>
-              <a href={appPath(`/downloads/${encodeURIComponent(download.client)}/${encodeURIComponent(download.infoHash)}`)}>
+              <a href={releaseViewPath(
+                item.release.tracker,
+                item.release.groupId,
+                item.variant.torrentId,
+                "downloads",
+                { client: download.client, infoHash: download.infoHash }
+              )}>
                 {item.release.title}
               </a>
             </strong>

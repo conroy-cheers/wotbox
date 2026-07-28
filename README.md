@@ -31,9 +31,9 @@ The download API exposes `GET /api/v1/downloads` as `{ items, index }`, where
 each visible item combines a canonical release, its matched torrent variant,
 and live client state. Pending, failed, and unconfigured torrents remain
 hidden while the background index progressively resolves configured announce
-hosts. `GET /api/v1/downloads/{client}/{infoHash}` remains as a compatibility
-lookup for resolved torrents. `POST /api/v1/downloads` remains the
-tracker-to-client submission endpoint.
+hosts. `POST /api/v1/downloads` remains the tracker-to-client submission
+endpoint; canonical release detail is served by
+`GET /api/v1/groups/{tracker}/{groupId}`.
 
 Completed, linked torrents also form a durable Library. Once a torrent reaches
 100%, its canonical release remains in the Library even if its client copy
@@ -52,6 +52,27 @@ bounded typo tolerance; version qualifiers and numbered parts remain distinct.
 Unresolved matches stay visible, and each release list can temporarily reveal
 confirmed matches and their covering Albums. Operational Downloads and
 Dashboard views are never filtered.
+
+## UI routes
+
+Every application view is deep-linkable and browser history restores its
+query-backed state:
+
+- `/` — Dashboard
+- `/search` — tracker search; filters, result page, covered Singles, expanded
+  variants, and the add confirmation are represented in the query string
+- `/library` — artist index and Library search with filter and result-limit
+  state
+- `/library/artists/{tracker}/{artistKey}` — one artist's tracker catalog with
+  filters, sorting, covered Singles, expanded variants, and add confirmation
+- `/downloads` — canonical downloads with links to their releases
+- `/releases/{tracker}/{groupId}` — canonical release detail, selected torrent,
+  exact live client attachment, expanded variants, and source context
+- `/preferences` — runtime release preferences
+
+The embedded server returns the SPA shell for these routes so they can be
+loaded directly. Unknown paths render the Wotbox 404 view and carry an HTTP
+404 status in packaged builds.
 
 ## Development
 
@@ -101,6 +122,22 @@ pnpm --dir frontend check
 pnpm --dir frontend test
 nix flake check
 ```
+
+The single/album overlap detector has a separately reviewable validation
+corpus at `tests/fixtures/dedupe_validation.json`. It contains labeled filename
+pairs plus end-to-end release scenarios covering normalization, credits,
+qualifiers, numbers, fuzzy-match boundaries, multiple editions, quality
+cutoffs, B-sides, and re-recordings. Run it with metrics visible using:
+
+```console
+cargo test dedupe_validation_corpus_meets_accuracy_bars -- --nocapture
+```
+
+The regression gate requires at least 200 title comparisons and 20 release
+scenarios, 99.5% precision and specificity, 98% recall, and 97% match-kind
+accuracy. End-to-end release decisions must all agree with their labels.
+False-positive resistance is deliberately weighted most heavily because an
+incorrect positive hides a release.
 
 `flake.nix` exports the packaged service, the separately buildable frontend,
 the development shell, and `nixosModules.default`. See

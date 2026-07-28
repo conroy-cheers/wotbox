@@ -1,0 +1,575 @@
+{
+  "schemaVersion": 1,
+  "titleFamilies": [
+    {
+      "id": "punctuation-apostrophe",
+      "category": "normalization",
+      "canonical": "01 - Don't Stop Me Now.flac",
+      "exact": ["Don't Stop Me Now.flac", "01. Dont Stop Me Now.mp3"],
+      "fuzzy": ["Dont Stpo Me Now.flac"],
+      "distinct": ["Don't Stop Now.flac", "Don't Stop Me Then.flac", "Don't Stop Me Now (Live).flac"]
+    },
+    {
+      "id": "ampersand-and",
+      "category": "normalization",
+      "canonical": "Brothers & Sisters.flac",
+      "exact": ["Brothers and Sisters.flac", "02 - BROTHERS + SISTERS.flac"],
+      "fuzzy": ["Brothres and Sisters.flac"],
+      "distinct": ["Brothers.flac", "Brothers and Strangers.flac", "Brothers and Sisters (Acoustic).flac"]
+    },
+    {
+      "id": "diacritics",
+      "category": "normalization",
+      "canonical": "Déjà Vu.flac",
+      "exact": ["Deja Vu.mp3", "03 - DÉJÀ-VU.flac"],
+      "fuzzy": [],
+      "distinct": ["Deja Blue.flac", "Vu Deja.flac", "Deja Vu (Remix).flac"]
+    },
+    {
+      "id": "unicode-dashes",
+      "category": "normalization",
+      "canonical": "04 – Midnight City.flac",
+      "exact": ["Midnight City.flac", "04 — Midnight City.mp3"],
+      "fuzzy": ["Midngiht City.flac"],
+      "distinct": ["Midnight Sun.flac", "Midnight City (Live).flac", "City at Midnight.flac"]
+    },
+    {
+      "id": "scene-name",
+      "category": "normalization",
+      "canonical": "01-Artist_-_Album_-_A_Song.flac",
+      "exact": ["01. A Song.flac", "A_Song.mp3"],
+      "fuzzy": [],
+      "distinct": ["Another Song.flac", "A Song (Demo).flac", "The Song.flac"]
+    },
+    {
+      "id": "disc-prefix",
+      "category": "normalization",
+      "canonical": "Disc 2 - 07 - Northern Lights.flac",
+      "exact": ["07 - Northern Lights.flac", "CD2 07 Northern Lights.mp3"],
+      "fuzzy": ["Northern Ligths.flac"],
+      "distinct": ["Southern Lights.flac", "Northern Light.flac", "Northern Lights (Live).flac"]
+    },
+    {
+      "id": "case-spacing",
+      "category": "normalization",
+      "canonical": "  THE   LAST   GOODBYE.flac",
+      "exact": ["The Last Goodbye.mp3", "05 - the last goodbye.flac"],
+      "fuzzy": ["The Last Goodbey.flac"],
+      "distinct": ["The First Goodbye.flac", "Last Goodbye.flac", "The Last Goodbye (Acoustic).flac"]
+    },
+    {
+      "id": "brackets",
+      "category": "normalization",
+      "canonical": "Heart-Shaped Box.flac",
+      "exact": ["Heart Shaped Box.mp3", "06. Heart_Shaped_Box.flac"],
+      "fuzzy": ["Heart Shpaed Box.flac"],
+      "distinct": ["Heart Shaped.flac", "Heart Shaped Boxes.flac", "Heart-Shaped Box (Demo).flac"]
+    },
+    {
+      "id": "non-latin-diacritics",
+      "category": "normalization",
+      "canonical": "Jóga.flac",
+      "exact": ["Joga.mp3", "08 - JÓGA.flac"],
+      "fuzzy": [],
+      "distinct": ["Yoga.flac", "Joga Live.flac", "Joga Remix.flac"]
+    },
+    {
+      "id": "punctuation-symbols",
+      "category": "normalization",
+      "canonical": "What's Up?.flac",
+      "exact": ["Whats Up.mp3", "09 - WHAT'S UP!.flac"],
+      "fuzzy": [],
+      "distinct": ["What Is Up.flac", "Whats Down.flac", "Whats Up Live.flac"]
+    },
+    {
+      "id": "featured-credit-feat",
+      "category": "credits",
+      "canonical": "Solo feat. Demi Lovato.flac",
+      "exact": ["Solo.flac", "01 - Solo featuring Demi Lovato.mp3", "Solo ft Demi Lovato.flac"],
+      "fuzzy": [],
+      "distinct": ["Solo (Acoustic).flac", "Demi Lovato - Solo Performance.flac", "Solo Remix.flac"]
+    },
+    {
+      "id": "featured-credit-trailing",
+      "category": "credits",
+      "canonical": "Electric Feel featuring Guest.flac",
+      "exact": ["Electric Feel.flac", "02 - Electric Feel feat Guest.mp3"],
+      "fuzzy": ["Elecrtic Feel.flac"],
+      "distinct": ["Electric Feeling.flac", "Electric Feel (Live).flac", "Acoustic Feel.flac"]
+    },
+    {
+      "id": "numbered-scene-artist-prefix",
+      "category": "credits",
+      "canonical": "01 - Palaye Royale - Morning Light.flac",
+      "exact": ["Morning Light.flac", "01. Morning Light.mp3"],
+      "fuzzy": ["Morning Ligth.flac"],
+      "distinct": ["Morning Lights.flac", "Morning Light (Demo).flac", "Evening Light.flac"]
+    },
+    {
+      "id": "artist-prefix-with-context",
+      "category": "credits",
+      "canonical": "PRESIDENT - Mercy.flac",
+      "artist": "PRESIDENT",
+      "exact": ["Mercy.flac", "01 - Mercy.mp3"],
+      "fuzzy": [],
+      "distinct": ["Mercy (Live).flac", "No Mercy.flac", "Merciful.flac"]
+    },
+    {
+      "id": "artist-prefix-not-arbitrary",
+      "category": "credits",
+      "canonical": "Someone Else - Mercy.flac",
+      "artist": "PRESIDENT",
+      "exact": [],
+      "fuzzy": [],
+      "distinct": ["Mercy.flac", "Someone - Mercy.flac", "Someone Else - Merciful.flac"]
+    },
+    {
+      "id": "live-protection",
+      "category": "qualifiers",
+      "canonical": "City of Blinding Lights.flac",
+      "exact": ["01 - City Of Blinding Lights.mp3"],
+      "fuzzy": ["City of Blidning Lights.flac"],
+      "distinct": ["City of Blinding Lights (Live).flac", "City of Blinding Lights Radio Edit.flac", "City of Burning Lights.flac"]
+    },
+    {
+      "id": "acoustic-protection",
+      "category": "qualifiers",
+      "canonical": "Mountain Sound.flac",
+      "exact": ["03 - Mountain Sound.mp3"],
+      "fuzzy": ["Mountian Sound.flac"],
+      "distinct": ["Mountain Sound Acoustic.flac", "Mountain Sounds.flac", "Mountain Song.flac"]
+    },
+    {
+      "id": "remix-protection",
+      "category": "qualifiers",
+      "canonical": "Electrical Storm.flac",
+      "exact": ["Electrical-Storm.mp3"],
+      "fuzzy": ["Electrical Sotrm.flac"],
+      "distinct": ["Electrical Storm Remix.flac", "Electrical Storm Radio Edit.flac", "Electric Storm.flac"]
+    },
+    {
+      "id": "instrumental-protection",
+      "category": "qualifiers",
+      "canonical": "Silent Assassin.flac",
+      "exact": ["11 - Silent Assassin.mp3"],
+      "fuzzy": ["Silent Assasin.flac"],
+      "distinct": ["Silent Assassin Instrumental.flac", "Silent Assassin Demo.flac", "Silent Assassins.flac"]
+    },
+    {
+      "id": "mono-stereo-protection",
+      "category": "qualifiers",
+      "canonical": "Good Vibrations (Mono).flac",
+      "exact": ["Good Vibrations Mono.mp3"],
+      "fuzzy": ["Good Vibratinos Mono.flac"],
+      "distinct": ["Good Vibrations Stereo.flac", "Good Vibrations.flac", "Bad Vibrations Mono.flac"]
+    },
+    {
+      "id": "remaster-protection",
+      "category": "qualifiers",
+      "canonical": "Red Hill Mining Town (2017 Remaster).flac",
+      "exact": ["Red Hill Mining Town 2017 Remastered.mp3"],
+      "fuzzy": [],
+      "distinct": ["Red Hill Mining Town.flac", "Red Hill Mining Town 2024 Remaster.flac", "Red Hill Mining Town 2017 Mix.flac"]
+    },
+    {
+      "id": "mix-protection",
+      "category": "qualifiers",
+      "canonical": "Love Train (Killahurtz Mix).flac",
+      "exact": ["Love Train Killahurtz Mix.mp3"],
+      "fuzzy": [],
+      "distinct": ["Love Train.flac", "Love Train Club Mix.flac", "Love Train Killahurtz Remix.flac", "Love Train Killahurtz Mxi.flac"]
+    },
+    {
+      "id": "demo-protection",
+      "category": "qualifiers",
+      "canonical": "Morning Light (Demo).flac",
+      "exact": ["Morning Light Demo.mp3"],
+      "fuzzy": ["Morning Ligth Demo.flac"],
+      "distinct": ["Morning Light.flac", "Morning Light Live.flac", "Morning Light Acoustic.flac"]
+    },
+    {
+      "id": "version-protection",
+      "category": "qualifiers",
+      "canonical": "Love Story (Taylor's Version).flac",
+      "exact": ["Love Story Taylors Version.mp3"],
+      "fuzzy": ["Love Sotry Taylors Version.flac"],
+      "distinct": ["Love Story.flac", "Love Story Live.flac", "Love Story Radio Edit.flac"]
+    },
+    {
+      "id": "part-arabic-number",
+      "category": "numbers",
+      "canonical": "Song Part 1.flac",
+      "exact": ["Song - Part 1.mp3", "01 - Song Part 1.flac"],
+      "fuzzy": [],
+      "distinct": ["Song Part 2.flac", "Song Part 10.flac", "Song Part One.flac"]
+    },
+    {
+      "id": "year-number",
+      "category": "numbers",
+      "canonical": "Summer of 69.flac",
+      "exact": ["Summer Of '69.mp3"],
+      "fuzzy": ["Sumer of 69.flac"],
+      "distinct": ["Summer of 68.flac", "Summer of 1969.flac", "Winter of 69.flac"]
+    },
+    {
+      "id": "roman-numeral",
+      "category": "numbers",
+      "canonical": "Movement I.flac",
+      "exact": ["Movement I.mp3"],
+      "fuzzy": [],
+      "distinct": ["Movement II.flac", "Movement V.flac", "Movement.flac"]
+    },
+    {
+      "id": "chapter-number",
+      "category": "numbers",
+      "canonical": "Chapter 12 The Escape.flac",
+      "exact": ["Chapter 12 - The Escape.mp3"],
+      "fuzzy": ["Chapter 12 The Escpae.flac"],
+      "distinct": ["Chapter 13 The Escape.flac", "Chapter 12 The Return.flac", "The Escape.flac"]
+    },
+    {
+      "id": "short-title-no-fuzzy",
+      "category": "fuzzy-boundary",
+      "canonical": "Hello.flac",
+      "exact": ["HELLO.mp3"],
+      "fuzzy": [],
+      "distinct": ["Hallo.flac", "Hella.flac", "Help.flac"]
+    },
+    {
+      "id": "eight-char-boundary",
+      "category": "fuzzy-boundary",
+      "canonical": "Sunshine.flac",
+      "exact": ["SUNSHINE.mp3"],
+      "fuzzy": ["Sunshien.flac"],
+      "distinct": ["Moonshine.flac", "Sunshiny.flac", "Sunrise.flac"]
+    },
+    {
+      "id": "long-title-two-edits",
+      "category": "fuzzy-boundary",
+      "canonical": "Everything Matters Tonight.flac",
+      "exact": ["Everything Matters Tonight.mp3"],
+      "fuzzy": ["Everythnig Maters Tonight.flac"],
+      "distinct": ["Anything Matters Tonight.flac", "Everything Matters Tomorrow.flac", "Everything Tonight.flac"]
+    },
+    {
+      "id": "word-count-boundary",
+      "category": "fuzzy-boundary",
+      "canonical": "All I Need.flac",
+      "exact": ["All I Need.mp3"],
+      "fuzzy": [],
+      "distinct": ["All We Need.flac", "All I Really Need.flac", "All You Need.flac"]
+    },
+    {
+      "id": "transposition",
+      "category": "fuzzy-boundary",
+      "canonical": "Watch the World Burn.flac",
+      "exact": ["Watch The World Burn.mp3"],
+      "fuzzy": ["Watch the Wrold Burn.flac"],
+      "distinct": ["Watch the World Turn.flac", "Watch This World Burn.flac", "World Burn.flac"]
+    },
+    {
+      "id": "single-substitution",
+      "category": "fuzzy-boundary",
+      "canonical": "Punching Bag.flac",
+      "exact": ["Punching-Bag.mp3"],
+      "fuzzy": ["Puncing Bag.flac"],
+      "distinct": ["Punching Back.flac", "Punch Bag.flac", "Punching Bag Live.flac"]
+    },
+    {
+      "id": "plural-not-fuzzy",
+      "category": "fuzzy-boundary",
+      "canonical": "Crystal.flac",
+      "exact": ["CRYSTAL.mp3"],
+      "fuzzy": [],
+      "distinct": ["Crystals.flac", "Crystel.flac", "Crystal Live.flac"]
+    },
+    {
+      "id": "different-long-word",
+      "category": "fuzzy-boundary",
+      "canonical": "International Dream.flac",
+      "exact": ["International Dream.mp3"],
+      "fuzzy": ["Internatoinal Dream.flac"],
+      "distinct": ["Intercontinental Dream.flac", "International Dreams.flac", "International Dream Demo.flac"]
+    },
+    {
+      "id": "dot-punctuation",
+      "category": "normalization",
+      "canonical": "Black.White.flac",
+      "exact": ["Black White.mp3", "12. BLACK.WHITE.flac"],
+      "fuzzy": ["Balck White.flac"],
+      "distinct": ["Black and White.flac", "Black or White.flac", "Black White Live.flac"]
+    },
+    {
+      "id": "parenthetical-punctuation",
+      "category": "normalization",
+      "canonical": "Sweet (Like Candy).flac",
+      "exact": ["Sweet Like Candy.mp3", "03 - Sweet [Like Candy].flac"],
+      "fuzzy": ["Sweet Like Cnady.flac"],
+      "distinct": ["Sweet Candy.flac", "Sweet Like Honey.flac", "Sweet Like Candy Remix.flac"]
+    },
+    {
+      "id": "catalogue-number-protection",
+      "category": "numbers",
+      "canonical": "Opus 24 No 3.flac",
+      "exact": ["Opus 24 - No. 3.mp3", "08 - Opus 24 No 3.flac"],
+      "fuzzy": [],
+      "distinct": ["Opus 24 No 2.flac", "Opus 25 No 3.flac", "Opus 24.flac"]
+    },
+    {
+      "id": "long-title-deletion",
+      "category": "fuzzy-boundary",
+      "canonical": "Beautifully Unconventional.flac",
+      "exact": ["Beautifully-Unconventional.mp3"],
+      "fuzzy": ["Beautifully Unconventonal.flac"],
+      "distinct": ["Beautiful and Unconventional.flac", "Beautifully Conventional.flac", "Beautifully Unconventional Live.flac"]
+    },
+    {
+      "id": "roman-letters-in-word",
+      "category": "fuzzy-boundary",
+      "canonical": "Civil War.flac",
+      "exact": ["CIVIL WAR.mp3"],
+      "fuzzy": ["Civli War.flac"],
+      "distinct": ["Civil Wars.flac", "Civil Peace.flac", "Civil War Live.flac"]
+    }
+  ],
+  "coverageCases": [
+    {
+      "id": "single-track-on-lossless-album",
+      "category": "basic",
+      "single": {"id": 1, "title": "Ache In My Heart", "artist": "Palaye Royale", "variants": [{"torrentId": 11, "tracks": ["01 - Ache In My Heart.flac"]}]},
+      "albums": [{"id": 101, "title": "Death or Glory", "artist": "Palaye Royale", "variants": [{"torrentId": 1011, "format": "FLAC", "encoding": "Lossless", "tracks": ["01 - Death or Glory.flac", "02 - Ache In My Heart.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [101]
+    },
+    {
+      "id": "b-side-remains-visible",
+      "category": "multi-track",
+      "single": {"id": 2, "title": "One for the Road", "artist": "Arctic Monkeys", "variants": [{"torrentId": 21, "tracks": ["01 - One for the Road.flac", "02 - You're So Dark.flac"]}]},
+      "albums": [{"id": 102, "title": "AM", "artist": "Arctic Monkeys", "variants": [{"torrentId": 1021, "format": "FLAC", "encoding": "Lossless", "tracks": ["07 - One for the Road.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "all-tracks-across-two-albums",
+      "category": "multi-track",
+      "single": {"id": 3, "title": "Two Track Single", "artist": "Example Artist", "variants": [{"torrentId": 31, "tracks": ["01 - First Song.flac", "02 - Second Song.flac"]}]},
+      "albums": [
+        {"id": 103, "title": "First Album", "artist": "Example Artist", "variants": [{"torrentId": 1031, "format": "FLAC", "encoding": "Lossless", "tracks": ["First Song.flac"]}]},
+        {"id": 104, "title": "Second Album", "artist": "Example Artist", "variants": [{"torrentId": 1041, "format": "FLAC", "encoding": "Lossless", "tracks": ["Second Song.flac"]}]}
+      ],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [103, 104]
+    },
+    {
+      "id": "fuzzy-long-title-covered",
+      "category": "fuzzy",
+      "single": {"id": 4, "title": "Everything Matters", "artist": "Aurora", "variants": [{"torrentId": 41, "tracks": ["Everything Matters.flac"]}]},
+      "albums": [{"id": 105, "title": "The Gods We Can Touch", "artist": "Aurora", "variants": [{"torrentId": 1051, "format": "FLAC", "encoding": "Lossless", "tracks": ["Everythnig Matters.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "fuzzy",
+      "expectedAlbumIds": [105]
+    },
+    {
+      "id": "short-title-typo-not-covered",
+      "category": "fuzzy",
+      "single": {"id": 5, "title": "Hello", "artist": "Example Artist", "variants": [{"torrentId": 51, "tracks": ["Hello.flac"]}]},
+      "albums": [{"id": 106, "title": "Album", "artist": "Example Artist", "variants": [{"torrentId": 1061, "format": "FLAC", "encoding": "Lossless", "tracks": ["Hallo.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "live-track-not-studio",
+      "category": "qualifiers",
+      "single": {"id": 6, "title": "Mercy (Live)", "artist": "PRESIDENT", "variants": [{"torrentId": 61, "tracks": ["Mercy Live.flac"]}]},
+      "albums": [{"id": 107, "title": "Studio Album", "artist": "PRESIDENT", "variants": [{"torrentId": 1071, "format": "FLAC", "encoding": "Lossless", "tracks": ["Mercy.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "original-not-covered-by-taylors-version",
+      "category": "release-version",
+      "single": {"id": 7, "title": "Today Was a Fairytale", "artist": "Taylor Swift", "variants": [{"torrentId": 71, "tracks": ["1 - Today Was A Fairytale.flac"]}]},
+      "albums": [{"id": 108, "title": "Fearless (Taylor's Version)", "artist": "Taylor Swift", "variants": [{"torrentId": 1081, "format": "FLAC", "encoding": "Lossless", "tracks": ["07 - Today Was a Fairytale.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "taylors-version-single-covered",
+      "category": "release-version",
+      "single": {"id": 8, "title": "Today Was a Fairytale (Taylor's Version)", "artist": "Taylor Swift", "variants": [{"torrentId": 81, "tracks": ["1 - Today Was A Fairytale.flac"]}]},
+      "albums": [{"id": 109, "title": "Fearless (Taylor's Version)", "artist": "Taylor Swift", "variants": [{"torrentId": 1091, "format": "FLAC", "encoding": "Lossless", "tracks": ["07 - Today Was a Fairytale.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [109]
+    },
+    {
+      "id": "rerecorded-album-does-not-cover-original",
+      "category": "release-version",
+      "single": {"id": 9, "title": "Old Song", "artist": "Example Artist", "variants": [{"torrentId": 91, "tracks": ["Old Song.flac"]}]},
+      "albums": [{"id": 110, "title": "Greatest Songs (Re-recorded)", "artist": "Example Artist", "variants": [{"torrentId": 1101, "format": "FLAC", "encoding": "Lossless", "tracks": ["Old Song.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "rerecorded-single-covered-by-rerecorded-album",
+      "category": "release-version",
+      "single": {"id": 10, "title": "Old Song (Re-recorded)", "artist": "Example Artist", "variants": [{"torrentId": 101, "tracks": ["Old Song.flac"]}]},
+      "albums": [{"id": 111, "title": "Greatest Songs (Re-recorded)", "artist": "Example Artist", "variants": [{"torrentId": 1111, "format": "FLAC", "encoding": "Lossless", "tracks": ["Old Song.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [111]
+    },
+    {
+      "id": "match-only-on-ineligible-variant",
+      "category": "quality",
+      "single": {"id": 11, "title": "Bonus Track", "artist": "Example Artist", "variants": [{"torrentId": 111, "tracks": ["Bonus Track.flac"]}]},
+      "albums": [{"id": 112, "title": "Album With Editions", "artist": "Example Artist", "variants": [
+        {"torrentId": 1121, "format": "MP3", "encoding": "320", "tracks": ["Bonus Track.mp3"]},
+        {"torrentId": 1122, "format": "FLAC", "encoding": "Lossless", "tracks": ["Different Standard Track.flac"]}
+      ]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "matched-mp3-allowed-by-runtime-cutoff",
+      "category": "quality",
+      "minimumQuality": "320",
+      "single": {"id": 12, "title": "Bonus Track", "artist": "Example Artist", "variants": [{"torrentId": 121, "tracks": ["Bonus Track.flac"]}]},
+      "albums": [{"id": 113, "title": "Album With Editions", "artist": "Example Artist", "variants": [
+        {"torrentId": 1131, "format": "MP3", "encoding": "320", "tracks": ["Bonus Track.mp3"]},
+        {"torrentId": 1132, "format": "FLAC", "encoding": "Lossless", "tracks": ["Different Standard Track.flac"]}
+      ]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [113]
+    },
+    {
+      "id": "match-on-special-lossless-edition",
+      "category": "quality",
+      "single": {"id": 13, "title": "Bonus Track", "artist": "Example Artist", "variants": [{"torrentId": 131, "tracks": ["Bonus Track.flac"]}]},
+      "albums": [{"id": 114, "title": "Album With Editions", "artist": "Example Artist", "variants": [
+        {"torrentId": 1141, "format": "MP3", "encoding": "320", "tracks": ["Standard Track.mp3"]},
+        {"torrentId": 1142, "format": "FLAC", "encoding": "Lossless", "tracks": ["Bonus Track.flac"]}
+      ]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [114]
+    },
+    {
+      "id": "featured-credit-normalizes",
+      "category": "credits",
+      "single": {"id": 14, "title": "Solo", "artist": "Clean Bandit", "variants": [{"torrentId": 141, "tracks": ["Solo feat. Demi Lovato.flac"]}]},
+      "albums": [{"id": 115, "title": "What Is Love?", "artist": "Clean Bandit", "variants": [{"torrentId": 1151, "format": "FLAC", "encoding": "Lossless", "tracks": ["Solo.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [115]
+    },
+    {
+      "id": "artist-prefix-normalizes-with-context",
+      "category": "credits",
+      "single": {"id": 15, "title": "Mercy", "artist": "PRESIDENT", "variants": [{"torrentId": 151, "tracks": ["PRESIDENT - Mercy.flac"]}]},
+      "albums": [{"id": 116, "title": "Album", "artist": "PRESIDENT", "variants": [{"torrentId": 1161, "format": "FLAC", "encoding": "Lossless", "tracks": ["Mercy.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [116]
+    },
+    {
+      "id": "unrelated-prefix-does-not-normalize",
+      "category": "credits",
+      "single": {"id": 16, "title": "Mercy", "artist": "PRESIDENT", "variants": [{"torrentId": 161, "tracks": ["Someone Else - Mercy.flac"]}]},
+      "albums": [{"id": 117, "title": "Album", "artist": "PRESIDENT", "variants": [{"torrentId": 1171, "format": "FLAC", "encoding": "Lossless", "tracks": ["Mercy.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "single-variants-union-extra-track",
+      "category": "multi-variant",
+      "single": {"id": 17, "title": "Christmas Tree Farm", "artist": "Taylor Swift", "variants": [
+        {"torrentId": 171, "tracks": ["Christmas Tree Farm.flac"]},
+        {"torrentId": 172, "tracks": ["Christmas Tree Farm.flac", "Christmas Tree Farm Live at Jingle Ball.flac"]}
+      ]},
+      "albums": [{"id": 118, "title": "Holiday Album", "artist": "Taylor Swift", "variants": [{"torrentId": 1181, "format": "FLAC", "encoding": "Lossless", "tracks": ["Christmas Tree Farm.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "equivalent-single-variants-collapse",
+      "category": "multi-variant",
+      "single": {"id": 18, "title": "The One", "artist": "The Chainsmokers", "variants": [
+        {"torrentId": 181, "tracks": ["01 - The One.flac"]},
+        {"torrentId": 182, "tracks": ["The One.mp3"]}
+      ]},
+      "albums": [{"id": 119, "title": "Memories...Do Not Open", "artist": "The Chainsmokers", "variants": [{"torrentId": 1191, "format": "FLAC", "encoding": "Lossless", "tracks": ["The One.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [119]
+    },
+    {
+      "id": "ampersand-and-coverage",
+      "category": "normalization",
+      "single": {"id": 19, "title": "Brothers & Sisters", "artist": "Example Artist", "variants": [{"torrentId": 191, "tracks": ["Brothers & Sisters.flac"]}]},
+      "albums": [{"id": 120, "title": "Family Album", "artist": "Example Artist", "variants": [{"torrentId": 1201, "format": "FLAC", "encoding": "Lossless", "tracks": ["Brothers and Sisters.flac"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [120]
+    },
+    {
+      "id": "roman-numerals-distinct",
+      "category": "numbers",
+      "single": {"id": 20, "title": "Movement I", "artist": "Composer", "variants": [{"torrentId": 201, "tracks": ["Movement I.flac"]}]},
+      "albums": [{"id": 121, "title": "Symphony", "artist": "Composer", "variants": [{"torrentId": 1211, "format": "FLAC", "encoding": "Lossless", "tracks": ["Movement II.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "radio-edit-extra-keeps-single",
+      "category": "multi-track",
+      "single": {"id": 21, "title": "City of Blinding Lights", "artist": "U2", "variants": [{"torrentId": 211, "tracks": ["City of Blinding Lights.flac", "City of Blinding Lights Radio Edit.flac"]}]},
+      "albums": [{"id": 122, "title": "How to Dismantle an Atomic Bomb", "artist": "U2", "variants": [{"torrentId": 1221, "format": "FLAC", "encoding": "Lossless", "tracks": ["City of Blinding Lights.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "non-audio-files-ignored",
+      "category": "file-parsing",
+      "single": {"id": 22, "title": "Artwork", "artist": "Example Artist", "variants": [{"torrentId": 221, "tracks": ["Song.flac", "cover.jpg", "rip.log"]}]},
+      "albums": [{"id": 123, "title": "Album", "artist": "Example Artist", "variants": [{"torrentId": 1231, "format": "FLAC", "encoding": "Lossless", "tracks": ["Song.flac", "booklet.pdf"]}]}],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [123]
+    },
+    {
+      "id": "no-audio-tracks-never-covered",
+      "category": "file-parsing",
+      "single": {"id": 23, "title": "Empty", "artist": "Example Artist", "variants": [{"torrentId": 231, "tracks": ["cover.jpg", "rip.log"]}]},
+      "albums": [{"id": 124, "title": "Album", "artist": "Example Artist", "variants": [{"torrentId": 1241, "format": "FLAC", "encoding": "Lossless", "tracks": ["Song.flac"]}]}],
+      "expectedCovered": false,
+      "expectedConfidence": null,
+      "expectedAlbumIds": []
+    },
+    {
+      "id": "multiple-album-matches-reported",
+      "category": "multi-album",
+      "single": {"id": 24, "title": "Popular Song", "artist": "Example Artist", "variants": [{"torrentId": 241, "tracks": ["Popular Song.flac"]}]},
+      "albums": [
+        {"id": 125, "title": "Original Album", "artist": "Example Artist", "variants": [{"torrentId": 1251, "format": "FLAC", "encoding": "Lossless", "tracks": ["Popular Song.flac"]}]},
+        {"id": 126, "title": "Greatest Hits", "artist": "Example Artist", "variants": [{"torrentId": 1261, "format": "FLAC", "encoding": "Lossless", "tracks": ["Popular Song.flac"]}]}
+      ],
+      "expectedCovered": true,
+      "expectedConfidence": "exact",
+      "expectedAlbumIds": [125, 126]
+    }
+  ]
+}

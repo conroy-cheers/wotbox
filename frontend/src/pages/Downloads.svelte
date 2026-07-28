@@ -1,13 +1,16 @@
 <script lang="ts">
   import { createQuery } from "@tanstack/svelte-query";
-  import { ArrowDownToLine, Clock3, RefreshCw } from "@lucide/svelte";
+  import { ArrowDownToLine, ArrowRight, Clock3, RefreshCw } from "@lucide/svelte";
   import { derived, writable } from "svelte/store";
-  import { api, appPath, formatBytes, formatSpeed, relativeTime, type DownloadsPage } from "../lib/api";
+  import { api, formatBytes, formatSpeed, relativeTime, type DownloadsPage } from "../lib/api";
   import DownloadDiagnostic from "../lib/DownloadDiagnostic.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
+  import { positiveInteger, releaseViewPath, replaceView } from "../lib/routing";
 
-  const limit = writable(100);
+  const initial = new URLSearchParams(location.search);
+  const limit = writable(Math.min(positiveInteger(initial, "limit", 100), 500));
+  let urlSyncReady = false;
   const queryOptions = derived(limit, ($limit) => ({
     queryKey: ["downloads", $limit] as const,
     queryFn: () => api<DownloadsPage>(`/api/v1/downloads?limit=${$limit}`),
@@ -15,11 +18,32 @@
   }));
   const downloads = createQuery(queryOptions);
 
+  $effect(() => {
+    const value = $limit;
+    if (urlSyncReady) {
+      replaceView("/downloads", { limit: value === 100 ? undefined : value });
+    } else {
+      urlSyncReady = true;
+    }
+  });
+
   function eta(value?: number): string {
     if (value == null) return "—";
     if (value < 60) return `${value}s`;
     if (value < 3600) return `${Math.round(value / 60)}m`;
     return `${Math.round(value / 3600)}h`;
+  }
+
+  function releasePath(item: DownloadsPage["items"][number], showClientDetails = false): string {
+    return releaseViewPath(
+      item.release.tracker,
+      item.release.groupId,
+      item.variant.torrentId,
+      "downloads",
+      { client: item.download.client, infoHash: item.download.infoHash },
+      false,
+      showClientDetails
+    );
   }
 </script>
 
@@ -55,7 +79,7 @@
           <div class="release-mark large">{item.release.title.slice(0, 1).toUpperCase()}</div>
           <div>
             <h2>
-              <a href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?torrent=${item.variant.torrentId}`)}>
+              <a href={releasePath(item)}>
                 {item.release.title}
               </a>
             </h2>
@@ -75,12 +99,17 @@
           <DownloadDiagnostic
             diagnostic={download.diagnostic}
             compact
-            href={appPath(`/downloads/${encodeURIComponent(download.client)}/${encodeURIComponent(download.infoHash)}`)}
+            href={releasePath(item, true)}
           />
         {/if}
         <footer>
-          <span>{item.provenance.stale ? "Tracker metadata stale · refreshing" : download.addedAt ? `Added ${relativeTime(download.addedAt)}` : download.clientState}</span>
-          <span>Ratio {download.ratio.toFixed(2)} · ↑ {formatSpeed(download.uploadSpeed)}</span>
+          <div class="download-card-meta">
+            <span>{item.provenance.stale ? "Tracker metadata stale · refreshing" : download.addedAt ? `Added ${relativeTime(download.addedAt)}` : download.clientState}</span>
+            <span>Ratio {download.ratio.toFixed(2)} · ↑ {formatSpeed(download.uploadSpeed)}</span>
+          </div>
+          <a class="download-release-link" href={releasePath(item)}>
+            View release <ArrowRight size={13} />
+          </a>
         </footer>
       </article>
     {/each}
