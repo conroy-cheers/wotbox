@@ -2,23 +2,33 @@ use std::{path::Path, str::FromStr};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectOptions,
+    Database as SeaDatabase, DatabaseConnection, EntityTrait, IntoActiveModel, ModelTrait,
+    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+};
+use sea_orm_migration::MigratorTrait;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-};
 use uuid::Uuid;
 
-use crate::dedupe::{CatalogMembership, RawSingleCoverage, ReleaseTrackIndex};
-use crate::model::{
-    ArtistCatalogPage, ArtistCreditSource, CanonicalTorrent, DownloadIndexCounts, DownloadJob,
-    DownloadState, LiveDownloadStatus, RuntimePreferences,
+use crate::{
+    dedupe::{CatalogMembership, RawSingleCoverage, ReleaseTrackIndex},
+    entity::{
+        canonical_release_artist, canonical_torrent, dedupe_catalog_membership,
+        download_client_scan, download_event, download_job, download_release_link,
+        release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
+    },
+    migration::Migrator,
+    model::{
+        ArtistCatalogPage, ArtistCreditSource, CanonicalTorrent, DownloadIndexCounts, DownloadJob,
+        DownloadState, LiveDownloadStatus, RuntimePreferences,
+    },
 };
 
 #[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    connection: DatabaseConnection,
 }
 
 pub struct Cached<T> {
@@ -77,21 +87,23 @@ impl Database {
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let mut options = ConnectOptions::new(url);
+        options
             .max_connections(8)
-            .connect_with(options)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| {
+                options
+                    .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Wal)
+                    .foreign_keys(true)
+            });
+        let connection = SeaDatabase::connect(options)
             .await
             .context("connect to SQLite")?;
-        sqlx::migrate!()
-            .run(&pool)
+        Migrator::up(&connection, None)
             .await
-            .context("run migrations")?;
-        Ok(Self { pool })
+            .context("run database migrations")?;
+        Ok(Self { connection })
     }
 
     pub async fn get_snapshot<T: DeserializeOwned>(
@@ -100,48 +112,44 @@ impl Database {
         kind: &str,
         key: &str,
     ) -> Result<Option<Cached<T>>> {
-        let row = sqlx::query(
-            "SELECT normalized_json, sanitized_raw_json, fetched_at, expires_at
-             FROM tracker_snapshots
-             WHERE tracker = ? AND resource_kind = ? AND resource_key = ?",
-        )
-        .bind(tracker)
-        .bind(kind)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else { return Ok(None) };
-        Ok(Some(Cached {
-            value: serde_json::from_str(row.get("normalized_json"))?,
-            fetched_at: DateTime::parse_from_rfc3339(row.get("fetched_at"))?.with_timezone(&Utc),
-            expires_at: DateTime::parse_from_rfc3339(row.get("expires_at"))?.with_timezone(&Utc),
-        }))
+        let model = tracker_snapshot::Entity::find()
+            .filter(tracker_snapshot::Column::Tracker.eq(tracker))
+            .filter(tracker_snapshot::Column::ResourceKind.eq(kind))
+            .filter(tracker_snapshot::Column::ResourceKey.eq(key))
+            .one(&self.connection)
+            .await?;
+        model.map(snapshot_from_model).transpose()
     }
 
     pub async fn get_runtime_preferences(&self) -> Result<RuntimePreferences> {
-        let value = sqlx::query_scalar::<_, String>(
-            "SELECT value_json FROM runtime_preferences WHERE key = 'runtime'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        match value {
-            Some(value) => Ok(serde_json::from_str(&value)?),
-            None => Ok(RuntimePreferences::default()),
-        }
+        let model = runtime_preference::Entity::find_by_id("runtime")
+            .one(&self.connection)
+            .await?;
+        model
+            .map(|model| serde_json::from_value(model.value_json).map_err(Into::into))
+            .unwrap_or_else(|| Ok(RuntimePreferences::default()))
     }
 
     pub async fn put_runtime_preferences(&self, preferences: &RuntimePreferences) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO runtime_preferences (key, value_json, updated_at)
-             VALUES ('runtime', ?, ?)
-             ON CONFLICT (key) DO UPDATE SET
-                value_json = excluded.value_json,
-                updated_at = excluded.updated_at",
-        )
-        .bind(serde_json::to_string(preferences)?)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let now = Utc::now().to_rfc3339();
+        let value = serde_json::to_value(preferences)?;
+        if let Some(model) = runtime_preference::Entity::find_by_id("runtime")
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.value_json = Set(value);
+            active.updated_at = Set(now);
+            active.update(&self.connection).await?;
+        } else {
+            runtime_preference::ActiveModel {
+                key: Set("runtime".into()),
+                value_json: Set(value),
+                updated_at: Set(now),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
@@ -156,106 +164,119 @@ impl Database {
         group_id: i64,
         priority: i64,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO release_track_indexes (tracker, group_id, state, priority, updated_at)
-             VALUES (?, ?, 'pending', ?, ?)
-             ON CONFLICT (tracker, group_id) DO UPDATE SET
-                priority = MAX(release_track_indexes.priority, excluded.priority),
-                state = CASE
-                    WHEN release_track_indexes.expires_at IS NOT NULL
-                     AND release_track_indexes.expires_at <= excluded.updated_at
-                    THEN 'pending'
-                    ELSE release_track_indexes.state
-                END,
-                next_retry_at = CASE
-                    WHEN release_track_indexes.expires_at IS NOT NULL
-                     AND release_track_indexes.expires_at <= excluded.updated_at
-                    THEN NULL
-                    ELSE release_track_indexes.next_retry_at
-                END,
-                updated_at = CASE
-                    WHEN release_track_indexes.expires_at IS NOT NULL
-                     AND release_track_indexes.expires_at <= excluded.updated_at
-                    THEN excluded.updated_at
-                    ELSE release_track_indexes.updated_at
-                END",
-        )
-        .bind(tracker)
-        .bind(group_id)
-        .bind(priority)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        let now = Utc::now();
+        if let Some(model) = release_track_index::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&self.connection)
+            .await?
+        {
+            let current_priority = model.priority;
+            let expired = model
+                .expires_at
+                .as_deref()
+                .map(parse_timestamp)
+                .transpose()?
+                .is_some_and(|expires_at| expires_at <= now);
+            let mut active = model.into_active_model();
+            active.priority = Set(current_priority.max(priority));
+            if expired {
+                active.state = Set("pending".into());
+                active.next_retry_at = Set(None);
+                active.updated_at = Set(now.to_rfc3339());
+            }
+            active.update(&self.connection).await?;
+        } else {
+            release_track_index::ActiveModel {
+                tracker: Set(tracker.into()),
+                group_id: Set(group_id),
+                state: Set("pending".into()),
+                index_json: Set(None),
+                attempts: Set(0),
+                next_retry_at: Set(None),
+                error_message: Set(None),
+                fetched_at: Set(None),
+                expires_at: Set(None),
+                updated_at: Set(now.to_rfc3339()),
+                priority: Set(priority),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
     pub async fn ensure_single_coverage(&self, tracker: &str, group_id: i64) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO single_album_coverages
-                (tracker, single_group_id, state, updated_at)
-             VALUES (?, ?, 'pending', ?)
-             ON CONFLICT (tracker, single_group_id) DO NOTHING",
-        )
-        .bind(tracker)
-        .bind(group_id)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        if single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&self.connection)
+            .await?
+            .is_none()
+        {
+            single_album_coverage::ActiveModel {
+                tracker: Set(tracker.into()),
+                single_group_id: Set(group_id),
+                state: Set("pending".into()),
+                coverage_json: Set(None),
+                updated_at: Set(Utc::now().to_rfc3339()),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
     pub async fn due_track_indexes(&self, limit: i64) -> Result<Vec<TrackIndexJob>> {
-        let rows = sqlx::query(
-            "SELECT tracker, group_id FROM release_track_indexes
-             WHERE state IN ('pending', 'failed')
-               AND (next_retry_at IS NULL OR next_retry_at <= ?)
-             ORDER BY priority DESC, updated_at ASC LIMIT ?",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
+        let now = Utc::now().to_rfc3339();
+        let models = release_track_index::Entity::find()
+            .filter(release_track_index::Column::State.is_in(["pending", "failed"]))
+            .filter(
+                Condition::any()
+                    .add(release_track_index::Column::NextRetryAt.is_null())
+                    .add(release_track_index::Column::NextRetryAt.lte(now)),
+            )
+            .order_by_desc(release_track_index::Column::Priority)
+            .order_by_asc(release_track_index::Column::UpdatedAt)
+            .limit(limit.max(0) as u64)
+            .all(&self.connection)
+            .await?;
+        Ok(models
             .into_iter()
-            .map(|row| TrackIndexJob {
-                tracker: row.get("tracker"),
-                group_id: row.get("group_id"),
+            .map(|model| TrackIndexJob {
+                tracker: model.tracker,
+                group_id: model.group_id,
             })
             .collect())
     }
 
     pub async fn set_track_index_resolving(&self, tracker: &str, group_id: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE release_track_indexes
-             SET state = 'resolving', updated_at = ?
-             WHERE tracker = ? AND group_id = ?",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(tracker)
-        .bind(group_id)
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) = release_track_index::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set("resolving".into());
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
     pub async fn put_track_index(&self, index: &ReleaseTrackIndex) -> Result<()> {
-        let now = Utc::now();
-        sqlx::query(
-            "UPDATE release_track_indexes SET
-                state = 'indexed', index_json = ?, attempts = 0,
-                next_retry_at = NULL, error_message = NULL,
-                fetched_at = ?, expires_at = ?, updated_at = ?
-             WHERE tracker = ? AND group_id = ?",
-        )
-        .bind(serde_json::to_string(index)?)
-        .bind(now.to_rfc3339())
-        .bind((now + chrono::Duration::hours(24)).to_rfc3339())
-        .bind(now.to_rfc3339())
-        .bind(&index.tracker)
-        .bind(index.group_id)
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) =
+            release_track_index::Entity::find_by_id((index.tracker.clone(), index.group_id))
+                .one(&self.connection)
+                .await?
+        {
+            let now = Utc::now();
+            let mut active = model.into_active_model();
+            active.state = Set("indexed".into());
+            active.index_json = Set(Some(serde_json::to_value(index)?));
+            active.attempts = Set(0);
+            active.next_retry_at = Set(None);
+            active.error_message = Set(None);
+            active.fetched_at = Set(Some(now.to_rfc3339()));
+            active.expires_at = Set(Some((now + chrono::Duration::hours(24)).to_rfc3339()));
+            active.updated_at = Set(now.to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -265,39 +286,35 @@ impl Database {
         group_id: i64,
         message: &str,
     ) -> Result<()> {
-        let attempts: i64 = sqlx::query_scalar(
-            "SELECT attempts FROM release_track_indexes WHERE tracker = ? AND group_id = ?",
-        )
-        .bind(tracker)
-        .bind(group_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let delay = chrono::Duration::seconds((30_i64 * (1_i64 << attempts.min(7))).min(3600));
-        sqlx::query(
-            "UPDATE release_track_indexes SET
-                state = 'failed', attempts = attempts + 1,
-                next_retry_at = ?, error_message = ?, updated_at = ?
-             WHERE tracker = ? AND group_id = ?",
-        )
-        .bind((Utc::now() + delay).to_rfc3339())
-        .bind(message.chars().take(500).collect::<String>())
-        .bind(Utc::now().to_rfc3339())
-        .bind(tracker)
-        .bind(group_id)
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) = release_track_index::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&self.connection)
+            .await?
+        {
+            let attempts = model.attempts;
+            let delay = chrono::Duration::seconds((30_i64 * (1_i64 << attempts.min(7))).min(3600));
+            let mut active = model.into_active_model();
+            active.state = Set("failed".into());
+            active.attempts = Set(attempts + 1);
+            active.next_retry_at = Set(Some((Utc::now() + delay).to_rfc3339()));
+            active.error_message = Set(Some(message.chars().take(500).collect()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
     pub async fn recover_track_indexes(&self) -> Result<()> {
-        sqlx::query(
-            "UPDATE release_track_indexes
-             SET state = 'pending', next_retry_at = NULL, updated_at = ?
-             WHERE state = 'resolving'",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let models = release_track_index::Entity::find()
+            .filter(release_track_index::Column::State.eq("resolving"))
+            .all(&self.connection)
+            .await?;
+        for model in models {
+            let mut active = model.into_active_model();
+            active.state = Set("pending".into());
+            active.next_retry_at = Set(None);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -306,25 +323,22 @@ impl Database {
         tracker: &str,
         catalog: &ArtistCatalogPage,
     ) -> Result<()> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("DELETE FROM dedupe_catalog_memberships WHERE tracker = ? AND artist_id = ?")
-            .bind(tracker)
-            .bind(catalog.artist.artist_id)
-            .execute(&mut *transaction)
+        let transaction = self.connection.begin().await?;
+        dedupe_catalog_membership::Entity::delete_many()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq(tracker))
+            .filter(dedupe_catalog_membership::Column::ArtistId.eq(catalog.artist.artist_id))
+            .exec(&transaction)
             .await?;
         let now = Utc::now().to_rfc3339();
         for group in &catalog.groups {
-            sqlx::query(
-                "INSERT INTO dedupe_catalog_memberships
-                    (tracker, artist_id, group_id, group_json, updated_at)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(tracker)
-            .bind(catalog.artist.artist_id)
-            .bind(group.release.group_id)
-            .bind(serde_json::to_string(group)?)
-            .bind(&now)
-            .execute(&mut *transaction)
+            dedupe_catalog_membership::ActiveModel {
+                tracker: Set(tracker.into()),
+                artist_id: Set(catalog.artist.artist_id),
+                group_id: Set(group.release.group_id),
+                group_json: Set(serde_json::to_value(group)?),
+                updated_at: Set(now.clone()),
+            }
+            .insert(&transaction)
             .await?;
         }
         transaction.commit().await?;
@@ -332,57 +346,51 @@ impl Database {
     }
 
     pub async fn list_catalog_memberships(&self) -> Result<Vec<CatalogMembership>> {
-        let rows = sqlx::query("SELECT artist_id, group_json FROM dedupe_catalog_memberships")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(|row| {
+        dedupe_catalog_membership::Entity::find()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| {
                 Ok(CatalogMembership {
-                    artist_id: row.get("artist_id"),
-                    group: serde_json::from_str(row.get("group_json"))?,
+                    artist_id: model.artist_id,
+                    group: serde_json::from_value(model.group_json)?,
                 })
             })
             .collect()
     }
 
     pub async fn list_track_indexes(&self) -> Result<Vec<StoredTrackIndex>> {
-        let rows =
-            sqlx::query("SELECT tracker, group_id, state, index_json FROM release_track_indexes")
-                .fetch_all(&self.pool)
-                .await?;
-        rows.into_iter()
-            .map(|row| {
-                let value: Option<&str> = row.get("index_json");
+        release_track_index::Entity::find()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| {
                 Ok(StoredTrackIndex {
-                    tracker: row.get("tracker"),
-                    group_id: row.get("group_id"),
-                    state: row.get("state"),
-                    index: value.map(serde_json::from_str).transpose()?,
+                    tracker: model.tracker,
+                    group_id: model.group_id,
+                    state: model.state,
+                    index: model.index_json.map(serde_json::from_value).transpose()?,
                 })
             })
             .collect()
     }
 
     pub async fn track_index_progress(&self) -> Result<TrackIndexProgress> {
-        let rows = sqlx::query(
-            "SELECT state, COUNT(*) AS count
-             FROM release_track_indexes GROUP BY state",
-        )
-        .fetch_all(&self.pool)
-        .await?;
         let mut progress = TrackIndexProgress {
             indexed: 0,
             pending: 0,
             resolving: 0,
             failed: 0,
         };
-        for row in rows {
-            let count = row.get::<i64, _>("count").max(0) as usize;
-            match row.get::<&str, _>("state") {
-                "indexed" => progress.indexed += count,
-                "pending" => progress.pending += count,
-                "resolving" => progress.resolving += count,
-                "failed" => progress.failed += count,
+        for model in release_track_index::Entity::find()
+            .all(&self.connection)
+            .await?
+        {
+            match model.state.as_str() {
+                "indexed" => progress.indexed += 1,
+                "pending" => progress.pending += 1,
+                "resolving" => progress.resolving += 1,
+                "failed" => progress.failed += 1,
                 _ => {}
             }
         }
@@ -396,22 +404,28 @@ impl Database {
         state: &str,
         coverage: Option<&RawSingleCoverage>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO single_album_coverages
-                (tracker, single_group_id, state, coverage_json, updated_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT (tracker, single_group_id) DO UPDATE SET
-                state = excluded.state,
-                coverage_json = excluded.coverage_json,
-                updated_at = excluded.updated_at",
-        )
-        .bind(tracker)
-        .bind(group_id)
-        .bind(state)
-        .bind(coverage.map(serde_json::to_string).transpose()?)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let coverage_json = coverage.map(serde_json::to_value).transpose()?;
+        if let Some(model) =
+            single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+                .one(&self.connection)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set(state.into());
+            active.coverage_json = Set(coverage_json);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        } else {
+            single_album_coverage::ActiveModel {
+                tracker: Set(tracker.into()),
+                single_group_id: Set(group_id),
+                state: Set(state.into()),
+                coverage_json: Set(coverage_json),
+                updated_at: Set(Utc::now().to_rfc3339()),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
@@ -420,22 +434,19 @@ impl Database {
         tracker: &str,
         group_id: i64,
     ) -> Result<Option<StoredCoverage>> {
-        let row = sqlx::query(
-            "SELECT state, coverage_json FROM single_album_coverages
-             WHERE tracker = ? AND single_group_id = ?",
-        )
-        .bind(tracker)
-        .bind(group_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            let value: Option<&str> = row.get("coverage_json");
-            Ok(StoredCoverage {
-                state: row.get("state"),
-                coverage: value.map(serde_json::from_str).transpose()?,
+        single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&self.connection)
+            .await?
+            .map(|model| {
+                Ok(StoredCoverage {
+                    state: model.state,
+                    coverage: model
+                        .coverage_json
+                        .map(serde_json::from_value)
+                        .transpose()?,
+                })
             })
-        })
-        .transpose()
+            .transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -449,26 +460,35 @@ impl Database {
         fetched_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO tracker_snapshots
-                (tracker, resource_kind, resource_key, normalized_json, sanitized_raw_json, fetched_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (tracker, resource_kind, resource_key) DO UPDATE SET
-                normalized_json = excluded.normalized_json,
-                sanitized_raw_json = excluded.sanitized_raw_json,
-                fetched_at = excluded.fetched_at,
-                expires_at = excluded.expires_at,
-                schema_version = 1",
-        )
-        .bind(tracker)
-        .bind(kind)
-        .bind(key)
-        .bind(serde_json::to_string(value)?)
-        .bind(serde_json::to_string(raw)?)
-        .bind(fetched_at.to_rfc3339())
-        .bind(expires_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let existing = tracker_snapshot::Entity::find()
+            .filter(tracker_snapshot::Column::Tracker.eq(tracker))
+            .filter(tracker_snapshot::Column::ResourceKind.eq(kind))
+            .filter(tracker_snapshot::Column::ResourceKey.eq(key))
+            .one(&self.connection)
+            .await?;
+        if let Some(model) = existing {
+            let mut active = model.into_active_model();
+            active.normalized_json = Set(serde_json::to_value(value)?);
+            active.sanitized_raw_json = Set(raw.clone());
+            active.fetched_at = Set(fetched_at.to_rfc3339());
+            active.expires_at = Set(expires_at.to_rfc3339());
+            active.schema_version = Set(1);
+            active.update(&self.connection).await?;
+        } else {
+            tracker_snapshot::ActiveModel {
+                id: Default::default(),
+                tracker: Set(tracker.into()),
+                resource_kind: Set(kind.into()),
+                resource_key: Set(key.into()),
+                normalized_json: Set(serde_json::to_value(value)?),
+                sanitized_raw_json: Set(raw.clone()),
+                fetched_at: Set(fetched_at.to_rfc3339()),
+                expires_at: Set(expires_at.to_rfc3339()),
+                schema_version: Set(1),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
@@ -488,20 +508,25 @@ impl Database {
         if let Some(existing) = self.find_job(tracker, torrent_id, profile).await? {
             if existing.state == DownloadState::Failed {
                 let now = Utc::now();
-                sqlx::query(
-                    "UPDATE download_jobs SET
-                        idempotency_key = ?, use_token = ?, group_id = NULL, info_hash = NULL,
-                        name = NULL, state = 'queued', progress = 0, download_speed = 0,
-                        upload_speed = 0, eta = NULL, error_code = NULL, error_message = NULL,
-                        updated_at = ?
-                     WHERE id = ?",
-                )
-                .bind(idempotency_key)
-                .bind(use_token)
-                .bind(now.to_rfc3339())
-                .bind(existing.id.to_string())
-                .execute(&self.pool)
-                .await?;
+                let model = download_job::Entity::find_by_id(existing.id.to_string())
+                    .one(&self.connection)
+                    .await?
+                    .context("download job disappeared while retrying")?;
+                let mut active = model.into_active_model();
+                active.idempotency_key = Set(idempotency_key.map(str::to_owned));
+                active.use_token = Set(use_token);
+                active.group_id = Set(None);
+                active.info_hash = Set(None);
+                active.name = Set(None);
+                active.state = Set("queued".into());
+                active.progress = Set(0.0);
+                active.download_speed = Set(0);
+                active.upload_speed = Set(0);
+                active.eta = Set(None);
+                active.error_code = Set(None);
+                active.error_message = Set(None);
+                active.updated_at = Set(now.to_rfc3339());
+                active.update(&self.connection).await?;
                 self.add_event(existing.id, &DownloadState::Queued, None)
                     .await?;
                 return Ok((
@@ -545,21 +570,27 @@ impl Database {
             created_at: now,
             updated_at: now,
         };
-        sqlx::query(
-            "INSERT INTO download_jobs
-             (id, idempotency_key, tracker, torrent_id, profile, use_token, state, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(job.id.to_string())
-        .bind(idempotency_key)
-        .bind(tracker)
-        .bind(torrent_id)
-        .bind(profile)
-        .bind(use_token)
-        .bind(job.state.as_str())
-        .bind(now.to_rfc3339())
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        download_job::ActiveModel {
+            id: Set(job.id.to_string()),
+            idempotency_key: Set(idempotency_key.map(str::to_owned)),
+            tracker: Set(tracker.into()),
+            torrent_id: Set(torrent_id),
+            group_id: Set(None),
+            profile: Set(profile.into()),
+            use_token: Set(use_token),
+            info_hash: Set(None),
+            name: Set(None),
+            state: Set(job.state.as_str().into()),
+            progress: Set(0.0),
+            download_speed: Set(0),
+            upload_speed: Set(0),
+            eta: Set(None),
+            error_code: Set(None),
+            error_message: Set(None),
+            created_at: Set(now.to_rfc3339()),
+            updated_at: Set(now.to_rfc3339()),
+        }
+        .insert(&self.connection)
         .await?;
         self.add_event(job.id, &job.state, None).await?;
         Ok((job, true))
@@ -572,16 +603,17 @@ impl Database {
         info_hash: &str,
         name: &str,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE download_jobs SET group_id = ?, info_hash = ?, name = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(group_id)
-        .bind(info_hash)
-        .bind(name)
-        .bind(Utc::now().to_rfc3339())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) = download_job::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.group_id = Set(group_id);
+            active.info_hash = Set(Some(info_hash.into()));
+            active.name = Set(Some(name.into()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -591,17 +623,17 @@ impl Database {
         state: DownloadState,
         error: Option<(&str, &str)>,
     ) -> Result<()> {
-        let (code, message) = error.unwrap_or(("", ""));
-        sqlx::query(
-            "UPDATE download_jobs SET state = ?, error_code = NULLIF(?, ''), error_message = NULLIF(?, ''), updated_at = ? WHERE id = ?",
-        )
-        .bind(state.as_str())
-        .bind(code)
-        .bind(message)
-        .bind(Utc::now().to_rfc3339())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) = download_job::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set(state.as_str().into());
+            active.error_code = Set(error.map(|(code, _)| code.to_owned()));
+            active.error_message = Set(error.map(|(_, message)| message.to_owned()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         self.add_event(id, &state, error.map(|(_, message)| message))
             .await?;
         Ok(())
@@ -616,36 +648,38 @@ impl Database {
         upload_speed: i64,
         eta: Option<i64>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE download_jobs
-             SET state = ?, progress = ?, download_speed = ?, upload_speed = ?, eta = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(state.as_str())
-        .bind(progress)
-        .bind(download_speed)
-        .bind(upload_speed)
-        .bind(eta)
-        .bind(Utc::now().to_rfc3339())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) = download_job::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set(state.as_str().into());
+            active.progress = Set(progress);
+            active.download_speed = Set(download_speed);
+            active.upload_speed = Set(upload_speed);
+            active.eta = Set(eta);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
     pub async fn list_jobs(&self) -> Result<Vec<DownloadJob>> {
-        let rows = sqlx::query("SELECT * FROM download_jobs ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_job).collect()
+        download_job::Entity::find()
+            .order_by_desc(download_job::Column::CreatedAt)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(job_from_model)
+            .collect()
     }
 
     pub async fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>> {
-        let row = sqlx::query("SELECT * FROM download_jobs WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(row_to_job).transpose()
+        download_job::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+            .map(job_from_model)
+            .transpose()
     }
 
     pub async fn put_canonical(
@@ -655,16 +689,14 @@ impl Database {
         expires_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut canonical = canonical.clone();
-        let existing_torrent = sqlx::query(
-            "SELECT canonical_json FROM canonical_torrents
-             WHERE tracker = ? AND torrent_id = ?",
-        )
-        .bind(&canonical.release.tracker)
-        .bind(canonical.variant.torrent_id)
-        .fetch_optional(&self.pool)
+        let existing_torrent = canonical_torrent::Entity::find_by_id((
+            canonical.release.tracker.clone(),
+            canonical.variant.torrent_id,
+        ))
+        .one(&self.connection)
         .await?;
-        if let Some(row) = &existing_torrent {
-            let previous: CanonicalTorrent = serde_json::from_str(row.get("canonical_json"))?;
+        if let Some(model) = &existing_torrent {
+            let previous: CanonicalTorrent = serde_json::from_value(model.canonical_json.clone())?;
             if canonical.variant.info_hash.is_none() {
                 canonical.variant.info_hash = previous.variant.info_hash;
             }
@@ -699,20 +731,18 @@ impl Database {
             .iter()
             .any(|artist| artist.source == ArtistCreditSource::Structured);
         if !incoming_is_structured {
-            let existing = if existing_torrent.is_some() {
-                existing_torrent
-            } else {
-                sqlx::query(
-                    "SELECT canonical_json FROM canonical_torrents
-                     WHERE tracker = ? AND group_id = ? LIMIT 1",
-                )
-                .bind(&canonical.release.tracker)
-                .bind(canonical.release.group_id)
-                .fetch_optional(&self.pool)
-                .await?
+            let previous_model = match existing_torrent.as_ref() {
+                Some(model) => Some(model.clone()),
+                None => {
+                    canonical_torrent::Entity::find()
+                        .filter(canonical_torrent::Column::Tracker.eq(&canonical.release.tracker))
+                        .filter(canonical_torrent::Column::GroupId.eq(canonical.release.group_id))
+                        .one(&self.connection)
+                        .await?
+                }
             };
-            if let Some(row) = existing {
-                let previous: CanonicalTorrent = serde_json::from_str(row.get("canonical_json"))?;
+            if let Some(model) = previous_model {
+                let previous: CanonicalTorrent = serde_json::from_value(model.canonical_json)?;
                 if previous
                     .release
                     .artists
@@ -726,26 +756,29 @@ impl Database {
                 }
             }
         }
-        sqlx::query(
-            "INSERT INTO canonical_torrents
-                (tracker, torrent_id, group_id, info_hash, canonical_json, fetched_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (tracker, torrent_id) DO UPDATE SET
-                group_id = excluded.group_id,
-                info_hash = excluded.info_hash,
-                canonical_json = excluded.canonical_json,
-                fetched_at = excluded.fetched_at,
-                expires_at = excluded.expires_at",
-        )
-        .bind(&canonical.release.tracker)
-        .bind(canonical.variant.torrent_id)
-        .bind(canonical.release.group_id)
-        .bind(canonical.variant.info_hash.as_deref())
-        .bind(serde_json::to_string(&canonical)?)
-        .bind(fetched_at.to_rfc3339())
-        .bind(expires_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+
+        let canonical_json = serde_json::to_value(&canonical)?;
+        if let Some(model) = existing_torrent {
+            let mut active = model.into_active_model();
+            active.group_id = Set(canonical.release.group_id);
+            active.info_hash = Set(canonical.variant.info_hash.clone());
+            active.canonical_json = Set(canonical_json);
+            active.fetched_at = Set(fetched_at.to_rfc3339());
+            active.expires_at = Set(expires_at.to_rfc3339());
+            active.update(&self.connection).await?;
+        } else {
+            canonical_torrent::ActiveModel {
+                tracker: Set(canonical.release.tracker.clone()),
+                torrent_id: Set(canonical.variant.torrent_id),
+                group_id: Set(canonical.release.group_id),
+                info_hash: Set(canonical.variant.info_hash.clone()),
+                canonical_json: Set(canonical_json),
+                fetched_at: Set(fetched_at.to_rfc3339()),
+                expires_at: Set(expires_at.to_rfc3339()),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         self.replace_release_artists(&canonical).await?;
         Ok(())
     }
@@ -754,33 +787,32 @@ impl Database {
         if canonical.release.artists.is_empty() {
             return Ok(());
         }
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("DELETE FROM canonical_release_artists WHERE tracker = ? AND group_id = ?")
-            .bind(&canonical.release.tracker)
-            .bind(canonical.release.group_id)
-            .execute(&mut *transaction)
+        let transaction = self.connection.begin().await?;
+        canonical_release_artist::Entity::delete_many()
+            .filter(canonical_release_artist::Column::Tracker.eq(&canonical.release.tracker))
+            .filter(canonical_release_artist::Column::GroupId.eq(canonical.release.group_id))
+            .exec(&transaction)
             .await?;
         for artist in &canonical.release.artists {
-            sqlx::query(
-                "INSERT INTO canonical_release_artists
-                    (tracker, group_id, artist_key, artist_id, name, sort_name, role, source)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&canonical.release.tracker)
-            .bind(canonical.release.group_id)
-            .bind(&artist.key)
-            .bind(artist.artist_id)
-            .bind(&artist.name)
-            .bind(artist_sort_name(&artist.name))
-            .bind(match artist.role {
-                crate::model::ArtistRole::Primary => "primary",
-                crate::model::ArtistRole::Guest => "guest",
-            })
-            .bind(match artist.source {
-                ArtistCreditSource::Structured => "structured",
-                ArtistCreditSource::DisplayFallback => "display_fallback",
-            })
-            .execute(&mut *transaction)
+            canonical_release_artist::ActiveModel {
+                tracker: Set(canonical.release.tracker.clone()),
+                group_id: Set(canonical.release.group_id),
+                artist_key: Set(artist.key.clone()),
+                role: Set(match artist.role {
+                    crate::model::ArtistRole::Primary => "primary",
+                    crate::model::ArtistRole::Guest => "guest",
+                }
+                .into()),
+                artist_id: Set(artist.artist_id),
+                name: Set(artist.name.clone()),
+                sort_name: Set(artist_sort_name(&artist.name)),
+                source: Set(match artist.source {
+                    ArtistCreditSource::Structured => "structured",
+                    ArtistCreditSource::DisplayFallback => "display_fallback",
+                }
+                .into()),
+            }
+            .insert(&transaction)
             .await?;
         }
         transaction.commit().await?;
@@ -792,24 +824,20 @@ impl Database {
         tracker: &str,
         torrent_id: i64,
     ) -> Result<Option<Cached<CanonicalTorrent>>> {
-        let row = sqlx::query(
-            "SELECT canonical_json, fetched_at, expires_at
-             FROM canonical_torrents WHERE tracker = ? AND torrent_id = ?",
-        )
-        .bind(tracker)
-        .bind(torrent_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(canonical_from_row).transpose()
+        canonical_torrent::Entity::find_by_id((tracker.to_owned(), torrent_id))
+            .one(&self.connection)
+            .await?
+            .map(canonical_from_model)
+            .transpose()
     }
 
     pub async fn list_canonical_for_tracker(&self, tracker: &str) -> Result<Vec<CanonicalTorrent>> {
-        let rows = sqlx::query("SELECT canonical_json FROM canonical_torrents WHERE tracker = ?")
-            .bind(tracker)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(|row| serde_json::from_str(row.get("canonical_json")).map_err(Into::into))
+        canonical_torrent::Entity::find()
+            .filter(canonical_torrent::Column::Tracker.eq(tracker))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| serde_json::from_value(model.canonical_json).map_err(Into::into))
             .collect()
     }
 
@@ -823,60 +851,64 @@ impl Database {
         let now = now_value.to_rfc3339();
         let completed_at =
             (live.progress >= 1.0).then(|| live.completed_at.unwrap_or(now_value).to_rfc3339());
+        let hash = live.info_hash.to_ascii_lowercase();
         let state = if tracker.is_some() {
             "pending"
         } else {
             "unconfigured"
         };
-        sqlx::query(
-            "INSERT INTO download_release_links
-                (client, info_hash, announce_host, tracker, resolution_state,
-                 first_seen_at, last_seen_at, updated_at, present,
-                 missing_since, library_added_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
-             ON CONFLICT (client, info_hash) DO UPDATE SET
-                announce_host = excluded.announce_host,
-                tracker = CASE
-                    WHEN download_release_links.resolution_state = 'linked'
-                        THEN download_release_links.tracker
-                    ELSE excluded.tracker
-                END,
-                resolution_state = CASE
-                    WHEN download_release_links.resolution_state = 'linked'
-                        THEN 'linked'
-                    WHEN COALESCE(download_release_links.tracker, '') != COALESCE(excluded.tracker, '')
-                        THEN excluded.resolution_state
-                    ELSE download_release_links.resolution_state
-                END,
-                last_seen_at = excluded.last_seen_at,
-                present = 1,
-                missing_since = NULL,
-                library_added_at = COALESCE(
-                    download_release_links.library_added_at,
-                    excluded.library_added_at
-                ),
-                completed_at = COALESCE(
-                    download_release_links.completed_at,
-                    excluded.completed_at
-                ),
-                updated_at = CASE
-                    WHEN download_release_links.resolution_state = 'linked'
-                        THEN download_release_links.updated_at
-                    ELSE excluded.updated_at
-                END",
-        )
-        .bind(&live.client)
-        .bind(live.info_hash.to_ascii_lowercase())
-        .bind(announce_host)
-        .bind(tracker)
-        .bind(state)
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .bind(&completed_at)
-        .bind(&completed_at)
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) =
+            download_release_link::Entity::find_by_id((live.client.clone(), hash.clone()))
+                .one(&self.connection)
+                .await?
+        {
+            let linked = model.resolution_state == "linked";
+            let tracker_changed = model.tracker.as_deref() != tracker;
+            let has_library_added_at = model.library_added_at.is_some();
+            let has_completed_at = model.completed_at.is_some();
+            let mut active = model.into_active_model();
+            active.announce_host = Set(announce_host.map(str::to_owned));
+            if !linked {
+                active.tracker = Set(tracker.map(str::to_owned));
+                if tracker_changed {
+                    active.resolution_state = Set(state.into());
+                }
+                active.updated_at = Set(now.clone());
+            }
+            active.last_seen_at = Set(now);
+            active.present = Set(true);
+            active.missing_since = Set(None);
+            if !has_library_added_at && completed_at.is_some() {
+                active.library_added_at = Set(completed_at.clone());
+            }
+            if !has_completed_at && completed_at.is_some() {
+                active.completed_at = Set(completed_at);
+            }
+            active.update(&self.connection).await?;
+        } else {
+            download_release_link::ActiveModel {
+                client: Set(live.client.clone()),
+                info_hash: Set(hash),
+                announce_host: Set(announce_host.map(str::to_owned)),
+                tracker: Set(tracker.map(str::to_owned)),
+                group_id: Set(None),
+                torrent_id: Set(None),
+                resolution_state: Set(state.into()),
+                attempts: Set(0),
+                next_retry_at: Set(None),
+                error_code: Set(None),
+                error_message: Set(None),
+                first_seen_at: Set(now.clone()),
+                last_seen_at: Set(now.clone()),
+                updated_at: Set(now),
+                present: Set(true),
+                missing_since: Set(None),
+                library_added_at: Set(completed_at.clone()),
+                completed_at: Set(completed_at),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
@@ -890,60 +922,79 @@ impl Database {
         linked: bool,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO download_release_links
-                (client, info_hash, tracker, group_id, torrent_id, resolution_state,
-                 first_seen_at, last_seen_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (client, info_hash) DO UPDATE SET
-                tracker = excluded.tracker,
-                group_id = excluded.group_id,
-                torrent_id = excluded.torrent_id,
-                resolution_state = excluded.resolution_state,
-                next_retry_at = NULL,
-                error_code = NULL,
-                error_message = NULL,
-                last_seen_at = excluded.last_seen_at,
-                updated_at = excluded.updated_at",
-        )
-        .bind(client)
-        .bind(info_hash.to_ascii_lowercase())
-        .bind(tracker)
-        .bind(group_id)
-        .bind(torrent_id)
-        .bind(if linked { "linked" } else { "pending" })
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        let hash = info_hash.to_ascii_lowercase();
+        if let Some(model) =
+            download_release_link::Entity::find_by_id((client.to_owned(), hash.clone()))
+                .one(&self.connection)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.tracker = Set(Some(tracker.into()));
+            active.group_id = Set(group_id);
+            active.torrent_id = Set(Some(torrent_id));
+            active.resolution_state = Set(if linked { "linked" } else { "pending" }.into());
+            active.next_retry_at = Set(None);
+            active.error_code = Set(None);
+            active.error_message = Set(None);
+            active.last_seen_at = Set(now.clone());
+            active.updated_at = Set(now);
+            active.update(&self.connection).await?;
+        } else {
+            download_release_link::ActiveModel {
+                client: Set(client.into()),
+                info_hash: Set(hash),
+                announce_host: Set(None),
+                tracker: Set(Some(tracker.into())),
+                group_id: Set(group_id),
+                torrent_id: Set(Some(torrent_id)),
+                resolution_state: Set(if linked { "linked" } else { "pending" }.into()),
+                attempts: Set(0),
+                next_retry_at: Set(None),
+                error_code: Set(None),
+                error_message: Set(None),
+                first_seen_at: Set(now.clone()),
+                last_seen_at: Set(now.clone()),
+                updated_at: Set(now),
+                present: Set(true),
+                missing_since: Set(None),
+                library_added_at: Set(None),
+                completed_at: Set(None),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
         Ok(())
     }
 
     pub async fn due_links(&self, limit: i64) -> Result<Vec<DownloadReleaseLink>> {
-        let rows = sqlx::query(
-            "SELECT * FROM download_release_links
-             WHERE tracker IS NOT NULL
-               AND resolution_state IN ('pending', 'failed')
-               AND (next_retry_at IS NULL OR next_retry_at <= ?)
-             ORDER BY updated_at ASC LIMIT ?",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(link_from_row).collect()
+        let now = Utc::now().to_rfc3339();
+        let models = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Tracker.is_not_null())
+            .filter(download_release_link::Column::ResolutionState.is_in(["pending", "failed"]))
+            .filter(
+                Condition::any()
+                    .add(download_release_link::Column::NextRetryAt.is_null())
+                    .add(download_release_link::Column::NextRetryAt.lte(now)),
+            )
+            .order_by_asc(download_release_link::Column::UpdatedAt)
+            .limit(limit.max(0) as u64)
+            .all(&self.connection)
+            .await?;
+        Ok(models.into_iter().map(link_from_model).collect())
     }
 
     pub async fn recover_resolving_links(&self) -> Result<()> {
-        sqlx::query(
-            "UPDATE download_release_links
-             SET resolution_state = 'pending', next_retry_at = NULL, updated_at = ?
-             WHERE resolution_state = 'resolving'",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let models = download_release_link::Entity::find()
+            .filter(download_release_link::Column::ResolutionState.eq("resolving"))
+            .all(&self.connection)
+            .await?;
+        for model in models {
+            let mut active = model.into_active_model();
+            active.resolution_state = Set("pending".into());
+            active.next_retry_at = Set(None);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -953,49 +1004,56 @@ impl Database {
         scan_started_at: DateTime<Utc>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE download_release_links
-             SET present = 0, missing_since = COALESCE(missing_since, ?)
-             WHERE client = ? AND last_seen_at < ? AND library_added_at IS NOT NULL",
-        )
-        .bind(&now)
-        .bind(client)
-        .bind(scan_started_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "DELETE FROM download_release_links
-             WHERE client = ? AND last_seen_at < ? AND library_added_at IS NULL",
-        )
-        .bind(client)
-        .bind(scan_started_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "INSERT INTO download_client_scans (client, last_successful_at)
-             VALUES (?, ?)
-             ON CONFLICT (client) DO UPDATE SET last_successful_at = excluded.last_successful_at",
-        )
-        .bind(client)
-        .bind(&now)
-        .execute(&mut *transaction)
-        .await?;
+        let transaction = self.connection.begin().await?;
+        let stale = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Client.eq(client))
+            .filter(download_release_link::Column::LastSeenAt.lt(scan_started_at.to_rfc3339()))
+            .all(&transaction)
+            .await?;
+        for model in stale {
+            if model.library_added_at.is_some() {
+                let has_missing_since = model.missing_since.is_some();
+                let mut active = model.into_active_model();
+                active.present = Set(false);
+                if !has_missing_since {
+                    active.missing_since = Set(Some(now.clone()));
+                }
+                active.update(&transaction).await?;
+            } else {
+                model.delete(&transaction).await?;
+            }
+        }
+        if let Some(model) = download_client_scan::Entity::find_by_id(client)
+            .one(&transaction)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.last_successful_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            download_client_scan::ActiveModel {
+                client: Set(client.into()),
+                last_successful_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
 
     pub async fn set_link_resolving(&self, client: &str, info_hash: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE download_release_links
-             SET resolution_state = 'resolving', updated_at = ?
-             WHERE client = ? AND info_hash = ? AND resolution_state != 'linked'",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(client)
-        .bind(info_hash)
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) =
+            download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
+                .one(&self.connection)
+                .await?
+            && model.resolution_state != "linked"
+        {
+            let mut active = model.into_active_model();
+            active.resolution_state = Set("resolving".into());
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -1005,21 +1063,22 @@ impl Database {
         info_hash: &str,
         canonical: &CanonicalTorrent,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE download_release_links SET
-                tracker = ?, group_id = ?, torrent_id = ?,
-                resolution_state = 'linked', next_retry_at = NULL,
-                error_code = NULL, error_message = NULL, updated_at = ?
-             WHERE client = ? AND info_hash = ?",
-        )
-        .bind(&canonical.release.tracker)
-        .bind(canonical.release.group_id)
-        .bind(canonical.variant.torrent_id)
-        .bind(Utc::now().to_rfc3339())
-        .bind(client)
-        .bind(info_hash)
-        .execute(&self.pool)
-        .await?;
+        if let Some(model) =
+            download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
+                .one(&self.connection)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.tracker = Set(Some(canonical.release.tracker.clone()));
+            active.group_id = Set(Some(canonical.release.group_id));
+            active.torrent_id = Set(Some(canonical.variant.torrent_id));
+            active.resolution_state = Set("linked".into());
+            active.next_retry_at = Set(None);
+            active.error_code = Set(None);
+            active.error_message = Set(None);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -1030,66 +1089,64 @@ impl Database {
         not_found: bool,
         message: &str,
     ) -> Result<()> {
-        let row = sqlx::query(
-            "SELECT attempts, first_seen_at FROM download_release_links
-             WHERE client = ? AND info_hash = ?",
-        )
-        .bind(client)
-        .bind(info_hash)
-        .fetch_one(&self.pool)
-        .await?;
-        let attempts: i64 = row.get("attempts");
-        let first_seen =
-            DateTime::parse_from_rfc3339(row.get("first_seen_at"))?.with_timezone(&Utc);
-        let next_attempt = attempts + 1;
+        let model =
+            download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
+                .one(&self.connection)
+                .await?
+                .context("download release link disappeared while recording failure")?;
+        let first_seen = parse_timestamp(&model.first_seen_at)?;
         let old_enough = Utc::now() - first_seen >= chrono::Duration::hours(24);
-        let state = if not_found && old_enough {
-            "not_found"
-        } else {
-            "failed"
-        };
         let delay = if not_found {
             chrono::Duration::hours(1)
         } else {
-            chrono::Duration::seconds((30_i64 * (1_i64 << attempts.min(7))).min(3600))
+            chrono::Duration::seconds((30_i64 * (1_i64 << model.attempts.min(7))).min(3600))
         };
-        sqlx::query(
-            "UPDATE download_release_links SET
-                resolution_state = ?, attempts = ?, next_retry_at = ?,
-                error_code = ?, error_message = ?, updated_at = ?
-             WHERE client = ? AND info_hash = ?",
-        )
-        .bind(state)
-        .bind(next_attempt)
-        .bind((!not_found || !old_enough).then(|| (Utc::now() + delay).to_rfc3339()))
-        .bind(if not_found {
+        let attempts = model.attempts;
+        let mut active = model.into_active_model();
+        active.resolution_state = Set(if not_found && old_enough {
             "not_found"
         } else {
-            "tracker_error"
-        })
-        .bind(message.chars().take(500).collect::<String>())
-        .bind(Utc::now().to_rfc3339())
-        .bind(client)
-        .bind(info_hash)
-        .execute(&self.pool)
-        .await?;
+            "failed"
+        }
+        .into());
+        active.attempts = Set(attempts + 1);
+        active.next_retry_at =
+            Set((!not_found || !old_enough).then(|| (Utc::now() + delay).to_rfc3339()));
+        active.error_code = Set(Some(
+            if not_found {
+                "not_found"
+            } else {
+                "tracker_error"
+            }
+            .into(),
+        ));
+        active.error_message = Set(Some(message.chars().take(500).collect()));
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
         Ok(())
     }
 
     pub async fn retry_link(&self, client: &str, info_hash: &str) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE download_release_links SET
-                resolution_state = 'pending', next_retry_at = NULL,
-                error_code = NULL, error_message = NULL, updated_at = ?
-             WHERE client = ? AND info_hash = ?
-               AND tracker IS NOT NULL AND resolution_state IN ('failed', 'not_found')",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(client)
-        .bind(info_hash.to_ascii_lowercase())
-        .execute(&self.pool)
+        let model = download_release_link::Entity::find_by_id((
+            client.to_owned(),
+            info_hash.to_ascii_lowercase(),
+        ))
+        .one(&self.connection)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let Some(model) = model.filter(|model| {
+            model.tracker.is_some()
+                && matches!(model.resolution_state.as_str(), "failed" | "not_found")
+        }) else {
+            return Ok(false);
+        };
+        let mut active = model.into_active_model();
+        active.resolution_state = Set("pending".into());
+        active.next_retry_at = Set(None);
+        active.error_code = Set(None);
+        active.error_message = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(true)
     }
 
     pub async fn get_link(
@@ -1097,31 +1154,28 @@ impl Database {
         client: &str,
         info_hash: &str,
     ) -> Result<Option<DownloadReleaseLink>> {
-        let row =
-            sqlx::query("SELECT * FROM download_release_links WHERE client = ? AND info_hash = ?")
-                .bind(client)
-                .bind(info_hash.to_ascii_lowercase())
-                .fetch_optional(&self.pool)
-                .await?;
-        row.as_ref().map(link_from_row).transpose()
+        Ok(download_release_link::Entity::find_by_id((
+            client.to_owned(),
+            info_hash.to_ascii_lowercase(),
+        ))
+        .one(&self.connection)
+        .await?
+        .map(link_from_model))
     }
 
     pub async fn index_counts(&self) -> Result<DownloadIndexCounts> {
-        let rows = sqlx::query(
-            "SELECT resolution_state, COUNT(*) AS count
-             FROM download_release_links WHERE present = 1 GROUP BY resolution_state",
-        )
-        .fetch_all(&self.pool)
-        .await?;
         let mut counts = DownloadIndexCounts::default();
-        for row in rows {
-            let count = row.get("count");
-            match row.get::<&str, _>("resolution_state") {
-                "linked" => counts.linked = count,
-                "pending" => counts.pending = count,
-                "resolving" => counts.resolving = count,
-                "unconfigured" => counts.unconfigured = count,
-                "failed" | "not_found" => counts.failed += count,
+        for model in download_release_link::Entity::find()
+            .filter(download_release_link::Column::Present.eq(true))
+            .all(&self.connection)
+            .await?
+        {
+            match model.resolution_state.as_str() {
+                "linked" => counts.linked += 1,
+                "pending" => counts.pending += 1,
+                "resolving" => counts.resolving += 1,
+                "unconfigured" => counts.unconfigured += 1,
+                "failed" | "not_found" => counts.failed += 1,
                 _ => {}
             }
         }
@@ -1129,27 +1183,57 @@ impl Database {
     }
 
     pub async fn list_library_records(&self) -> Result<Vec<LibraryRecord>> {
-        let rows = sqlx::query(
-            "SELECT c.canonical_json, c.fetched_at, c.expires_at,
-                    l.client, l.info_hash, l.present, l.library_added_at,
-                    l.completed_at, l.last_seen_at, l.missing_since
-             FROM download_release_links l
-             JOIN canonical_torrents c
-               ON c.tracker = l.tracker AND c.torrent_id = l.torrent_id
-             WHERE l.resolution_state = 'linked' AND l.library_added_at IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(library_record_from_row).collect()
+        let links = download_release_link::Entity::find()
+            .filter(download_release_link::Column::ResolutionState.eq("linked"))
+            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
+            .all(&self.connection)
+            .await?;
+        let mut records = Vec::with_capacity(links.len());
+        for link in links {
+            let (Some(tracker), Some(torrent_id), Some(library_added_at)) = (
+                link.tracker.as_deref(),
+                link.torrent_id,
+                link.library_added_at.as_deref(),
+            ) else {
+                continue;
+            };
+            let Some(canonical) =
+                canonical_torrent::Entity::find_by_id((tracker.to_owned(), torrent_id))
+                    .one(&self.connection)
+                    .await?
+            else {
+                continue;
+            };
+            let library_added_at = parse_timestamp(library_added_at)?;
+            records.push(LibraryRecord {
+                canonical: canonical_from_model(canonical)?,
+                client: link.client,
+                info_hash: link.info_hash,
+                present: link.present,
+                library_added_at,
+                completed_at: link
+                    .completed_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?
+                    .unwrap_or(library_added_at),
+                last_seen_at: parse_timestamp(&link.last_seen_at)?,
+                missing_since: link
+                    .missing_since
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?,
+            });
+        }
+        Ok(records)
     }
 
     pub async fn last_successful_download_scan(&self) -> Result<Option<DateTime<Utc>>> {
-        let value: Option<String> =
-            sqlx::query_scalar("SELECT MIN(last_successful_at) FROM download_client_scans")
-                .fetch_one(&self.pool)
-                .await?;
-        value
-            .map(|value| Ok(DateTime::parse_from_rfc3339(&value)?.with_timezone(&Utc)))
+        download_client_scan::Entity::find()
+            .order_by_asc(download_client_scan::Column::LastSuccessfulAt)
+            .one(&self.connection)
+            .await?
+            .map(|model| parse_timestamp(&model.last_successful_at))
             .transpose()
     }
 
@@ -1159,83 +1243,63 @@ impl Database {
         torrent_id: i64,
         profile: &str,
     ) -> Result<Option<DownloadJob>> {
-        let row = sqlx::query(
-            "SELECT * FROM download_jobs WHERE tracker = ? AND torrent_id = ? AND profile = ?",
-        )
-        .bind(tracker)
-        .bind(torrent_id)
-        .bind(profile)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.as_ref().map(row_to_job).transpose()
+        download_job::Entity::find()
+            .filter(download_job::Column::Tracker.eq(tracker))
+            .filter(download_job::Column::TorrentId.eq(torrent_id))
+            .filter(download_job::Column::Profile.eq(profile))
+            .one(&self.connection)
+            .await?
+            .map(job_from_model)
+            .transpose()
     }
 
     async fn find_job_by_idempotency_key(&self, key: &str) -> Result<Option<DownloadJob>> {
-        let row = sqlx::query("SELECT * FROM download_jobs WHERE idempotency_key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
-        row.as_ref().map(row_to_job).transpose()
+        download_job::Entity::find()
+            .filter(download_job::Column::IdempotencyKey.eq(key))
+            .one(&self.connection)
+            .await?
+            .map(job_from_model)
+            .transpose()
     }
 
     async fn add_event(&self, id: Uuid, state: &DownloadState, detail: Option<&str>) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO download_events (job_id, state, detail, created_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(state.as_str())
-        .bind(detail)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        download_event::ActiveModel {
+            id: Default::default(),
+            job_id: Set(id.to_string()),
+            state: Set(state.as_str().into()),
+            detail: Set(detail.map(str::to_owned)),
+            created_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&self.connection)
         .await?;
         Ok(())
     }
 }
 
-fn canonical_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Cached<CanonicalTorrent>> {
+fn snapshot_from_model<T: DeserializeOwned>(model: tracker_snapshot::Model) -> Result<Cached<T>> {
     Ok(Cached {
-        value: serde_json::from_str(row.get("canonical_json"))?,
-        fetched_at: DateTime::parse_from_rfc3339(row.get("fetched_at"))?.with_timezone(&Utc),
-        expires_at: DateTime::parse_from_rfc3339(row.get("expires_at"))?.with_timezone(&Utc),
+        value: serde_json::from_value(model.normalized_json)?,
+        fetched_at: parse_timestamp(&model.fetched_at)?,
+        expires_at: parse_timestamp(&model.expires_at)?,
     })
 }
 
-fn link_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadReleaseLink> {
-    Ok(DownloadReleaseLink {
-        client: row.get("client"),
-        info_hash: row.get("info_hash"),
-        tracker: row.get("tracker"),
-        torrent_id: row.get("torrent_id"),
-        resolution_state: row.get("resolution_state"),
+fn canonical_from_model(model: canonical_torrent::Model) -> Result<Cached<CanonicalTorrent>> {
+    Ok(Cached {
+        value: serde_json::from_value(model.canonical_json)?,
+        fetched_at: parse_timestamp(&model.fetched_at)?,
+        expires_at: parse_timestamp(&model.expires_at)?,
     })
 }
 
-fn library_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<LibraryRecord> {
-    let library_added_at =
-        DateTime::parse_from_rfc3339(row.get("library_added_at"))?.with_timezone(&Utc);
-    let completed_at: Option<&str> = row.get("completed_at");
-    let missing_since: Option<&str> = row.get("missing_since");
-    Ok(LibraryRecord {
-        canonical: Cached {
-            value: serde_json::from_str(row.get("canonical_json"))?,
-            fetched_at: DateTime::parse_from_rfc3339(row.get("fetched_at"))?.with_timezone(&Utc),
-            expires_at: DateTime::parse_from_rfc3339(row.get("expires_at"))?.with_timezone(&Utc),
-        },
-        client: row.get("client"),
-        info_hash: row.get("info_hash"),
-        present: row.get("present"),
-        library_added_at,
-        completed_at: completed_at
-            .map(DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or(library_added_at),
-        last_seen_at: DateTime::parse_from_rfc3339(row.get("last_seen_at"))?.with_timezone(&Utc),
-        missing_since: missing_since
-            .map(DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|value| value.with_timezone(&Utc)),
-    })
+fn link_from_model(model: download_release_link::Model) -> DownloadReleaseLink {
+    DownloadReleaseLink {
+        client: model.client,
+        info_hash: model.info_hash,
+        tracker: model.tracker,
+        torrent_id: model.torrent_id,
+        resolution_state: model.resolution_state,
+    }
 }
 
 fn artist_sort_name(name: &str) -> String {
@@ -1246,34 +1310,40 @@ fn artist_sort_name(name: &str) -> String {
         .to_owned()
 }
 
-fn row_to_job(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadJob> {
+fn job_from_model(model: download_job::Model) -> Result<DownloadJob> {
     Ok(DownloadJob {
-        id: Uuid::parse_str(row.get("id"))?,
-        tracker: row.get("tracker"),
-        torrent_id: row.get("torrent_id"),
-        group_id: row.get("group_id"),
-        profile: row.get("profile"),
-        use_token: row.get("use_token"),
-        info_hash: row.get("info_hash"),
-        name: row.get("name"),
-        state: DownloadState::from_str(row.get("state"))?,
-        progress: row.get("progress"),
-        download_speed: row.get("download_speed"),
-        upload_speed: row.get("upload_speed"),
-        eta: row.get("eta"),
-        error_code: row.get("error_code"),
-        error_message: row.get("error_message"),
-        created_at: DateTime::parse_from_rfc3339(row.get("created_at"))?.with_timezone(&Utc),
-        updated_at: DateTime::parse_from_rfc3339(row.get("updated_at"))?.with_timezone(&Utc),
+        id: Uuid::parse_str(&model.id)?,
+        tracker: model.tracker,
+        torrent_id: model.torrent_id,
+        group_id: model.group_id,
+        profile: model.profile,
+        use_token: model.use_token,
+        info_hash: model.info_hash,
+        name: model.name,
+        state: DownloadState::from_str(&model.state)?,
+        progress: model.progress,
+        download_speed: model.download_speed,
+        upload_speed: model.upload_speed,
+        eta: model.eta,
+        error_code: model.error_code,
+        error_message: model.error_message,
+        created_at: parse_timestamp(&model.created_at)?,
+        updated_at: parse_timestamp(&model.updated_at)?,
     })
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, IntoActiveModel};
     use tempfile::tempdir;
 
     use crate::{
+        entity::download_release_link,
         model::{
             CanonicalTorrent, ClientDownloadState, LiveDownloadStatus, ReleaseSummary,
             TorrentVariant,
@@ -1377,11 +1447,16 @@ mod tests {
         db.seed_download_link("music", hash, "ops", None, 20, false)
             .await
             .expect("link");
-        sqlx::query("UPDATE download_release_links SET first_seen_at = ? WHERE client = 'music'")
-            .bind((Utc::now() - Duration::hours(25)).to_rfc3339())
-            .execute(&db.pool)
-            .await
-            .expect("age link");
+        let model =
+            download_release_link::Entity::find_by_id(("music".to_owned(), hash.to_owned()))
+                .one(&db.connection)
+                .await
+                .expect("lookup link")
+                .expect("link");
+        let mut active = model.into_active_model();
+        active.first_seen_at = Set((Utc::now() - Duration::hours(25)).to_rfc3339());
+        active.update(&db.connection).await.expect("age link");
+
         db.set_link_failure("music", hash, true, "not found")
             .await
             .expect("negative result");

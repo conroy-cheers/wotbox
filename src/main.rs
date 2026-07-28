@@ -2,6 +2,8 @@ mod api;
 mod config;
 mod db;
 mod dedupe;
+mod entity;
+mod migration;
 mod model;
 mod qbittorrent;
 mod tracker;

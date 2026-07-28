@@ -76,7 +76,6 @@
             ./Cargo.lock
             ./Cargo.toml
             ./build.rs
-            ./migrations
             ./src
           ];
           rustPackageSource = lib.fileset.toSource {
@@ -213,7 +212,6 @@
               pkgs.rust-analyzer
               pkgs.rustc
               pkgs.rustfmt
-              pkgs.sqlx-cli
               pkgs.cargo-nextest
               pkgs.netcat
               pkgs.openssh
