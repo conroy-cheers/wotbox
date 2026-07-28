@@ -2291,32 +2291,41 @@ async fn enrich_requested_variant(
     let Some(torrent_id) = torrent_id else {
         return Ok(());
     };
-    if variants
-        .iter()
-        .any(|variant| variant.torrent_id == torrent_id)
-    {
-        return Ok(());
-    }
     let Some(cached) = state.db.get_canonical(tracker, torrent_id).await? else {
         return Ok(());
     };
-    append_requested_variant(variants, tracker, group_id, cached.value);
+    merge_requested_variant(variants, tracker, group_id, torrent_id, cached.value);
     Ok(())
 }
 
-fn append_requested_variant(
+fn merge_requested_variant(
     variants: &mut Vec<TorrentVariant>,
     tracker: &str,
     group_id: i64,
+    torrent_id: i64,
     canonical: CanonicalTorrent,
 ) -> bool {
     if !canonical.release.tracker.eq_ignore_ascii_case(tracker)
         || canonical.release.group_id != group_id
-        || variants
-            .iter()
-            .any(|variant| variant.torrent_id == canonical.variant.torrent_id)
+        || canonical.variant.torrent_id != torrent_id
     {
         return false;
+    }
+    if let Some(variant) = variants
+        .iter_mut()
+        .find(|variant| variant.torrent_id == torrent_id)
+    {
+        let mut changed = false;
+        if variant.info_hash.is_none() && canonical.variant.info_hash.is_some() {
+            variant.info_hash = canonical.variant.info_hash;
+            changed = true;
+        }
+        if !variant.token_eligibility_known && canonical.variant.token_eligibility_known {
+            variant.can_use_token = canonical.variant.can_use_token;
+            variant.token_eligibility_known = true;
+            changed = true;
+        }
+        return changed;
     }
     variants.push(canonical.variant);
     true
@@ -2847,7 +2856,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_canonical_variant_is_appended_only_to_its_release() {
+    fn requested_canonical_variant_fills_partial_tracker_variants() {
         let release = library_release(176023, Vec::new()).release;
         let canonical = CanonicalTorrent {
             release,
@@ -2857,10 +2866,11 @@ mod tests {
             record_label: None,
         };
         let mut variants = vec![torrent_variant(111, 176023)];
-        assert!(append_requested_variant(
+        assert!(merge_requested_variant(
             &mut variants,
             "OPS",
             176023,
+            345678,
             canonical.clone()
         ));
         assert_eq!(
@@ -2870,18 +2880,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![111, 345678]
         );
-        assert!(!append_requested_variant(
+        assert!(!merge_requested_variant(
             &mut variants,
             "ops",
             176023,
+            345678,
             canonical.clone()
         ));
-        assert!(!append_requested_variant(
+        assert!(!merge_requested_variant(
             &mut Vec::new(),
             "ops",
             999,
+            345678,
             canonical
         ));
+
+        let mut partial = torrent_variant(345678, 176023);
+        partial.info_hash = None;
+        partial.token_eligibility_known = false;
+        let mut variants = vec![partial];
+        let canonical = CanonicalTorrent {
+            release: library_release(176023, Vec::new()).release,
+            variant: torrent_variant(345678, 176023),
+            tags: Vec::new(),
+            description: None,
+            record_label: None,
+        };
+        assert!(merge_requested_variant(
+            &mut variants,
+            "ops",
+            176023,
+            345678,
+            canonical
+        ));
+        assert_eq!(variants[0].info_hash.as_deref(), Some("HASH345678"));
+        assert!(variants[0].token_eligibility_known);
     }
 
     #[test]

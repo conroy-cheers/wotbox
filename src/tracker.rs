@@ -207,15 +207,15 @@ impl TrackerClient for GazelleTrackerClient {
     async fn download_torrent(&self, id: i64, use_token: bool) -> Result<Vec<u8>> {
         self.limiter.execute().await;
         let endpoint = self.base_url.join("ajax.php")?;
+        let mut query = vec![("action", "download".to_owned()), ("id", id.to_string())];
+        if use_token {
+            query.push(("usetoken", "1".to_owned()));
+        }
         let response = self
             .client
             .get(endpoint)
             .header("Authorization", format!("token {}", self.token))
-            .query(&[
-                ("action", "download".to_owned()),
-                ("id", id.to_string()),
-                ("usetoken", if use_token { "1" } else { "0" }.to_owned()),
-            ])
+            .query(&query)
             .send()
             .await?;
         if !response.status().is_success() {
@@ -226,6 +226,12 @@ impl TrackerClient for GazelleTrackerClient {
         }
         let bytes = response.bytes().await?;
         if bytes.is_empty() || bytes.first() != Some(&b'd') {
+            if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                bail!(
+                    "tracker rejected torrent download: {}",
+                    tracker_error(&body)
+                );
+            }
             bail!("tracker returned an invalid torrent payload");
         }
         Ok(bytes.to_vec())
@@ -798,7 +804,7 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path, query_param},
+        matchers::{header, method, path, query_param, query_param_is_missing},
     };
 
     use crate::config::{TrackerConfig, TrackerKind};
@@ -1089,5 +1095,87 @@ mod tests {
             .await
             .expect("hash lookup");
         assert_eq!(canonical.variant.info_hash.as_deref(), Some(lowercase));
+    }
+
+    #[tokio::test]
+    async fn omits_token_parameter_for_normal_torrent_downloads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ajax.php"))
+            .and(query_param("action", "download"))
+            .and(query_param("id", "99"))
+            .and(query_param_is_missing("usetoken"))
+            .and(header("authorization", "token tracker-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"d4:infode".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_tracker_client(&server);
+
+        let payload = client
+            .download_torrent(99, false)
+            .await
+            .expect("torrent download");
+        assert_eq!(payload, b"d4:infode");
+    }
+
+    #[tokio::test]
+    async fn sends_token_parameter_only_when_requested() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ajax.php"))
+            .and(query_param("action", "download"))
+            .and(query_param("id", "99"))
+            .and(query_param("usetoken", "1"))
+            .and(header("authorization", "token tracker-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"d4:infode".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_tracker_client(&server);
+
+        client
+            .download_torrent(99, true)
+            .await
+            .expect("token torrent download");
+    }
+
+    #[tokio::test]
+    async fn surfaces_json_errors_from_torrent_downloads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ajax.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "failure",
+                "error": "already freeleech"
+            })))
+            .mount(&server)
+            .await;
+        let client = test_tracker_client(&server);
+
+        let error = client
+            .download_torrent(99, false)
+            .await
+            .expect_err("tracker failure");
+        assert_eq!(
+            error.to_string(),
+            "tracker rejected torrent download: already freeleech"
+        );
+    }
+
+    fn test_tracker_client(server: &MockServer) -> GazelleTrackerClient {
+        let directory = tempdir().expect("temporary directory");
+        let token_path = directory.path().join("token");
+        std::fs::write(&token_path, "tracker-token").expect("write token");
+        GazelleTrackerClient::new(
+            "ops".into(),
+            &TrackerConfig {
+                kind: TrackerKind::Ops,
+                base_url: server.uri(),
+                token_file: token_path,
+                announce_hosts: vec!["home.opsfet.ch".into()],
+            },
+        )
+        .expect("tracker client")
     }
 }

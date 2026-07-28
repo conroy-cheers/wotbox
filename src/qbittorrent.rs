@@ -117,6 +117,14 @@ struct QbitTorrent {
     completion_on: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct AddTorrentResult {
+    #[serde(default)]
+    success_count: u64,
+    #[serde(default)]
+    failure_count: u64,
+}
+
 impl QbitTorrent {
     fn normalized(self, client: &str) -> ObservedDownload {
         ObservedDownload {
@@ -252,10 +260,17 @@ impl DownloadClient for QbittorrentClient {
             bail!("qBittorrent add returned HTTP {}", response.status());
         }
         let body = response.text().await?;
-        if body.trim() != "Ok." {
-            bail!("qBittorrent rejected add request: {}", body.trim());
+        let body = body.trim();
+        if body == "Ok." {
+            return Ok(());
         }
-        Ok(())
+        if let Ok(result) = serde_json::from_str::<AddTorrentResult>(body)
+            && result.success_count > 0
+            && result.failure_count == 0
+        {
+            return Ok(());
+        }
+        bail!("qBittorrent rejected add request: {body}")
     }
 }
 
@@ -381,5 +396,78 @@ mod tests {
         assert!(!public_json.contains("tracker.invalid"));
         assert!(!public_json.contains("A tracker download"));
         assert!(!public_json.contains("\"tags\""));
+    }
+
+    #[tokio::test]
+    async fn accepts_structured_add_success_responses() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/add"))
+            .and(header(
+                "authorization",
+                "Bearer qbt_0123456789012345678901234567",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "added_torrent_ids": ["abcdef0123456789abcdef0123456789abcdef01"],
+                "failure_count": 0,
+                "pending_count": 0,
+                "success_count": 1
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+
+        client
+            .add_torrent(b"d4:infode".to_vec(), "ops-99.torrent", &test_profile())
+            .await
+            .expect("structured success");
+    }
+
+    #[tokio::test]
+    async fn rejects_structured_add_failure_responses() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "added_torrent_ids": [],
+                "failure_count": 1,
+                "pending_count": 0,
+                "success_count": 0
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+
+        assert!(
+            client
+                .add_torrent(b"d4:infode".to_vec(), "ops-99.torrent", &test_profile(),)
+                .await
+                .is_err()
+        );
+    }
+
+    fn test_client(server: &MockServer) -> QbittorrentClient {
+        let directory = tempdir().expect("temporary directory");
+        let key_path = directory.path().join("qbit-key");
+        std::fs::write(&key_path, "qbt_0123456789012345678901234567").expect("write key");
+        QbittorrentClient::new(
+            "music".into(),
+            &DownloadClientConfig {
+                kind: DownloadClientKind::Qbittorrent,
+                base_url: server.uri(),
+                api_key_file: key_path,
+            },
+        )
+        .expect("client")
+    }
+
+    fn test_profile() -> crate::model::DownloadProfile {
+        crate::model::DownloadProfile {
+            name: "ops".into(),
+            client: "music".into(),
+            save_path: "/downloads/ops".into(),
+            tag: "ops".into(),
+            start_paused: false,
+        }
     }
 }
