@@ -112,6 +112,20 @@ cargo run -- --config config.example.toml
 The backend listens on `127.0.0.1:8780` by default. The Vite development
 server proxies `/api` and `/health` to it.
 
+The packaged Rust build uses crate2nix and keeps its generated `Cargo.nix` in
+the repository. This lets Nix cache dependency crates independently, so a
+normal source edit rebuilds the Wotbox crate without recompiling its entire
+dependency graph. Regenerate the file whenever `Cargo.toml` or `Cargo.lock`
+changes:
+
+```console
+nix run .#update-cargo-nix
+```
+
+The same `crate2nix` command is available inside `nix develop`. A clean
+crate2nix build has more derivations than the previous monolithic build because
+it populates the per-crate cache; subsequent builds reuse them.
+
 Run the full validation set with:
 
 ```console

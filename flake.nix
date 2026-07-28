@@ -72,30 +72,53 @@
               runHook postInstall
             '';
           });
-          source = lib.fileset.toSource {
+          rustPackageFiles = lib.fileset.unions [
+            ./Cargo.lock
+            ./Cargo.toml
+            ./build.rs
+            ./migrations
+            ./src
+          ];
+          rustPackageSource = lib.fileset.toSource {
+            root = ./.;
+            fileset = rustPackageFiles;
+          };
+          rustTestSource = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [
-              ./Cargo.lock
-              ./Cargo.toml
-              ./build.rs
-              ./migrations
-              ./src
+              rustPackageFiles
+              ./tests
             ];
           };
-          package = pkgs.rustPlatform.buildRustPackage {
-            inherit pname version;
-            src = source;
-            cargoLock.lockFile = ./Cargo.lock;
-            WOTBOX_UI_DIST = frontend;
-            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-            doCheck = true;
-            meta = {
-              description = "Gazelle tracker and qBittorrent manager";
-              homepage = "https://github.com/conroy-cheers/wotbox";
-              license = lib.licenses.agpl3Only;
-              mainProgram = "wotbox";
-              platforms = lib.platforms.unix;
+          cargoNix = pkgs.callPackage ./Cargo.nix { };
+          crateOverridesFor =
+            src:
+            pkgs.defaultCrateOverrides
+            // {
+              wotbox = _: {
+                inherit src;
+                WOTBOX_UI_DIST = frontend;
+                SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+                meta = {
+                  description = "Gazelle tracker and qBittorrent manager";
+                  homepage = "https://github.com/conroy-cheers/wotbox";
+                  license = lib.licenses.agpl3Only;
+                  mainProgram = "wotbox";
+                  platforms = lib.platforms.unix;
+                };
+              };
             };
+          package = cargoNix.rootCrate.build.override {
+            crateOverrides = crateOverridesFor rustPackageSource;
+          };
+          packageTests = cargoNix.rootCrate.build.override {
+            crateOverrides = crateOverridesFor rustTestSource;
+            runTests = true;
+          };
+          updateCargoNix = pkgs.writeShellApplication {
+            name = "wotbox-update-cargo-nix";
+            runtimeInputs = [ pkgs.crate2nix ];
+            text = "crate2nix generate";
           };
           devSleet = pkgs.writeShellApplication {
             name = "wotbox-dev-sleet";
@@ -123,6 +146,7 @@
             wotbox = package;
             frontend = frontend;
             dev-sleet = devSleet;
+            update-cargo-nix = updateCargoNix;
           };
 
           apps = {
@@ -134,10 +158,15 @@
               type = "app";
               program = lib.getExe devSleet;
             };
+            update-cargo-nix = {
+              type = "app";
+              program = lib.getExe updateCargoNix;
+            };
           };
 
           checks = {
-            inherit package frontend;
+            inherit frontend;
+            package = packageTests;
           }
           // lib.optionalAttrs pkgs.stdenv.isLinux {
             module = pkgs.testers.runNixOSTest {
@@ -178,6 +207,7 @@
             packages = [
               pkgs.cargo
               pkgs.clippy
+              pkgs.crate2nix
               pkgs.nodejs_24
               pnpm
               pkgs.rust-analyzer
@@ -191,7 +221,7 @@
             RUST_LOG = "wotbox=debug,tower_http=info";
           };
 
-          formatter = pkgs.nixfmt-rfc-style;
+          formatter = pkgs.nixfmt;
         };
     };
 }
