@@ -12,7 +12,9 @@ fi
 
 ssh_host="${WOTBOX_DEV_SSH_HOST:-sleet}"
 qbit_remote_port="${WOTBOX_DEV_QBIT_REMOTE_PORT:-8001}"
-qbit_local_port="${WOTBOX_DEV_QBIT_LOCAL_PORT:-18001}"
+# qBittorrent validates the request Host port during API-key authentication,
+# so the local tunnel must mirror the upstream WebUI port by default.
+qbit_local_port="${WOTBOX_DEV_QBIT_LOCAL_PORT:-8001}"
 backend_port="${WOTBOX_DEV_BACKEND_PORT:-8780}"
 frontend_port="${WOTBOX_DEV_FRONTEND_PORT:-5173}"
 state_directory="${WOTBOX_DEV_STATE_DIRECTORY:-$PWD/.state}"

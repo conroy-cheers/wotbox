@@ -41,6 +41,8 @@ export type SearchTorrent = {
   freeleech: boolean;
   canUseToken: boolean;
   remasterTitle?: string;
+  infoHash?: string;
+  downloads: LiveDownloadStatus[];
 };
 
 export type SearchGroup = {
@@ -80,12 +82,19 @@ export type ClientDownloadState =
   | "error"
   | "unknown";
 
-export type ClientDownload = {
+export type DownloadDiagnostic = {
+  code: "missing_files" | "client_error" | string;
+  summary: string;
+  message: string;
+  action: string;
+};
+
+export type LiveDownloadStatus = {
   client: string;
   infoHash: string;
-  name: string;
   state: ClientDownloadState;
   clientState: string;
+  diagnostic?: DownloadDiagnostic;
   progress: number;
   size: number;
   downloaded: number;
@@ -95,11 +104,161 @@ export type ClientDownload = {
   eta?: number;
   ratio: number;
   savePath: string;
-  category: string;
-  tags: string[];
-  tracker?: string;
   addedAt?: string;
   completedAt?: string;
+};
+
+export type ReleaseSummary = {
+  tracker: string;
+  groupId: number;
+  title: string;
+  artist?: string;
+  artists: ArtistCredit[];
+  year?: number;
+  artwork?: string;
+  releaseType?: string;
+};
+
+export type ArtistCredit = {
+  key: string;
+  tracker: string;
+  artistId?: number;
+  name: string;
+  role: "primary" | "guest";
+  source: "structured" | "display_fallback";
+};
+
+export type LibraryAvailability = "present" | "partial" | "missing";
+
+export type LibraryCopy = {
+  client: string;
+  infoHash: string;
+  present: boolean;
+  completedAt: string;
+  lastSeenAt: string;
+  missingSince?: string;
+};
+
+export type LibraryVariantState = {
+  availability: LibraryAvailability;
+  copies: LibraryCopy[];
+};
+
+export type TorrentVariant = {
+  tracker: string;
+  torrentId: number;
+  groupId: number;
+  infoHash?: string;
+  format?: string;
+  encoding?: string;
+  media?: string;
+  size?: number;
+  seeders?: number;
+  leechers?: number;
+  snatched?: number;
+  freeleech: boolean;
+  canUseToken: boolean;
+  tokenEligibilityKnown: boolean;
+  remasterTitle?: string;
+  downloads: LiveDownloadStatus[];
+  library?: LibraryVariantState;
+};
+
+export type ReleaseDetail = {
+  release: ReleaseSummary;
+  tags: string[];
+  description?: string;
+  recordLabel?: string;
+  variants: TorrentVariant[];
+};
+
+export type CanonicalDownload = {
+  release: ReleaseSummary;
+  variant: TorrentVariant;
+  download: LiveDownloadStatus;
+  provenance: Provenance;
+};
+
+export type DownloadsPage = {
+  items: CanonicalDownload[];
+  index: {
+    linked: number;
+    pending: number;
+    resolving: number;
+    failed: number;
+    unconfigured: number;
+  };
+};
+
+export type LibraryRelease = {
+  release: ReleaseSummary;
+  variants: TorrentVariant[];
+  availability: LibraryAvailability;
+  addedAt: string;
+  provenance: Provenance;
+};
+
+export type LibraryArtistSummary = {
+  key: string;
+  tracker: string;
+  artistId?: number;
+  creditSource: "structured" | "display_fallback";
+  name: string;
+  releaseCount: number;
+  missingCount: number;
+  artworks: string[];
+};
+
+export type LibraryIndexStatus = {
+  lastSuccessfulScanAt?: string;
+  unresolvedCredits: number;
+};
+
+export type LibraryArtistsPage = {
+  artists: LibraryArtistSummary[];
+  releases: LibraryRelease[];
+  artistTotal: number;
+  releaseTotal: number;
+  index: LibraryIndexStatus;
+};
+
+export type LibraryArtistPage = {
+  artist: LibraryArtistSummary;
+  items: LibraryRelease[];
+  total: number;
+  index: LibraryIndexStatus;
+};
+
+export type ArtistCatalogRole =
+  | "primary"
+  | "guest"
+  | "remixer"
+  | "composer"
+  | "conductor"
+  | "dj"
+  | "producer"
+  | "arranger";
+
+export type ArtistCatalogRelease = {
+  release: ReleaseSummary;
+  tags: string[];
+  variants: TorrentVariant[];
+  roles: ArtistCatalogRole[];
+  listedOnTracker: boolean;
+  libraryAvailability?: LibraryAvailability;
+  libraryAddedAt?: string;
+};
+
+export type ArtistCatalogPage = {
+  artist: {
+    tracker: string;
+    artistId: number;
+    name: string;
+    artwork?: string;
+  };
+  groups: ArtistCatalogRelease[];
+  primaryCount: number;
+  appearanceCount: number;
 };
 
 export type DownloadState =
@@ -136,6 +295,31 @@ export type CreateDownload = {
   torrentId: number;
   profile: string;
   useToken: boolean;
+};
+
+export type QualityPreference = "hi_res" | "lossless" | "320" | "v0" | "other";
+
+export type ReleasePreferences = {
+  qualityOrder: QualityPreference[];
+  minimumQuality: QualityPreference;
+  mediaTiers: string[][];
+};
+
+export type RuntimePreferences = {
+  release: ReleasePreferences;
+};
+
+export type DownloadSelection = {
+  name: string;
+  artist?: string;
+  torrent: {
+    torrentId: number;
+    format?: string;
+    encoding?: string;
+    freeleech: boolean;
+    canUseToken: boolean;
+    tokenEligibilityKnown?: boolean;
+  };
 };
 
 const configuredBase = window.__WOTBOX_CONFIG__?.basePath ?? "";

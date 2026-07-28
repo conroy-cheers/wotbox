@@ -7,6 +7,7 @@ database_path = "./wotbox.sqlite"
 kind = "ops"
 base_url = "https://orpheus.network"
 token_file = "./ops-token"
+announce_hosts = ["home.opsfet.ch"]
 
 [download_clients.music]
 kind = "qbittorrent"

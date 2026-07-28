@@ -2,18 +2,24 @@
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
   import { onMount } from "svelte";
   import page from "page";
-  import { ArrowDownToLine, LayoutDashboard, Search, Settings2 } from "@lucide/svelte";
+  import { ArrowDownToLine, BookOpen, LayoutDashboard, Search, Settings2 } from "@lucide/svelte";
   import { appPath, basePath } from "./lib/api";
   import Dashboard from "./pages/Dashboard.svelte";
   import DownloadDetails from "./pages/DownloadDetails.svelte";
   import Downloads from "./pages/Downloads.svelte";
+  import Library from "./pages/Library.svelte";
+  import LibraryArtist from "./pages/LibraryArtist.svelte";
+  import Preferences from "./pages/Preferences.svelte";
   import Release from "./pages/Release.svelte";
   import SearchPage from "./pages/Search.svelte";
 
   type Route =
     | { name: "dashboard" }
     | { name: "search" }
+    | { name: "library" }
+    | { name: "libraryArtist"; tracker: string; artistKey: string }
     | { name: "downloads" }
+    | { name: "preferences" }
     | { name: "download"; client: string; infoHash: string }
     | { name: "release"; tracker: string; id: string };
 
@@ -32,7 +38,14 @@
     page.base(basePath);
     page("/", () => route = { name: "dashboard" });
     page("/search", () => route = { name: "search" });
+    page("/library", () => route = { name: "library" });
+    page("/library/artists/:tracker/:artistKey", (context) => route = {
+      name: "libraryArtist",
+      tracker: context.params.tracker,
+      artistKey: context.params.artistKey
+    });
     page("/downloads", () => route = { name: "downloads" });
+    page("/preferences", () => route = { name: "preferences" });
     page("/downloads/:client/:infoHash", (context) => route = {
       name: "download",
       client: context.params.client,
@@ -51,7 +64,9 @@
   const navigation = [
     { name: "dashboard", label: "Dashboard", path: "/", icon: LayoutDashboard },
     { name: "search", label: "Search", path: "/search", icon: Search },
-    { name: "downloads", label: "Downloads", path: "/downloads", icon: ArrowDownToLine }
+    { name: "library", label: "Library", path: "/library", icon: BookOpen },
+    { name: "downloads", label: "Downloads", path: "/downloads", icon: ArrowDownToLine },
+    { name: "preferences", label: "Preferences", path: "/preferences", icon: Settings2 }
   ];
 </script>
 
@@ -64,7 +79,7 @@
       </a>
       <nav aria-label="Main navigation">
         {#each navigation as item}
-          <a href={appPath(item.path)} class:active={route.name === item.name}>
+          <a href={appPath(item.path)} class:active={route.name === item.name || (item.name === "library" && route.name === "libraryArtist")}>
             <item.icon size={19} />
             <span>{item.label}</span>
           </a>
@@ -80,17 +95,23 @@
         <Dashboard />
       {:else if route.name === "search"}
         <SearchPage />
+      {:else if route.name === "library"}
+        <Library />
+      {:else if route.name === "libraryArtist"}
+        <LibraryArtist tracker={route.tracker} artistKey={route.artistKey} />
       {:else if route.name === "downloads"}
         <Downloads />
       {:else if route.name === "download"}
         <DownloadDetails client={route.client} infoHash={route.infoHash} />
+      {:else if route.name === "preferences"}
+        <Preferences />
       {:else}
         <Release tracker={route.tracker} id={route.id} />
       {/if}
     </main>
     <nav class="mobile-nav" aria-label="Mobile navigation">
       {#each navigation as item}
-        <a href={appPath(item.path)} class:active={route.name === item.name}>
+        <a href={appPath(item.path)} class:active={route.name === item.name || (item.name === "library" && route.name === "libraryArtist")}>
           <item.icon size={19} />
           <span>{item.label}</span>
         </a>

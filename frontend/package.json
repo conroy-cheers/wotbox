@@ -11,9 +11,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@lucide/svelte": "^1.27.0",
     "@tanstack/svelte-query": "^5.85.5",
     "bits-ui": "^2.9.1",
-    "@lucide/svelte": "^1.27.0",
+    "dompurify": "^3.4.12",
     "page": "^1.11.6",
     "svelte": "^5.0.0"
   },

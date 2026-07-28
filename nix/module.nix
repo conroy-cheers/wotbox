@@ -20,6 +20,10 @@ let
       };
       baseUrl = mkOption { type = lib.types.str; };
       tokenFile = mkOption { type = lib.types.str; };
+      announceHosts = mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+      };
     };
   };
 
@@ -51,6 +55,7 @@ let
       inherit (tracker) kind;
       base_url = tracker.baseUrl;
       token_file = tracker.tokenFile;
+      announce_hosts = tracker.announceHosts;
     }) cfg.trackers;
     download_clients = lib.mapAttrs (_: client: {
       kind = "qbittorrent";

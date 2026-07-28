@@ -32,6 +32,8 @@ pub struct TrackerConfig {
     pub kind: TrackerKind,
     pub base_url: String,
     pub token_file: PathBuf,
+    #[serde(default, alias = "announceHosts")]
+    pub announce_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -140,6 +142,7 @@ impl Config {
                 kind: TrackerKind::Ops,
                 base_url: "https://orpheus.network".into(),
                 token_file: ops_path,
+                announce_hosts: vec!["home.opsfet.ch".into()],
             },
         );
         config.download_clients.insert(

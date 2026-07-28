@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { createMutation, createQuery, useQueryClient } from "@tanstack/svelte-query";
-  import { Dialog } from "bits-ui";
+  import { createQuery } from "@tanstack/svelte-query";
   import { derived, writable } from "svelte/store";
-  import { ArrowDownToLine, Check, Disc3, Search as SearchIcon, SlidersHorizontal, Users } from "@lucide/svelte";
-  import { api, appPath, formatBytes, type CreateDownload, type DownloadJob, type DownloadProfile, type Envelope, type PublicConfig, type SearchGroup, type SearchPage, type SearchTorrent } from "../lib/api";
+  import { Disc3, Search as SearchIcon, SlidersHorizontal } from "@lucide/svelte";
+  import { api, appPath, type Envelope, type PublicConfig, type SearchGroup, type SearchPage, type SearchTorrent } from "../lib/api";
+  import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
+  import PreferredVariants from "../lib/PreferredVariants.svelte";
+  import { releaseTypeColor } from "../lib/releasePresentation";
   import StaleNotice from "../lib/StaleNotice.svelte";
 
   const initial = new URLSearchParams(location.search);
@@ -24,19 +26,11 @@
   let tracker = $state(initialValues.tracker);
   let submitted = $state(initialValues.submitted);
   let selected = $state<{ group: SearchGroup; torrent: SearchTorrent } | null>(null);
-  let useToken = $state(false);
-  let selectedProfile = $state("ops");
-  const queryClient = useQueryClient();
 
   const config = createQuery({
     queryKey: ["config"],
     queryFn: () => api<PublicConfig>("/api/v1/config")
   });
-  const profiles = createQuery({
-    queryKey: ["download-profiles"],
-    queryFn: () => api<DownloadProfile[]>("/api/v1/download-profiles")
-  });
-
   const searchValues = writable(initialValues);
   const resultOptions = derived(searchValues, (values) => {
     const params = new URLSearchParams();
@@ -53,20 +47,6 @@
     };
   });
   const results = createQuery(resultOptions);
-
-  const addDownload = createMutation({
-    mutationFn: (request: CreateDownload) =>
-      api<DownloadJob>("/api/v1/downloads", {
-        method: "POST",
-        headers: { "Idempotency-Key": crypto.randomUUID() },
-        body: JSON.stringify(request)
-      }),
-    onSuccess: async () => {
-      selected = null;
-      useToken = false;
-      await queryClient.invalidateQueries({ queryKey: ["downloads"] });
-    }
-  });
 
   function submit(event: SubmitEvent) {
     event.preventDefault();
@@ -153,7 +133,7 @@
   </div>
   <div class="result-list">
     {#each $results.data.data.groups as group}
-      <article class="release-card">
+      <article class="release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(group.releaseType)}`}>
         <div class="cover">
           <Disc3 size={36} />
           {#if group.image}
@@ -177,27 +157,13 @@
               {#each group.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}
             </div>
           </div>
-          <div class="torrent-list">
-            {#each group.torrents as torrent}
-              <div class="torrent-row">
-                <div class="torrent-format">
-                  <strong>{torrent.format ?? "Unknown"}</strong>
-                  <span>{torrent.encoding ?? "Unknown"} · {torrent.media ?? "Unknown"}</span>
-                  {#if torrent.remasterTitle}<small>{torrent.remasterTitle}</small>{/if}
-                </div>
-                <span class="torrent-size">{formatBytes(torrent.size)}</span>
-                <span class="peer-count" title="Seeders"><Users size={14} /> {torrent.seeders ?? 0}</span>
-                <div class="torrent-flags">
-                  {#if torrent.freeleech}<span class="free-badge">Free</span>{/if}
-                  {#if torrent.canUseToken}<span class="token-badge">Token</span>{/if}
-                </div>
-                <button class="download-button" aria-label={`Download ${group.name}`} onclick={() => {
-                  selected = { group, torrent };
-                  selectedProfile = $profiles.data?.[0]?.name ?? "ops";
-                }}><ArrowDownToLine size={17} /></button>
-              </div>
-            {/each}
-          </div>
+          <PreferredVariants
+            variants={group.torrents}
+            tracker={$results.data.provenance.tracker}
+            groupId={group.groupId}
+            title={group.name}
+            onadd={(torrent) => selected = { group, torrent: torrent as SearchTorrent }}
+          />
         </div>
       </article>
     {/each}
@@ -210,49 +176,12 @@
   </div>
 {/if}
 
-<Dialog.Root open={selected !== null} onOpenChange={(open) => { if (!open) selected = null; }}>
-  <Dialog.Portal>
-    <Dialog.Overlay class="dialog-overlay" />
-    <Dialog.Content class="dialog-content">
-      <Dialog.Title class="dialog-title">Add to qBittorrent</Dialog.Title>
-      <Dialog.Description class="dialog-description">
-        Confirm the release and download profile. Tracker metadata will be checked again before submission.
-      </Dialog.Description>
-      {#if selected}
-        <div class="dialog-release">
-          <div class="release-mark">{selected.group.name.slice(0, 1)}</div>
-          <div>
-            <strong>{selected.group.name}</strong>
-            <span>{selected.group.artist} · {selected.torrent.format} {selected.torrent.encoding}</span>
-          </div>
-        </div>
-        <label class="dialog-field">
-          <span>Download profile</span>
-          <select bind:value={selectedProfile}>
-            {#each $profiles.data ?? [] as profile}
-              <option value={profile.name}>{profile.name} · {profile.savePath}</option>
-            {/each}
-          </select>
-        </label>
-        <label class:disabled={!selected.torrent.canUseToken} class="token-toggle">
-          <input type="checkbox" bind:checked={useToken} disabled={!selected.torrent.canUseToken} />
-          <span class="toggle-box">{#if useToken}<Check size={15} />{/if}</span>
-          <span>
-            <strong>Use a freeleech token</strong>
-            <small>{selected.torrent.canUseToken ? "This action consumes one tracker token." : "This torrent is not token eligible."}</small>
-          </span>
-        </label>
-        {#if $addDownload.isError}<div class="error-panel compact">{$addDownload.error.message}</div>{/if}
-        <div class="dialog-actions">
-          <button class="secondary-button" onclick={() => selected = null}>Cancel</button>
-          <button class="primary-button" disabled={$addDownload.isPending} onclick={() => $addDownload.mutate({
-            tracker: $results.data?.provenance.tracker ?? tracker,
-            torrentId: selected!.torrent.torrentId,
-            profile: selectedProfile,
-            useToken
-          })}>{$addDownload.isPending ? "Adding…" : "Add download"}</button>
-        </div>
-      {/if}
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
+<AddDownloadDialog
+  selection={selected ? {
+    name: selected.group.name,
+    artist: selected.group.artist,
+    torrent: selected.torrent
+  } : null}
+  tracker={$results.data?.provenance.tracker ?? tracker}
+  onclose={() => selected = null}
+/>

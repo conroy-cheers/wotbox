@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use axum::{
@@ -17,14 +22,22 @@ use tokio::time::MissedTickBehavior;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::{
-    config::{Config, DownloadClientKind},
+    config::{Config, DownloadClientKind, TrackerKind},
     db::{Cached, Database},
     model::{
-        Account, ApiEnvelope, ClientDownload, ClientDownloadState, CreateDownload, DownloadJob,
-        DownloadProfile, DownloadState, Provenance, PublicConfig, SearchPage, TorrentMetadata,
+        Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
+        ArtistCredit, ArtistCreditSource, ArtistRole, CanonicalDownload, CanonicalTorrent,
+        ClientDownloadState, CreateDownload, DownloadJob, DownloadProfile, DownloadState,
+        DownloadsPage, LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage,
+        LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState,
+        LiveDownloadStatus, Provenance, PublicConfig, ReleaseDetail, ReleaseSummary,
+        RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant,
     },
     qbittorrent::{DownloadClient, QbittorrentClient},
-    tracker::{GazelleTrackerClient, SearchRequest, TrackerClient, search_cache_key},
+    tracker::{
+        GazelleTrackerClient, SearchRequest, TrackerClient, fallback_artist_credit,
+        search_cache_key,
+    },
 };
 
 static UI: Dir<'_> = include_dir!("$OUT_DIR/ui");
@@ -36,17 +49,31 @@ pub struct AppState {
     pub trackers: HashMap<String, Arc<dyn TrackerClient>>,
     pub download_clients: HashMap<String, Arc<dyn DownloadClient>>,
     pub profiles: HashMap<String, DownloadProfile>,
+    pub announce_hosts: HashMap<String, String>,
 }
 
 impl AppState {
     pub async fn new(config: &Config) -> Result<Arc<Self>> {
         let db = Database::open(&config.database_path).await?;
         let mut trackers: HashMap<String, Arc<dyn TrackerClient>> = HashMap::new();
+        let mut announce_hosts = HashMap::new();
         for (name, tracker) in &config.trackers {
             trackers.insert(
                 name.clone(),
                 Arc::new(GazelleTrackerClient::new(name.clone(), tracker)?),
             );
+            let hosts =
+                if tracker.announce_hosts.is_empty() && matches!(tracker.kind, TrackerKind::Ops) {
+                    vec!["home.opsfet.ch".to_owned()]
+                } else {
+                    tracker.announce_hosts.clone()
+                };
+            for host in hosts {
+                announce_hosts.insert(
+                    host.trim().trim_end_matches('.').to_ascii_lowercase(),
+                    name.clone(),
+                );
+            }
         }
         let mut download_clients: HashMap<String, Arc<dyn DownloadClient>> = HashMap::new();
         for (name, client) in &config.download_clients {
@@ -73,13 +100,17 @@ impl AppState {
                 )
             })
             .collect();
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             db,
             base_path: config.base_path.clone(),
             trackers,
             download_clients,
             profiles,
-        }))
+            announce_hosts,
+        });
+        state.db.recover_resolving_links().await?;
+        seed_existing_job_links(&state).await?;
+        Ok(state)
     }
 }
 
@@ -89,13 +120,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/openapi.json", get(openapi))
         .route("/api/v1/config", get(public_config))
+        .route(
+            "/api/v1/preferences",
+            get(preferences).put(update_preferences),
+        )
         .route("/api/v1/account", get(account))
         .route("/api/v1/search", get(search))
         .route("/api/v1/groups/{tracker}/{id}", get(group))
         .route("/api/v1/torrents/{tracker}/{id}", get(torrent))
+        .route(
+            "/api/v1/artists/{tracker}/{id}/releases",
+            get(artist_catalog),
+        )
         .route("/api/v1/download-profiles", get(download_profiles))
+        .route("/api/v1/library/artists", get(library_artists))
+        .route(
+            "/api/v1/library/artists/{tracker}/{artist_key}",
+            get(library_artist),
+        )
         .route("/api/v1/downloads", get(downloads).post(create_download))
         .route("/api/v1/downloads/{client}/{info_hash}", get(download))
+        .route(
+            "/api/v1/downloads/{client}/{info_hash}/retry",
+            axum::routing::post(retry_download_link),
+        )
         .fallback(get(ui))
         .with_state(state)
 }
@@ -113,6 +161,26 @@ async fn live() -> Json<Health> {
         status: "ok",
         qbittorrent: None,
     })
+}
+
+#[utoipa::path(get, path = "/api/v1/preferences", responses((status = 200, body = RuntimePreferences)))]
+async fn preferences(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RuntimePreferences>, AppError> {
+    Ok(Json(state.db.get_runtime_preferences().await?))
+}
+
+#[utoipa::path(put, path = "/api/v1/preferences", request_body = RuntimePreferences, responses((status = 200, body = RuntimePreferences)))]
+async fn update_preferences(
+    State(state): State<Arc<AppState>>,
+    Json(preferences): Json<RuntimePreferences>,
+) -> Result<Json<RuntimePreferences>, AppError> {
+    preferences
+        .release
+        .validate()
+        .map_err(|message| AppError::bad_request("invalid_preferences", message))?;
+    state.db.put_runtime_preferences(&preferences).await?;
+    Ok(Json(preferences))
 }
 
 #[utoipa::path(get, path = "/health/ready", responses((status = 200, body = Health)))]
@@ -222,14 +290,36 @@ async fn search(
         && let Some(cached) = state.db.get_snapshot(tracker_name, "search", &key).await?
         && cached.expires_at > Utc::now()
     {
-        return Ok(Json(envelope(tracker_name, cached, false)));
+        let mut response = envelope(tracker_name, cached, false);
+        enrich_search_downloads(&state, &mut response.data).await?;
+        return Ok(Json(response));
     }
     match tracker.search(&request).await {
-        Ok((value, raw)) => {
-            let cached = store(&state.db, tracker_name, "search", &key, value, raw, 300).await?;
-            Ok(Json(envelope(tracker_name, cached, false)))
+        Ok((mut value, raw)) => {
+            cache_search_canonical(&state.db, tracker_name, &value).await?;
+            let cached = store(
+                &state.db,
+                tracker_name,
+                "search",
+                &key,
+                value.clone(),
+                raw,
+                300,
+            )
+            .await?;
+            enrich_search_downloads(&state, &mut value).await?;
+            Ok(Json(ApiEnvelope {
+                data: value,
+                provenance: provenance(tracker_name, cached.fetched_at, false),
+            }))
         }
-        Err(error) => stale_or_error(&state.db, tracker_name, "search", &key, error).await,
+        Err(error) => {
+            let mut response = stale_or_error(&state.db, tracker_name, "search", &key, error)
+                .await?
+                .0;
+            enrich_search_downloads(&state, &mut response.data).await?;
+            Ok(Json(response))
+        }
     }
 }
 
@@ -237,30 +327,58 @@ async fn group(
     State(state): State<Arc<AppState>>,
     Path((tracker_name, id)): Path<(String, i64)>,
     Query(query): Query<RefreshQuery>,
-) -> Result<Json<ApiEnvelope<Value>>, AppError> {
+) -> Result<Json<ApiEnvelope<ReleaseDetail>>, AppError> {
     let (_, tracker) = get_tracker(&state, Some(&tracker_name))?;
     let key = id.to_string();
     if !query.refresh
-        && let Some(cached) = state.db.get_snapshot(&tracker_name, "group", &key).await?
-        && cached.expires_at > Utc::now()
+        && let Some(cached) = state
+            .db
+            .get_snapshot::<ReleaseDetail>(&tracker_name, "group", &key)
+            .await?
     {
-        return Ok(Json(envelope(&tracker_name, cached, false)));
+        let stale = cached.expires_at <= Utc::now();
+        let mut response = envelope(&tracker_name, cached, stale);
+        enrich_variant_downloads(&state, &mut response.data.variants).await?;
+        enrich_variant_library(&state, &tracker_name, id, &mut response.data.variants).await?;
+        if stale {
+            let refresh_state = state.clone();
+            let refresh_tracker = tracker_name.clone();
+            tokio::spawn(async move {
+                if let Err(error) = refresh_group(refresh_state, refresh_tracker, id).await {
+                    tracing::warn!(%error, "asynchronous release refresh failed");
+                }
+            });
+        }
+        return Ok(Json(response));
     }
     match tracker.group(id).await {
-        Ok(value) => {
+        Ok((mut value, raw)) => {
+            cache_release_detail(&state.db, &value).await?;
             let cached = store(
                 &state.db,
                 &tracker_name,
                 "group",
                 &key,
                 value.clone(),
-                value,
-                900,
+                raw,
+                86_400,
             )
             .await?;
-            Ok(Json(envelope(&tracker_name, cached, false)))
+            enrich_variant_downloads(&state, &mut value.variants).await?;
+            enrich_variant_library(&state, &tracker_name, id, &mut value.variants).await?;
+            Ok(Json(ApiEnvelope {
+                data: value,
+                provenance: provenance(&tracker_name, cached.fetched_at, false),
+            }))
         }
-        Err(error) => stale_or_error(&state.db, &tracker_name, "group", &key, error).await,
+        Err(error) => {
+            let mut response =
+                stale_or_error::<ReleaseDetail>(&state.db, &tracker_name, "group", &key, error)
+                    .await?;
+            enrich_variant_library(&state, &tracker_name, id, &mut response.0.data.variants)
+                .await?;
+            Ok(response)
+        }
     }
 }
 
@@ -281,11 +399,91 @@ async fn torrent(
         return Ok(Json(envelope(&tracker_name, cached, false)));
     }
     match tracker.torrent(id).await {
-        Ok((value, raw)) => {
+        Ok((value, canonical, raw)) => {
+            state
+                .db
+                .put_canonical(
+                    &canonical,
+                    Utc::now(),
+                    Utc::now() + ChronoDuration::hours(24),
+                )
+                .await?;
             let cached = store(&state.db, &tracker_name, "torrent", &key, value, raw, 900).await?;
             Ok(Json(envelope(&tracker_name, cached, false)))
         }
         Err(error) => stale_or_error(&state.db, &tracker_name, "torrent", &key, error).await,
+    }
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/artists/{tracker}/{id}/releases",
+    params(
+        ("tracker" = String, Path),
+        ("id" = i64, Path),
+        RefreshQuery
+    ),
+    responses((status = 200, body = inline(ApiEnvelope<ArtistCatalogPage>)))
+)]
+async fn artist_catalog(
+    State(state): State<Arc<AppState>>,
+    Path((tracker_name, id)): Path<(String, i64)>,
+    Query(query): Query<RefreshQuery>,
+) -> Result<Json<ApiEnvelope<ArtistCatalogPage>>, AppError> {
+    let (_, tracker) = get_tracker(&state, Some(&tracker_name))?;
+    let key = id.to_string();
+    if !query.refresh
+        && let Some(cached) = state
+            .db
+            .get_snapshot::<ArtistCatalogPage>(&tracker_name, "artist", &key)
+            .await?
+    {
+        let stale = cached.expires_at <= Utc::now();
+        let mut response = envelope(&tracker_name, cached, stale);
+        enrich_artist_catalog(&state, &tracker_name, id, &mut response.data).await?;
+        if stale {
+            let refresh_state = state.clone();
+            let refresh_tracker = tracker_name.clone();
+            tokio::spawn(async move {
+                if let Err(error) = refresh_artist_catalog(refresh_state, refresh_tracker, id).await
+                {
+                    tracing::warn!(%error, "asynchronous artist catalog refresh failed");
+                }
+            });
+        }
+        return Ok(Json(response));
+    }
+    match tracker.artist_catalog(id).await {
+        Ok((mut value, raw)) => {
+            cache_artist_catalog(&state.db, &value).await?;
+            let cached = store(
+                &state.db,
+                &tracker_name,
+                "artist",
+                &key,
+                value.clone(),
+                raw,
+                86_400,
+            )
+            .await?;
+            enrich_artist_catalog(&state, &tracker_name, id, &mut value).await?;
+            Ok(Json(ApiEnvelope {
+                data: value,
+                provenance: provenance(&tracker_name, cached.fetched_at, false),
+            }))
+        }
+        Err(error) => {
+            let mut response = stale_or_error::<ArtistCatalogPage>(
+                &state.db,
+                &tracker_name,
+                "artist",
+                &key,
+                error,
+            )
+            .await?
+            .0;
+            enrich_artist_catalog(&state, &tracker_name, id, &mut response.data).await?;
+            Ok(Json(response))
+        }
     }
 }
 
@@ -299,6 +497,453 @@ async fn download_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Downl
     let mut profiles: Vec<_> = state.profiles.values().cloned().collect();
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
     Json(profiles)
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+struct LibraryQuery {
+    q: Option<String>,
+    tracker: Option<String>,
+    format: Option<String>,
+    availability: Option<String>,
+    sort: Option<String>,
+    #[serde(default = "default_library_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_library_limit() -> usize {
+    50
+}
+
+struct LibraryReleaseBuild {
+    release: ReleaseSummary,
+    variants: HashMap<i64, (TorrentVariant, Vec<LibraryCopy>)>,
+    added_at: chrono::DateTime<Utc>,
+    fetched_at: chrono::DateTime<Utc>,
+    stale: bool,
+}
+
+async fn load_library_releases(state: &AppState) -> Result<Vec<LibraryRelease>, AppError> {
+    let records = state.db.list_library_records().await?;
+    let mut groups: HashMap<(String, i64), LibraryReleaseBuild> = HashMap::new();
+    for record in records {
+        let tracker = record.canonical.value.release.tracker.clone();
+        let group_id = record.canonical.value.release.group_id;
+        let torrent_id = record.canonical.value.variant.torrent_id;
+        let copy = LibraryCopy {
+            client: record.client,
+            info_hash: record.info_hash,
+            present: record.present,
+            completed_at: record.completed_at,
+            last_seen_at: record.last_seen_at,
+            missing_since: record.missing_since,
+        };
+        let entry = groups
+            .entry((tracker, group_id))
+            .or_insert_with(|| LibraryReleaseBuild {
+                release: record.canonical.value.release.clone(),
+                variants: HashMap::new(),
+                added_at: record.library_added_at,
+                fetched_at: record.canonical.fetched_at,
+                stale: record.canonical.expires_at <= Utc::now(),
+            });
+        if entry.release.artists.is_empty() && !record.canonical.value.release.artists.is_empty() {
+            entry.release = record.canonical.value.release.clone();
+        }
+        entry.added_at = entry.added_at.min(record.library_added_at);
+        entry.fetched_at = entry.fetched_at.max(record.canonical.fetched_at);
+        entry.stale |= record.canonical.expires_at <= Utc::now();
+        let variant = entry.variants.entry(torrent_id).or_insert_with(|| {
+            let mut variant = record.canonical.value.variant.clone();
+            variant.downloads.clear();
+            variant.library = None;
+            (variant, Vec::new())
+        });
+        variant.1.push(copy);
+    }
+
+    let mut releases = groups
+        .into_values()
+        .map(|mut group| {
+            if group.release.artists.is_empty() {
+                let display = group
+                    .release
+                    .artist
+                    .clone()
+                    .unwrap_or_else(|| "Unknown artist".to_owned());
+                group.release.artists =
+                    vec![fallback_artist_credit(&group.release.tracker, &display)];
+            }
+            let mut variants = group
+                .variants
+                .into_values()
+                .map(|(mut variant, mut copies)| {
+                    copies.sort_by(|left, right| {
+                        right
+                            .present
+                            .cmp(&left.present)
+                            .then_with(|| left.client.cmp(&right.client))
+                    });
+                    let availability = if copies.iter().any(|copy| copy.present) {
+                        LibraryAvailability::Present
+                    } else {
+                        LibraryAvailability::Missing
+                    };
+                    variant.library = Some(LibraryVariantState {
+                        availability,
+                        copies,
+                    });
+                    variant
+                })
+                .collect::<Vec<_>>();
+            variants.sort_by_key(|variant| variant.torrent_id);
+            let present = variants
+                .iter()
+                .filter(|variant| {
+                    variant
+                        .library
+                        .as_ref()
+                        .is_some_and(|library| library.availability == LibraryAvailability::Present)
+                })
+                .count();
+            let availability = if present == variants.len() {
+                LibraryAvailability::Present
+            } else if present == 0 {
+                LibraryAvailability::Missing
+            } else {
+                LibraryAvailability::Partial
+            };
+            LibraryRelease {
+                provenance: provenance(&group.release.tracker, group.fetched_at, group.stale),
+                release: group.release,
+                variants,
+                availability,
+                added_at: group.added_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    sort_library_releases(&mut releases, "year_desc");
+    Ok(releases)
+}
+
+fn library_release_matches(release: &LibraryRelease, query: &LibraryQuery) -> bool {
+    if query
+        .tracker
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .is_some_and(|tracker| !release.release.tracker.eq_ignore_ascii_case(tracker))
+    {
+        return false;
+    }
+    if query
+        .format
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .is_some_and(|format| {
+            !release.variants.iter().any(|variant| {
+                variant
+                    .format
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(format))
+            })
+        })
+    {
+        return false;
+    }
+    if let Some(availability) = query
+        .availability
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "all")
+    {
+        let matches = matches!(
+            (availability, release.availability),
+            ("present", LibraryAvailability::Present)
+                | ("partial", LibraryAvailability::Partial)
+                | ("missing", LibraryAvailability::Missing)
+        );
+        if !matches {
+            return false;
+        }
+    }
+    true
+}
+
+fn artist_sort_name(name: &str) -> String {
+    let normalized = name.trim().to_lowercase();
+    normalized
+        .strip_prefix("the ")
+        .unwrap_or(&normalized)
+        .to_owned()
+}
+
+fn is_compilation(release: &ReleaseSummary) -> bool {
+    let primary_artist_count = release
+        .artists
+        .iter()
+        .filter(|artist| artist.role == ArtistRole::Primary)
+        .count();
+    release.release_type.as_deref().is_some_and(|release_type| {
+        matches!(
+            release_type.trim().to_ascii_lowercase().as_str(),
+            "compilation" | "sampler"
+        )
+    }) || primary_artist_count > 3
+        || release.artist.as_deref().is_some_and(|artist| {
+            matches!(
+                artist.trim().to_ascii_lowercase().as_str(),
+                "various" | "various artists" | "various artistes"
+            )
+        })
+}
+
+fn artist_summary(
+    tracker: &str,
+    key: &str,
+    artist: &ArtistCredit,
+    releases: &[&LibraryRelease],
+) -> LibraryArtistSummary {
+    let mut artworks = releases
+        .iter()
+        .filter_map(|release| release.release.artwork.clone())
+        .collect::<Vec<_>>();
+    let mut seen_artwork = HashSet::new();
+    artworks.retain(|artwork| seen_artwork.insert(artwork.clone()));
+    artworks.truncate(4);
+    LibraryArtistSummary {
+        key: key.to_owned(),
+        tracker: tracker.to_owned(),
+        artist_id: artist.artist_id,
+        credit_source: artist.source.clone(),
+        name: artist.name.clone(),
+        release_count: releases.len(),
+        missing_count: releases
+            .iter()
+            .filter(|release| release.availability != LibraryAvailability::Present)
+            .count(),
+        artworks,
+    }
+}
+
+fn build_artist_summaries<'a>(releases: &'a [LibraryRelease]) -> Vec<LibraryArtistSummary> {
+    let primary_artists = releases
+        .iter()
+        .filter(|release| !is_compilation(&release.release))
+        .flat_map(|release| release.release.artists.iter())
+        .filter(|artist| artist.role == ArtistRole::Primary)
+        .map(|artist| (artist.tracker.to_ascii_lowercase(), artist.key.clone()))
+        .collect::<HashSet<_>>();
+    let mut grouped: HashMap<
+        (String, String, String, Option<i64>, ArtistCreditSource),
+        Vec<&'a LibraryRelease>,
+    > = HashMap::new();
+    for release in releases
+        .iter()
+        .filter(|release| !is_compilation(&release.release))
+    {
+        let mut seen = HashSet::new();
+        for artist in &release.release.artists {
+            if primary_artists.contains(&(artist.tracker.to_ascii_lowercase(), artist.key.clone()))
+                && seen.insert(artist.key.clone())
+            {
+                grouped
+                    .entry((
+                        artist.tracker.clone(),
+                        artist.key.clone(),
+                        artist.name.clone(),
+                        artist.artist_id,
+                        artist.source.clone(),
+                    ))
+                    .or_default()
+                    .push(release);
+            }
+        }
+    }
+    let mut artists = grouped
+        .into_iter()
+        .map(|((tracker, key, name, artist_id, source), releases)| {
+            let artist = ArtistCredit {
+                key: key.clone(),
+                tracker: tracker.clone(),
+                artist_id,
+                name,
+                role: ArtistRole::Primary,
+                source,
+            };
+            artist_summary(&tracker, &key, &artist, &releases)
+        })
+        .collect::<Vec<_>>();
+    artists.sort_by(|left, right| {
+        artist_sort_name(&left.name)
+            .cmp(&artist_sort_name(&right.name))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.tracker.cmp(&right.tracker))
+    });
+    artists
+}
+
+fn sort_library_releases(releases: &mut [LibraryRelease], sort: &str) {
+    match sort {
+        "title" => releases.sort_by(|left, right| {
+            left.release
+                .title
+                .to_lowercase()
+                .cmp(&right.release.title.to_lowercase())
+        }),
+        "added_desc" => {
+            releases.sort_by_key(|release| std::cmp::Reverse(release.added_at));
+        }
+        _ => releases.sort_by(|left, right| {
+            right
+                .release
+                .year
+                .unwrap_or_default()
+                .cmp(&left.release.year.unwrap_or_default())
+                .then_with(|| {
+                    left.release
+                        .title
+                        .to_lowercase()
+                        .cmp(&right.release.title.to_lowercase())
+                })
+        }),
+    }
+}
+
+async fn library_index_status(
+    state: &AppState,
+    releases: &[LibraryRelease],
+) -> Result<LibraryIndexStatus, AppError> {
+    Ok(LibraryIndexStatus {
+        last_successful_scan_at: state.db.last_successful_download_scan().await?,
+        unresolved_credits: releases
+            .iter()
+            .filter(|release| {
+                release
+                    .release
+                    .artists
+                    .iter()
+                    .all(|artist| artist.source == ArtistCreditSource::DisplayFallback)
+            })
+            .count(),
+    })
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/library/artists", params(LibraryQuery),
+    responses((status = 200, body = LibraryArtistsPage))
+)]
+async fn library_artists(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LibraryQuery>,
+) -> Result<Json<LibraryArtistsPage>, AppError> {
+    let all = load_library_releases(&state).await?;
+    let filtered = all
+        .into_iter()
+        .filter(|release| library_release_matches(release, &query))
+        .collect::<Vec<_>>();
+    let needle = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let mut artists = build_artist_summaries(&filtered);
+    if let Some(needle) = &needle {
+        artists.retain(|artist| artist.name.to_lowercase().contains(needle));
+    }
+    let artist_total = artists.len();
+    let limit = query.limit.clamp(1, 5_000);
+    let offset = query.offset.min(100_000);
+    let artists = artists.into_iter().skip(offset).take(limit).collect();
+
+    let mut releases = if let Some(needle) = &needle {
+        filtered
+            .iter()
+            .filter(|release| release.release.title.to_lowercase().contains(needle))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    sort_library_releases(&mut releases, query.sort.as_deref().unwrap_or("year_desc"));
+    let release_total = releases.len();
+    let releases = releases.into_iter().skip(offset).take(limit).collect();
+    let index = library_index_status(&state, &filtered).await?;
+    Ok(Json(LibraryArtistsPage {
+        artists,
+        releases,
+        artist_total,
+        release_total,
+        index,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/library/artists/{tracker}/{artist_key}",
+    params(
+        ("tracker" = String, Path),
+        ("artist_key" = String, Path),
+        LibraryQuery
+    ),
+    responses(
+        (status = 200, body = LibraryArtistPage),
+        (status = 404, description = "Library artist not found")
+    )
+)]
+async fn library_artist(
+    State(state): State<Arc<AppState>>,
+    Path((tracker, artist_key)): Path<(String, String)>,
+    Query(query): Query<LibraryQuery>,
+) -> Result<Json<LibraryArtistPage>, AppError> {
+    let all = load_library_releases(&state).await?;
+    let artist_releases = all
+        .iter()
+        .filter(|release| !is_compilation(&release.release))
+        .filter(|release| {
+            release.release.artists.iter().any(|artist| {
+                artist.tracker.eq_ignore_ascii_case(&tracker) && artist.key == artist_key
+            })
+        })
+        .collect::<Vec<_>>();
+    let artist = artist_releases
+        .iter()
+        .find_map(|release| {
+            release.release.artists.iter().find(|artist| {
+                artist.tracker.eq_ignore_ascii_case(&tracker)
+                    && artist.key == artist_key
+                    && artist.role == ArtistRole::Primary
+            })
+        })
+        .ok_or_else(|| AppError::not_found("artist_not_found", "Library artist not found"))?;
+    let summary = artist_summary(&tracker, &artist_key, artist, &artist_releases);
+    let needle = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let mut items = artist_releases
+        .into_iter()
+        .filter(|release| library_release_matches(release, &query))
+        .filter(|release| {
+            needle
+                .as_ref()
+                .is_none_or(|needle| release.release.title.to_lowercase().contains(needle))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_library_releases(&mut items, query.sort.as_deref().unwrap_or("year_desc"));
+    let total = items.len();
+    let limit = query.limit.clamp(1, 5_000);
+    let offset = query.offset.min(100_000);
+    let items = items.into_iter().skip(offset).take(limit).collect();
+    let index = library_index_status(&state, &all).await?;
+    Ok(Json(LibraryArtistPage {
+        artist: summary,
+        items,
+        total,
+        index,
+    }))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -316,12 +961,12 @@ fn default_download_limit() -> u32 {
 
 #[utoipa::path(
     get, path = "/api/v1/downloads", params(DownloadsQuery),
-    responses((status = 200, body = inline(Vec<ClientDownload>)))
+    responses((status = 200, body = DownloadsPage))
 )]
 async fn downloads(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DownloadsQuery>,
-) -> Result<Json<Vec<ClientDownload>>, AppError> {
+) -> Result<Json<DownloadsPage>, AppError> {
     let limit = query.limit.clamp(1, 500);
     let offset = query.offset.min(10_000);
     let clients: Vec<_> = if let Some(name) = query.client {
@@ -342,29 +987,83 @@ async fn downloads(
             .map(|(name, client)| (name.clone(), client.clone()))
             .collect()
     };
-    let mut downloads = Vec::new();
+    let mut observed = Vec::new();
     for (name, client) in clients {
-        let mut client_downloads = client
-            .downloads(limit.saturating_add(offset), 0)
-            .await
-            .map_err(|error| {
-                AppError::unavailable("download_client_unavailable", format!("{name}: {error}"))
-            })?;
-        downloads.append(&mut client_downloads);
+        let mut client_offset = 0;
+        loop {
+            let mut page = client
+                .downloads(500, client_offset)
+                .await
+                .map_err(|error| {
+                    AppError::unavailable("download_client_unavailable", format!("{name}: {error}"))
+                })?;
+            let count = page.len();
+            for download in &page {
+                observe_download(&state, download).await?;
+            }
+            observed.append(&mut page);
+            if count < 500 || client_offset >= 100_000 {
+                break;
+            }
+            client_offset += 500;
+        }
     }
-    downloads.sort_by(|left, right| {
+    observed.sort_by(|left, right| {
         right
+            .live
             .added_at
-            .cmp(&left.added_at)
-            .then_with(|| left.name.cmp(&right.name))
+            .cmp(&left.live.added_at)
+            .then_with(|| left.live.info_hash.cmp(&right.live.info_hash))
     });
-    Ok(Json(
-        downloads
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect(),
-    ))
+    let mut items = Vec::new();
+    for download in observed {
+        let Some(link) = state
+            .db
+            .get_link(&download.live.client, &download.live.info_hash)
+            .await?
+        else {
+            continue;
+        };
+        if link.resolution_state != "linked" {
+            continue;
+        }
+        let (Some(tracker), Some(torrent_id)) = (link.tracker.as_deref(), link.torrent_id) else {
+            continue;
+        };
+        let Some(canonical) = state.db.get_canonical(tracker, torrent_id).await? else {
+            continue;
+        };
+        let stale = canonical.expires_at <= Utc::now();
+        if stale {
+            let refresh_state = state.clone();
+            let refresh_tracker = tracker.to_owned();
+            let refresh_hash = download.live.info_hash.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    refresh_canonical_by_hash(refresh_state, refresh_tracker, refresh_hash).await
+                {
+                    tracing::warn!(%error, "asynchronous canonical torrent refresh failed");
+                }
+            });
+        }
+        let mut variant = canonical.value.variant.clone();
+        variant.downloads = vec![download.live.clone()];
+        items.push(CanonicalDownload {
+            release: canonical.value.release,
+            variant,
+            download: download.live,
+            provenance: provenance(tracker, canonical.fetched_at, stale),
+        });
+    }
+    let items = items
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(Json(DownloadsPage {
+        items,
+        index: state.db.index_counts().await?,
+    }))
 }
 
 #[utoipa::path(
@@ -374,28 +1073,102 @@ async fn downloads(
         ("info_hash" = String, Path, description = "Torrent info hash")
     ),
     responses(
-        (status = 200, body = ClientDownload),
-        (status = 404, description = "Torrent is not present in the download client")
+        (status = 200, body = CanonicalDownload),
+        (status = 404, description = "Torrent is missing or its tracker release is unresolved")
     )
 )]
 async fn download(
     State(state): State<Arc<AppState>>,
     Path((client_name, info_hash)): Path<(String, String)>,
-) -> Result<Json<ClientDownload>, AppError> {
+) -> Result<Json<CanonicalDownload>, AppError> {
     let client = state.download_clients.get(&client_name).ok_or_else(|| {
         AppError::bad_request("unknown_download_client", "Unknown download client")
     })?;
-    client
+    let observed = client
         .download(&info_hash)
         .await
         .map_err(|error| AppError::unavailable("download_client_unavailable", error))?
-        .map(Json)
         .ok_or_else(|| {
             AppError::not_found(
                 "download_not_found",
                 "Torrent is not present in the download client",
             )
-        })
+        })?;
+    observe_download(&state, &observed).await?;
+    let link = state
+        .db
+        .get_link(&client_name, &info_hash)
+        .await?
+        .filter(|link| link.resolution_state == "linked")
+        .ok_or_else(|| {
+            AppError::not_found(
+                "release_unresolved",
+                "The tracker release for this torrent has not been resolved",
+            )
+        })?;
+    let canonical = state
+        .db
+        .get_canonical(
+            link.tracker.as_deref().unwrap_or_default(),
+            link.torrent_id.unwrap_or_default(),
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found(
+                "release_unresolved",
+                "The tracker release for this torrent has not been resolved",
+            )
+        })?;
+    let stale = canonical.expires_at <= Utc::now();
+    if stale {
+        let refresh_state = state.clone();
+        let refresh_tracker = link.tracker.clone().unwrap_or_default();
+        let refresh_hash = observed.live.info_hash.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                refresh_canonical_by_hash(refresh_state, refresh_tracker, refresh_hash).await
+            {
+                tracing::warn!(%error, "asynchronous canonical torrent refresh failed");
+            }
+        });
+    }
+    let mut variant = canonical.value.variant.clone();
+    variant.downloads = vec![observed.live.clone()];
+    Ok(Json(CanonicalDownload {
+        release: canonical.value.release,
+        variant,
+        download: observed.live,
+        provenance: provenance(
+            link.tracker.as_deref().unwrap_or_default(),
+            canonical.fetched_at,
+            stale,
+        ),
+    }))
+}
+
+async fn retry_download_link(
+    State(state): State<Arc<AppState>>,
+    Path((client_name, info_hash)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    if !state.download_clients.contains_key(&client_name) {
+        return Err(AppError::bad_request(
+            "unknown_download_client",
+            "Unknown download client",
+        ));
+    }
+    if !state.db.retry_link(&client_name, &info_hash).await? {
+        return Err(AppError::bad_request(
+            "resolution_not_retryable",
+            "This torrent does not have a failed configured-tracker resolution",
+        ));
+    }
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = resolve_due_links(&task_state).await {
+            tracing::warn!(%error, "manual release resolution retry failed");
+        }
+    });
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[utoipa::path(
@@ -466,8 +1239,22 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .get(&profile.client)
         .ok_or_else(|| anyhow!("download client disappeared from configuration"))?;
 
-    let (metadata, raw) = tracker.torrent(job.torrent_id).await?;
-    if job.use_token && !metadata.can_use_token {
+    let (metadata, canonical, raw) = tracker.torrent(job.torrent_id).await?;
+    let preferences = state.db.get_runtime_preferences().await?;
+    if !preferences.release.allows(
+        canonical.variant.format.as_deref(),
+        canonical.variant.encoding.as_deref(),
+    ) {
+        return Err(anyhow!(
+            "release quality '{}' is below the configured '{}' cutoff",
+            crate::model::ReleasePreferences::quality_class(
+                canonical.variant.format.as_deref(),
+                canonical.variant.encoding.as_deref(),
+            ),
+            preferences.release.minimum_quality
+        ));
+    }
+    if job.use_token && metadata.token_eligibility_known && !metadata.can_use_token {
         return Err(anyhow!("torrent is not eligible for a freeleech token"));
     }
     state
@@ -484,6 +1271,14 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .await?;
     state
         .db
+        .put_canonical(
+            &canonical,
+            Utc::now(),
+            Utc::now() + ChronoDuration::hours(24),
+        )
+        .await?;
+    state
+        .db
         .update_job_metadata(
             job.id,
             metadata.group_id,
@@ -491,9 +1286,20 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
             &metadata.name,
         )
         .await?;
+    state
+        .db
+        .seed_download_link(
+            &profile.client,
+            &metadata.info_hash,
+            &job.tracker,
+            metadata.group_id,
+            metadata.torrent_id,
+            true,
+        )
+        .await?;
 
     if let Some(existing) = client.download(&metadata.info_hash).await? {
-        let state_value = if existing.progress >= 1.0 {
+        let state_value = if existing.live.progress >= 1.0 {
             DownloadState::Complete
         } else {
             DownloadState::Active
@@ -503,10 +1309,10 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
             .update_progress(
                 job.id,
                 state_value,
-                existing.progress,
-                existing.download_speed,
-                existing.upload_speed,
-                existing.eta,
+                existing.live.progress,
+                existing.live.download_speed,
+                existing.live.upload_speed,
+                existing.live.eta,
             )
             .await?;
         return Ok(());
@@ -554,7 +1360,7 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
                 };
                 match client.download(info_hash).await {
                     Ok(Some(status)) => {
-                        let next = if status.progress >= 1.0 {
+                        let next = if status.live.progress >= 1.0 {
                             DownloadState::Complete
                         } else {
                             DownloadState::Active
@@ -564,10 +1370,10 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
                             .update_progress(
                                 job.id,
                                 next,
-                                status.progress,
-                                status.download_speed,
-                                status.upload_speed,
-                                status.eta,
+                                status.live.progress,
+                                status.live.download_speed,
+                                status.live.upload_speed,
+                                status.live.eta,
                             )
                             .await;
                     }
@@ -591,6 +1397,602 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
             }
         }
     });
+}
+
+pub fn spawn_download_indexer(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut tick = 0_u64;
+        loop {
+            interval.tick().await;
+            if tick.is_multiple_of(5)
+                && let Err(error) = scan_download_clients(&state).await
+            {
+                tracing::warn!(%error, "download release index scan failed");
+            }
+            if let Err(error) = enrich_library_artist_credits(&state).await {
+                tracing::warn!(%error, "library artist enrichment pass failed");
+            }
+            if let Err(error) = resolve_due_links(&state).await {
+                tracing::warn!(%error, "download release resolution pass failed");
+            }
+            tick = tick.wrapping_add(1);
+        }
+    });
+}
+
+async fn scan_download_clients(state: &Arc<AppState>) -> Result<()> {
+    const PAGE_SIZE: u32 = 200;
+    for (name, client) in &state.download_clients {
+        let scan_started_at = Utc::now();
+        let mut offset = 0;
+        loop {
+            let downloads = client.downloads(PAGE_SIZE, offset).await?;
+            let count = downloads.len();
+            for download in &downloads {
+                observe_download(state, download).await?;
+            }
+            if count < PAGE_SIZE as usize || offset >= 100_000 {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+        state.db.complete_client_scan(name, scan_started_at).await?;
+        tracing::debug!(client = %name, indexed = offset, "scanned download client");
+    }
+    Ok(())
+}
+
+async fn observe_download(
+    state: &AppState,
+    download: &crate::model::ObservedDownload,
+) -> Result<()> {
+    let tracker = download
+        .announce_host
+        .as_ref()
+        .and_then(|host| state.announce_hosts.get(host));
+    state
+        .db
+        .observe_download(
+            &download.live,
+            download.announce_host.as_deref(),
+            tracker.map(String::as_str),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn resolve_due_links(state: &Arc<AppState>) -> Result<()> {
+    let mut batches = HashMap::new();
+    for link in state.db.due_links(100).await? {
+        let Some(tracker_name) = link.tracker.clone() else {
+            continue;
+        };
+        batches
+            .entry((tracker_name, link.info_hash.clone()))
+            .or_insert_with(Vec::new)
+            .push(link);
+    }
+    for ((tracker_name, info_hash), links) in batches.into_iter().take(25) {
+        let Some(tracker) = state.trackers.get(&tracker_name) else {
+            continue;
+        };
+        for link in &links {
+            state
+                .db
+                .set_link_resolving(&link.client, &link.info_hash)
+                .await?;
+        }
+        match tracker.torrent_by_hash(&info_hash).await {
+            Ok((canonical, _raw)) => {
+                let now = Utc::now();
+                state
+                    .db
+                    .put_canonical(&canonical, now, now + ChronoDuration::hours(24))
+                    .await?;
+                for link in &links {
+                    state
+                        .db
+                        .set_linked(&link.client, &link.info_hash, &canonical)
+                        .await?;
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let normalized = message.to_ascii_lowercase();
+                let not_found = normalized.contains("not found")
+                    || normalized.contains("does not exist")
+                    || normalized.contains("bad hash");
+                for link in &links {
+                    state
+                        .db
+                        .set_link_failure(&link.client, &link.info_hash, not_found, &message)
+                        .await?;
+                }
+                tracing::warn!(
+                    clients = links.len(),
+                    tracker = %tracker_name,
+                    info_hash = %info_hash,
+                    %error,
+                    "tracker hash resolution failed"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_canonical_by_hash(
+    state: Arc<AppState>,
+    tracker_name: String,
+    info_hash: String,
+) -> Result<()> {
+    let tracker = state
+        .trackers
+        .get(&tracker_name)
+        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
+    let (canonical, _) = tracker.torrent_by_hash(&info_hash).await?;
+    let now = Utc::now();
+    state
+        .db
+        .put_canonical(&canonical, now, now + ChronoDuration::hours(24))
+        .await
+}
+
+async fn seed_existing_job_links(state: &Arc<AppState>) -> Result<()> {
+    for job in state.db.list_jobs().await? {
+        let (Some(info_hash), Some(profile)) =
+            (job.info_hash.as_deref(), state.profiles.get(&job.profile))
+        else {
+            continue;
+        };
+        let linked = state
+            .db
+            .get_canonical(&job.tracker, job.torrent_id)
+            .await?
+            .is_some();
+        state
+            .db
+            .seed_download_link(
+                &profile.client,
+                info_hash,
+                &job.tracker,
+                job.group_id,
+                job.torrent_id,
+                linked,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn cache_search_canonical(db: &Database, tracker: &str, page: &SearchPage) -> Result<()> {
+    let now = Utc::now();
+    for group in &page.groups {
+        let release = ReleaseSummary {
+            tracker: tracker.to_owned(),
+            group_id: group.group_id,
+            title: group.name.clone(),
+            artist: group.artist.clone(),
+            artists: group
+                .artist
+                .as_deref()
+                .map(|artist| vec![fallback_artist_credit(tracker, artist)])
+                .unwrap_or_default(),
+            year: group.year,
+            artwork: group.image.clone(),
+            release_type: group.release_type.clone(),
+        };
+        for torrent in &group.torrents {
+            let canonical = CanonicalTorrent {
+                release: release.clone(),
+                variant: TorrentVariant {
+                    tracker: tracker.to_owned(),
+                    torrent_id: torrent.torrent_id,
+                    group_id: group.group_id,
+                    info_hash: torrent.info_hash.clone(),
+                    format: torrent.format.clone(),
+                    encoding: torrent.encoding.clone(),
+                    media: torrent.media.clone(),
+                    size: torrent.size,
+                    seeders: torrent.seeders,
+                    leechers: torrent.leechers,
+                    snatched: torrent.snatched,
+                    freeleech: torrent.freeleech,
+                    can_use_token: torrent.can_use_token,
+                    token_eligibility_known: true,
+                    remaster_title: torrent.remaster_title.clone(),
+                    downloads: Vec::new(),
+                    library: None,
+                },
+                tags: group.tags.clone(),
+                description: None,
+                record_label: None,
+            };
+            db.put_canonical(&canonical, now, now + ChronoDuration::hours(24))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cache_release_detail(db: &Database, detail: &ReleaseDetail) -> Result<()> {
+    let now = Utc::now();
+    for variant in &detail.variants {
+        db.put_canonical(
+            &CanonicalTorrent {
+                release: detail.release.clone(),
+                variant: variant.clone(),
+                tags: detail.tags.clone(),
+                description: detail.description.clone(),
+                record_label: detail.record_label.clone(),
+            },
+            now,
+            now + ChronoDuration::hours(24),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn cache_artist_catalog(db: &Database, catalog: &ArtistCatalogPage) -> Result<()> {
+    let now = Utc::now();
+    for group in &catalog.groups {
+        for variant in &group.variants {
+            db.put_canonical(
+                &CanonicalTorrent {
+                    release: group.release.clone(),
+                    variant: variant.clone(),
+                    tags: group.tags.clone(),
+                    description: None,
+                    record_label: None,
+                },
+                now,
+                now + ChronoDuration::hours(24),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn enrich_artist_catalog(
+    state: &Arc<AppState>,
+    tracker: &str,
+    artist_id: i64,
+    catalog: &mut ArtistCatalogPage,
+) -> Result<(), AppError> {
+    catalog
+        .groups
+        .retain(|group| !is_compilation(&group.release));
+    let library = load_library_releases(state)
+        .await?
+        .into_iter()
+        .filter(|release| {
+            !is_compilation(&release.release)
+                && release.release.tracker.eq_ignore_ascii_case(tracker)
+                && release
+                    .release
+                    .artists
+                    .iter()
+                    .any(|artist| artist.artist_id == Some(artist_id))
+        })
+        .collect::<Vec<_>>();
+    let canonical = state
+        .db
+        .list_canonical_for_tracker(tracker)
+        .await?
+        .into_iter()
+        .map(|item| (item.variant.torrent_id, item))
+        .collect::<HashMap<_, _>>();
+    let library_by_group = library
+        .iter()
+        .map(|release| (release.release.group_id, release))
+        .collect::<HashMap<_, _>>();
+
+    for group in &mut catalog.groups {
+        if let Some(library_release) = library_by_group.get(&group.release.group_id) {
+            group.library_availability = Some(library_release.availability);
+            group.library_added_at = Some(library_release.added_at);
+        }
+        for variant in &mut group.variants {
+            if let Some(known) = canonical.get(&variant.torrent_id) {
+                if variant.info_hash.is_none() {
+                    variant.info_hash = known.variant.info_hash.clone();
+                }
+                if !variant.token_eligibility_known && known.variant.token_eligibility_known {
+                    variant.can_use_token = known.variant.can_use_token;
+                    variant.token_eligibility_known = true;
+                }
+            }
+            if let Some(library_variant) =
+                library_by_group
+                    .get(&group.release.group_id)
+                    .and_then(|release| {
+                        release
+                            .variants
+                            .iter()
+                            .find(|item| item.torrent_id == variant.torrent_id)
+                    })
+            {
+                if variant.info_hash.is_none() {
+                    variant.info_hash = library_variant.info_hash.clone();
+                }
+                variant.library = library_variant.library.clone();
+            }
+        }
+        if let Some(library_release) = library_by_group.get(&group.release.group_id) {
+            for variant in &library_release.variants {
+                if !group
+                    .variants
+                    .iter()
+                    .any(|item| item.torrent_id == variant.torrent_id)
+                {
+                    group.variants.push(variant.clone());
+                }
+            }
+        }
+    }
+
+    let catalog_group_ids = catalog
+        .groups
+        .iter()
+        .map(|group| group.release.group_id)
+        .collect::<HashSet<_>>();
+    for release in library {
+        if catalog_group_ids.contains(&release.release.group_id) {
+            continue;
+        }
+        let roles = release
+            .release
+            .artists
+            .iter()
+            .find(|artist| artist.artist_id == Some(artist_id))
+            .map(|artist| match artist.role {
+                ArtistRole::Primary => vec![ArtistCatalogRole::Primary],
+                ArtistRole::Guest => vec![ArtistCatalogRole::Guest],
+            })
+            .unwrap_or_else(|| vec![ArtistCatalogRole::Guest]);
+        catalog.groups.push(ArtistCatalogRelease {
+            release: release.release,
+            tags: Vec::new(),
+            variants: release.variants,
+            roles,
+            listed_on_tracker: false,
+            library_availability: Some(release.availability),
+            library_added_at: Some(release.added_at),
+        });
+    }
+
+    let variants = catalog
+        .groups
+        .iter_mut()
+        .flat_map(|group| group.variants.iter_mut())
+        .collect::<Vec<_>>();
+    let hashes = variants
+        .iter()
+        .filter_map(|variant| variant.info_hash.clone())
+        .collect::<Vec<_>>();
+    let live = live_downloads_by_hash(state, &hashes).await;
+    for variant in variants {
+        variant.downloads = variant
+            .info_hash
+            .as_ref()
+            .and_then(|hash| live.get(&hash.to_ascii_lowercase()).cloned())
+            .unwrap_or_default();
+    }
+    catalog.groups.sort_by(|left, right| {
+        right
+            .release
+            .year
+            .unwrap_or_default()
+            .cmp(&left.release.year.unwrap_or_default())
+            .then_with(|| {
+                left.release
+                    .title
+                    .to_lowercase()
+                    .cmp(&right.release.title.to_lowercase())
+            })
+    });
+    catalog.primary_count = catalog
+        .groups
+        .iter()
+        .filter(|group| group.roles.contains(&ArtistCatalogRole::Primary))
+        .count();
+    catalog.appearance_count = catalog.groups.len().saturating_sub(catalog.primary_count);
+    Ok(())
+}
+
+async fn enrich_search_downloads(
+    state: &Arc<AppState>,
+    page: &mut SearchPage,
+) -> Result<(), AppError> {
+    let mut hashes = Vec::new();
+    for group in &page.groups {
+        for torrent in &group.torrents {
+            if let Some(hash) = &torrent.info_hash {
+                hashes.push(hash.clone());
+            }
+        }
+    }
+    let live = live_downloads_by_hash(state, &hashes).await;
+    for group in &mut page.groups {
+        for torrent in &mut group.torrents {
+            torrent.downloads = torrent
+                .info_hash
+                .as_ref()
+                .and_then(|hash| live.get(&hash.to_ascii_lowercase()).cloned())
+                .unwrap_or_default();
+        }
+    }
+    Ok(())
+}
+
+async fn enrich_variant_downloads(
+    state: &Arc<AppState>,
+    variants: &mut [TorrentVariant],
+) -> Result<(), AppError> {
+    let hashes = variants
+        .iter()
+        .filter_map(|variant| variant.info_hash.clone())
+        .collect::<Vec<_>>();
+    let live = live_downloads_by_hash(state, &hashes).await;
+    for variant in variants {
+        variant.downloads = variant
+            .info_hash
+            .as_ref()
+            .and_then(|hash| live.get(&hash.to_ascii_lowercase()).cloned())
+            .unwrap_or_default();
+    }
+    Ok(())
+}
+
+async fn enrich_variant_library(
+    state: &Arc<AppState>,
+    tracker: &str,
+    group_id: i64,
+    variants: &mut [TorrentVariant],
+) -> Result<(), AppError> {
+    let release = load_library_releases(state)
+        .await?
+        .into_iter()
+        .find(|release| {
+            release.release.tracker.eq_ignore_ascii_case(tracker)
+                && release.release.group_id == group_id
+        });
+    let Some(release) = release else {
+        return Ok(());
+    };
+    for variant in variants {
+        variant.library = release
+            .variants
+            .iter()
+            .find(|library_variant| library_variant.torrent_id == variant.torrent_id)
+            .and_then(|library_variant| library_variant.library.clone());
+    }
+    Ok(())
+}
+
+async fn enrich_library_artist_credits(state: &Arc<AppState>) -> Result<()> {
+    let mut groups = HashSet::new();
+    for record in state.db.list_library_records().await? {
+        if record
+            .canonical
+            .value
+            .release
+            .artists
+            .iter()
+            .any(|artist| artist.source == ArtistCreditSource::Structured)
+        {
+            continue;
+        }
+        let tracker = record.canonical.value.release.tracker.clone();
+        let group_id = record.canonical.value.release.group_id;
+        groups.insert((tracker, group_id));
+    }
+    for (tracker, group_id) in groups.into_iter().take(5) {
+        if state
+            .db
+            .get_snapshot::<ReleaseDetail>(&tracker, "group", &group_id.to_string())
+            .await?
+            .is_some_and(|cached| cached.expires_at > Utc::now())
+        {
+            continue;
+        }
+        if let Err(error) = refresh_group(state.clone(), tracker.clone(), group_id).await {
+            let rate_limited = error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("rate limit");
+            tracing::warn!(
+                tracker = %tracker,
+                group_id,
+                %error,
+                "library artist credit enrichment failed"
+            );
+            if rate_limited {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn live_downloads_by_hash(
+    state: &Arc<AppState>,
+    hashes: &[String],
+) -> HashMap<String, Vec<LiveDownloadStatus>> {
+    let hashes = hashes
+        .iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut result: HashMap<String, Vec<LiveDownloadStatus>> = HashMap::new();
+    for (name, client) in &state.download_clients {
+        match client.downloads_by_hashes(&hashes).await {
+            Ok(downloads) => {
+                for download in downloads {
+                    if let Err(error) = observe_download(state, &download).await {
+                        tracing::warn!(client = %name, %error, "could not index enriched download");
+                    }
+                    result
+                        .entry(download.live.info_hash.clone())
+                        .or_default()
+                        .push(download.live);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(client = %name, %error, "could not enrich tracker response with live state")
+            }
+        }
+    }
+    result
+}
+
+async fn refresh_group(state: Arc<AppState>, tracker_name: String, id: i64) -> Result<()> {
+    let tracker = state
+        .trackers
+        .get(&tracker_name)
+        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
+    let (detail, raw) = tracker.group(id).await?;
+    cache_release_detail(&state.db, &detail).await?;
+    let now = Utc::now();
+    state
+        .db
+        .put_snapshot(
+            &tracker_name,
+            "group",
+            &id.to_string(),
+            &detail,
+            &raw,
+            now,
+            now + ChronoDuration::hours(24),
+        )
+        .await
+}
+
+async fn refresh_artist_catalog(state: Arc<AppState>, tracker_name: String, id: i64) -> Result<()> {
+    let tracker = state
+        .trackers
+        .get(&tracker_name)
+        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
+    let (catalog, raw) = tracker.artist_catalog(id).await?;
+    cache_artist_catalog(&state.db, &catalog).await?;
+    let now = Utc::now();
+    state
+        .db
+        .put_snapshot(
+            &tracker_name,
+            "artist",
+            &id.to_string(),
+            &catalog,
+            &raw,
+            now,
+            now + ChronoDuration::hours(24),
+        )
+        .await
 }
 
 async fn store<T: Serialize + DeserializeOwned>(
@@ -630,12 +2032,16 @@ async fn stale_or_error<T: Serialize + DeserializeOwned>(
 fn envelope<T>(tracker: &str, cached: Cached<T>, stale: bool) -> ApiEnvelope<T> {
     ApiEnvelope {
         data: cached.value,
-        provenance: Provenance {
-            tracker: tracker.to_owned(),
-            fetched_at: cached.fetched_at,
-            cache_age_seconds: (Utc::now() - cached.fetched_at).num_seconds().max(0),
-            stale,
-        },
+        provenance: provenance(tracker, cached.fetched_at, stale),
+    }
+}
+
+fn provenance(tracker: &str, fetched_at: chrono::DateTime<Utc>, stale: bool) -> Provenance {
+    Provenance {
+        tracker: tracker.to_owned(),
+        fetched_at,
+        cache_age_seconds: (Utc::now() - fetched_at).num_seconds().max(0),
+        stale,
     }
 }
 
@@ -784,12 +2190,111 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(live, ready, account, search, downloads, download, create_download),
+    paths(
+        live, ready, preferences, update_preferences, account, search, downloads, download, create_download,
+        library_artists, library_artist, artist_catalog
+    ),
     components(schemas(
-        Health, Account, Provenance, SearchPage, TorrentMetadata, DownloadProfile,
-        ClientDownload, ClientDownloadState, CreateDownload, DownloadJob, DownloadState,
-        PublicConfig, ErrorBody, ErrorDetail
+        Health, Account, Provenance, RuntimePreferences, crate::model::ReleasePreferences,
+        SearchPage, TorrentMetadata, DownloadProfile,
+        LiveDownloadStatus, crate::model::DownloadDiagnostic, ClientDownloadState,
+        CreateDownload, DownloadJob, DownloadState,
+        PublicConfig, ArtistRole, ArtistCreditSource, ArtistCredit, ReleaseSummary,
+        TorrentVariant, ReleaseDetail, CanonicalDownload,
+        DownloadsPage, LibraryAvailability, LibraryCopy, LibraryVariantState, LibraryRelease,
+        LibraryArtistSummary, LibraryIndexStatus, LibraryArtistsPage, LibraryArtistPage,
+        ArtistCatalogRole, crate::model::ArtistCatalogArtist, ArtistCatalogRelease,
+        ArtistCatalogPage,
+        ErrorBody, ErrorDetail
     )),
     tags((name = "wotbox", description = "Wotbox API"))
 )]
 struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credit(id: i64, name: &str, role: ArtistRole) -> ArtistCredit {
+        ArtistCredit {
+            key: format!("id:{id}"),
+            tracker: "ops".into(),
+            artist_id: Some(id),
+            name: name.into(),
+            role,
+            source: ArtistCreditSource::Structured,
+        }
+    }
+
+    fn library_release(group_id: i64, artists: Vec<ArtistCredit>) -> LibraryRelease {
+        let now = Utc::now();
+        LibraryRelease {
+            release: ReleaseSummary {
+                tracker: "ops".into(),
+                group_id,
+                title: format!("Release {group_id}"),
+                artist: None,
+                artists,
+                year: None,
+                artwork: None,
+                release_type: None,
+            },
+            variants: Vec::new(),
+            availability: LibraryAvailability::Present,
+            added_at: now,
+            provenance: provenance("ops", now, false),
+        }
+    }
+
+    #[test]
+    fn library_artist_index_excludes_guest_only_and_compilation_only_artists() {
+        let mut compilation = library_release(
+            3,
+            vec![
+                credit(10, "Primary Artist", ArtistRole::Primary),
+                credit(40, "Compilation Only", ArtistRole::Primary),
+            ],
+        );
+        compilation.release.release_type = Some("Compilation".into());
+        let releases = vec![
+            library_release(
+                1,
+                vec![
+                    credit(10, "Primary Artist", ArtistRole::Primary),
+                    credit(20, "Guest Only", ArtistRole::Guest),
+                ],
+            ),
+            library_release(
+                2,
+                vec![
+                    credit(30, "Another Primary", ArtistRole::Primary),
+                    credit(10, "Primary Artist", ArtistRole::Guest),
+                ],
+            ),
+            compilation,
+        ];
+
+        let summaries = build_artist_summaries(&releases);
+        assert_eq!(summaries.len(), 2);
+        assert!(
+            summaries
+                .iter()
+                .all(|artist| !matches!(artist.name.as_str(), "Guest Only" | "Compilation Only"))
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|artist| artist.name == "Primary Artist")
+                .expect("primary artist")
+                .release_count,
+            2
+        );
+
+        let mut various_artists = library_release(
+            4,
+            vec![credit(50, "Soundtrack Appearance", ArtistRole::Primary)],
+        );
+        various_artists.release.artist = Some("Various artists".into());
+        assert!(is_compilation(&various_artists.release));
+    }
+}

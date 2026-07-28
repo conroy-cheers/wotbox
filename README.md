@@ -12,14 +12,14 @@ sanitized snapshots and local download state.
 - The embedded Svelte UI provides account status, tracker search, release
   metadata, and a download queue with live torrent detail. It works at `/` or
   behind a stripped reverse proxy subpath.
-- SQLite stores expiring, sanitized tracker snapshots and Wotbox's download
-  job state. Tracker payloads are refreshed on demand and remain the source of
-  truth.
+- SQLite stores expiring, sanitized tracker snapshots, canonical release
+  records, hash-to-release resolution state, and Wotbox's download job state.
+  Tracker payloads are refreshed on demand and remain the source of truth.
 - qBittorrent 5.2 is accessed with its bearer API-key flow. Password sessions
-  are deliberately not part of the application contract. Download list and
-  detail responses are always read directly from the configured download
-  client, including torrents added outside Wotbox; database job records are
-  used only for submission workflow and idempotency.
+  are deliberately not part of the application contract. Its torrent name,
+  tags, category, and announce URL are never public metadata. The adapter keeps
+  only the normalized announce hostname for tracker routing and attaches live
+  transfer state to releases resolved from the tracker by info hash.
 
 The `gazelle_api` crate is used for its tracker rate limiter. Its higher-level
 models are not used as the public Wotbox contract because OPS and RED expose
@@ -27,9 +27,23 @@ small response differences; the adapter normalizes those responses while
 retaining a sanitized source payload. The tracker and download client traits
 are the intended seams for RED and future Flood support.
 
-The download API exposes `GET /api/v1/downloads` for a live cross-client list
-and `GET /api/v1/downloads/{client}/{infoHash}` for live client detail.
-`POST /api/v1/downloads` remains the tracker-to-client submission endpoint.
+The download API exposes `GET /api/v1/downloads` as `{ items, index }`, where
+each visible item combines a canonical release, its matched torrent variant,
+and live client state. Pending, failed, and unconfigured torrents remain
+hidden while the background index progressively resolves configured announce
+hosts. `GET /api/v1/downloads/{client}/{infoHash}` remains as a compatibility
+lookup for resolved torrents. `POST /api/v1/downloads` remains the
+tracker-to-client submission endpoint.
+
+Completed, linked torrents also form a durable Library. Once a torrent reaches
+100%, its canonical release remains in the Library even if its client copy
+later disappears; successful client scans mark that copy missing instead of
+deleting the catalog record. `GET /api/v1/library/artists` provides the
+artist-sorted index and mixed artist/release search, while
+`GET /api/v1/library/artists/{tracker}/{artistKey}` returns one artist's
+completed releases. Artist membership comes only from structured Gazelle
+primary and guest credits, with the tracker's exact display artist used as a
+temporary fallback while group metadata is enriched.
 
 ## Development
 

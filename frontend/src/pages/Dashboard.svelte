@@ -1,9 +1,10 @@
 <script lang="ts">
   import { createQuery } from "@tanstack/svelte-query";
   import { ArrowDownToLine, Database, Gauge, HardDrive, RefreshCw } from "@lucide/svelte";
-  import { api, formatBytes, relativeTime, type Account, type ClientDownload, type Envelope } from "../lib/api";
+  import { api, appPath, formatBytes, relativeTime, type Account, type DownloadsPage, type Envelope } from "../lib/api";
   import StatusPill from "../lib/StatusPill.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
+  import { releaseTypeColor } from "../lib/releasePresentation";
 
   const account = createQuery({
     queryKey: ["account"],
@@ -11,7 +12,7 @@
   });
   const downloads = createQuery({
     queryKey: ["downloads"],
-    queryFn: () => api<ClientDownload[]>("/api/v1/downloads?limit=6"),
+    queryFn: () => api<DownloadsPage>("/api/v1/downloads?limit=6"),
     refetchInterval: 15_000
   });
   const health = createQuery({
@@ -82,13 +83,21 @@
     {#if $downloads.isPending}
       <div class="skeleton-row"></div>
       <div class="skeleton-row"></div>
-    {:else if $downloads.data?.length}
-      {#each $downloads.data.slice(0, 6) as download}
-        <article class="activity-row">
-          <div class="release-mark">{download.name.slice(0, 1).toUpperCase()}</div>
+    {:else if $downloads.data?.items.length}
+      {#each $downloads.data.items.slice(0, 6) as item}
+        {@const download = item.download}
+        <article class="activity-row release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
+          <div class="release-mark">{item.release.title.slice(0, 1).toUpperCase()}</div>
           <div class="activity-copy">
-            <strong>{download.name}</strong>
-            <span>{download.client} · {download.addedAt ? relativeTime(download.addedAt) : download.clientState}</span>
+            <strong>
+              <a href={appPath(`/downloads/${encodeURIComponent(download.client)}/${encodeURIComponent(download.infoHash)}`)}>
+                {item.release.title}
+              </a>
+            </strong>
+            <span>
+              {item.release.artist ?? "Various artists"} · {item.variant.format ?? "Unknown format"} ·
+              {download.diagnostic?.summary ?? (download.addedAt ? relativeTime(download.addedAt) : download.clientState)}
+            </span>
           </div>
           <StatusPill state={download.state} />
         </article>

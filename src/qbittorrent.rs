@@ -4,17 +4,22 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, multipart};
 use serde::Deserialize;
 use std::time::Duration;
+use url::Url;
 
 use crate::{
     config::{DownloadClientConfig, read_secret},
-    model::{ClientDownload, ClientDownloadState, DownloadProfile},
+    model::{
+        ClientDownloadState, DownloadDiagnostic, DownloadProfile, LiveDownloadStatus,
+        ObservedDownload,
+    },
 };
 
 #[async_trait]
 pub trait DownloadClient: Send + Sync {
     async fn health(&self) -> Result<String>;
-    async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ClientDownload>>;
-    async fn download(&self, info_hash: &str) -> Result<Option<ClientDownload>>;
+    async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>>;
+    async fn download(&self, info_hash: &str) -> Result<Option<ObservedDownload>>;
+    async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>>;
     async fn add_torrent(
         &self,
         bytes: Vec<u8>,
@@ -55,7 +60,7 @@ impl QbittorrentClient {
         info_hash: Option<&str>,
         limit: Option<u32>,
         offset: Option<u32>,
-    ) -> Result<Vec<ClientDownload>> {
+    ) -> Result<Vec<ObservedDownload>> {
         let mut request = self.request(reqwest::Method::GET, "/api/v2/torrents/info");
         if let Some(info_hash) = info_hash {
             request = request.query(&[("hashes", info_hash)]);
@@ -85,8 +90,6 @@ struct QbitTorrent {
     #[serde(default)]
     hash: String,
     #[serde(default)]
-    name: String,
-    #[serde(default)]
     state: String,
     #[serde(default)]
     progress: f64,
@@ -107,10 +110,6 @@ struct QbitTorrent {
     #[serde(default)]
     save_path: String,
     #[serde(default)]
-    category: String,
-    #[serde(default)]
-    tags: String,
-    #[serde(default)]
     tracker: String,
     #[serde(default)]
     added_on: i64,
@@ -119,35 +118,35 @@ struct QbitTorrent {
 }
 
 impl QbitTorrent {
-    fn normalized(self, client: &str) -> ClientDownload {
-        ClientDownload {
-            client: client.to_owned(),
-            info_hash: self.hash.to_ascii_lowercase(),
-            name: self.name,
-            state: normalize_state(&self.state, self.progress),
-            client_state: self.state,
-            progress: self.progress,
-            size: self.size,
-            downloaded: self.downloaded,
-            uploaded: self.uploaded,
-            download_speed: self.dlspeed,
-            upload_speed: self.upspeed,
-            eta: (self.eta >= 0 && self.eta < 8_640_000).then_some(self.eta),
-            ratio: self.ratio,
-            save_path: self.save_path,
-            category: self.category,
-            tags: self
-                .tags
-                .split(',')
-                .map(str::trim)
-                .filter(|tag| !tag.is_empty())
-                .map(ToOwned::to_owned)
-                .collect(),
-            tracker: (!self.tracker.is_empty()).then_some(self.tracker),
-            added_at: unix_timestamp(self.added_on),
-            completed_at: unix_timestamp(self.completion_on),
+    fn normalized(self, client: &str) -> ObservedDownload {
+        ObservedDownload {
+            announce_host: announce_host(&self.tracker),
+            live: LiveDownloadStatus {
+                client: client.to_owned(),
+                info_hash: self.hash.to_ascii_lowercase(),
+                state: normalize_state(&self.state, self.progress),
+                diagnostic: download_diagnostic(&self.state),
+                client_state: self.state,
+                progress: self.progress,
+                size: self.size,
+                downloaded: self.downloaded,
+                uploaded: self.uploaded,
+                download_speed: self.dlspeed,
+                upload_speed: self.upspeed,
+                eta: (self.eta >= 0 && self.eta < 8_640_000).then_some(self.eta),
+                ratio: self.ratio,
+                save_path: self.save_path,
+                added_at: unix_timestamp(self.added_on),
+                completed_at: unix_timestamp(self.completion_on),
+            },
         }
     }
+}
+
+fn announce_host(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let host = url.host_str()?.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 fn normalize_state(state: &str, progress: f64) -> ClientDownloadState {
@@ -158,11 +157,30 @@ fn normalize_state(state: &str, progress: f64) -> ClientDownloadState {
         "checkingdl" | "checkingup" | "checkingresumedata" | "moving" | "allocating" => {
             ClientDownloadState::Checking
         }
+        "stalledup" if progress >= 1.0 => ClientDownloadState::Seeding,
         "stalleddl" | "stalledup" => ClientDownloadState::Stalled,
         "uploading" | "forcedup" => ClientDownloadState::Seeding,
         "downloading" | "metadl" | "forceddl" => ClientDownloadState::Downloading,
         _ if progress >= 1.0 => ClientDownloadState::Complete,
         _ => ClientDownloadState::Unknown,
+    }
+}
+
+fn download_diagnostic(state: &str) -> Option<DownloadDiagnostic> {
+    match state.to_ascii_lowercase().as_str() {
+        "missingfiles" => Some(DownloadDiagnostic {
+            code: "missing_files".into(),
+            summary: "Files are missing".into(),
+            message: "qBittorrent cannot find some or all of the torrent payload at its configured save path.".into(),
+            action: "Restore or remount the files at that path, or correct the torrent's location, then run Force recheck in qBittorrent.".into(),
+        }),
+        "error" => Some(DownloadDiagnostic {
+            code: "client_error".into(),
+            summary: "qBittorrent reported an error".into(),
+            message: "The torrent status API does not provide the client's underlying error message.".into(),
+            action: "Check qBittorrent's execution log for a disk, permission, or I/O error, correct the cause, then run Force recheck.".into(),
+        }),
+        _ => None,
     }
 }
 
@@ -185,16 +203,24 @@ impl DownloadClient for QbittorrentClient {
         Ok(response.text().await?.trim().to_owned())
     }
 
-    async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ClientDownload>> {
+    async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>> {
         self.fetch_downloads(None, Some(limit), Some(offset)).await
     }
 
-    async fn download(&self, info_hash: &str) -> Result<Option<ClientDownload>> {
+    async fn download(&self, info_hash: &str) -> Result<Option<ObservedDownload>> {
         Ok(self
             .fetch_downloads(Some(info_hash), None, None)
             .await?
             .into_iter()
             .next())
+    }
+
+    async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>> {
+        if info_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fetch_downloads(Some(&info_hashes.join("|")), None, None)
+            .await
     }
 
     async fn add_torrent(
@@ -242,7 +268,10 @@ mod tests {
         matchers::{header, method, path, query_param},
     };
 
-    use super::{ClientDownloadState, DownloadClient, QbittorrentClient, normalize_state};
+    use super::{
+        ClientDownloadState, DownloadClient, QbittorrentClient, announce_host, download_diagnostic,
+        normalize_state,
+    };
 
     #[test]
     fn normalizes_qbittorrent_states() {
@@ -252,6 +281,10 @@ mod tests {
         );
         assert_eq!(
             normalize_state("stalledUP", 1.0),
+            ClientDownloadState::Seeding
+        );
+        assert_eq!(
+            normalize_state("stalledDL", 0.8),
             ClientDownloadState::Stalled
         );
         assert_eq!(
@@ -262,6 +295,28 @@ mod tests {
             normalize_state("someFutureCompleteState", 1.0),
             ClientDownloadState::Complete
         );
+    }
+
+    #[test]
+    fn extracts_only_normalized_announce_hostname() {
+        assert_eq!(
+            announce_host("https://PASSKEY@Home.Opsfet.Ch:443/abc/announce?token=secret"),
+            Some("home.opsfet.ch".into())
+        );
+        assert_eq!(announce_host("not a URL"), None);
+    }
+
+    #[test]
+    fn explains_qbittorrent_error_states() {
+        let missing = download_diagnostic("missingFiles").expect("missing files diagnostic");
+        assert_eq!(missing.code, "missing_files");
+        assert!(missing.message.contains("save path"));
+        assert!(missing.action.contains("Force recheck"));
+
+        let generic = download_diagnostic("error").expect("generic error diagnostic");
+        assert_eq!(generic.code, "client_error");
+        assert!(generic.action.contains("execution log"));
+        assert!(download_diagnostic("downloading").is_none());
     }
 
     #[tokio::test]
@@ -316,12 +371,15 @@ mod tests {
             .await
             .expect("qBittorrent response")
             .expect("download");
-        assert_eq!(download.client, "music");
-        assert_eq!(download.info_hash, info_hash);
-        assert_eq!(download.name, "A tracker download");
-        assert_eq!(download.state, ClientDownloadState::Downloading);
-        assert_eq!(download.tags, ["ops", "flac"]);
-        assert_eq!(download.downloaded, 1024);
-        assert!(download.added_at.is_some());
+        assert_eq!(download.live.client, "music");
+        assert_eq!(download.live.info_hash, info_hash);
+        assert_eq!(download.live.state, ClientDownloadState::Downloading);
+        assert_eq!(download.live.downloaded, 1024);
+        assert!(download.live.added_at.is_some());
+        assert_eq!(download.announce_host.as_deref(), Some("tracker.invalid"));
+        let public_json = serde_json::to_string(&download.live).expect("serialize live status");
+        assert!(!public_json.contains("tracker.invalid"));
+        assert!(!public_json.contains("A tracker download"));
+        assert!(!public_json.contains("\"tags\""));
     }
 }

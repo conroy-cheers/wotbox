@@ -71,6 +71,10 @@ pub struct SearchTorrent {
     pub freeleech: bool,
     pub can_use_token: bool,
     pub remaster_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_hash: Option<String>,
+    #[serde(default)]
+    pub downloads: Vec<LiveDownloadStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -81,6 +85,8 @@ pub struct TorrentMetadata {
     pub name: String,
     pub info_hash: String,
     pub can_use_token: bool,
+    #[serde(default)]
+    pub token_eligibility_known: bool,
     pub raw: Value,
 }
 
@@ -105,6 +111,111 @@ pub struct CreateDownload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasePreferences {
+    pub quality_order: Vec<String>,
+    pub minimum_quality: String,
+    pub media_tiers: Vec<Vec<String>>,
+}
+
+impl Default for ReleasePreferences {
+    fn default() -> Self {
+        Self {
+            quality_order: vec![
+                "hi_res".into(),
+                "lossless".into(),
+                "320".into(),
+                "v0".into(),
+                "other".into(),
+            ],
+            minimum_quality: "lossless".into(),
+            media_tiers: vec![
+                vec!["WEB".into(), "CD".into()],
+                vec!["Vinyl".into()],
+                vec!["SACD".into(), "DVD".into(), "Blu-ray".into()],
+                vec!["Cassette".into()],
+                vec!["Other".into()],
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePreferences {
+    pub release: ReleasePreferences,
+}
+
+impl ReleasePreferences {
+    pub fn validate(&self) -> Result<(), String> {
+        const QUALITIES: [&str; 5] = ["hi_res", "lossless", "320", "v0", "other"];
+        if self.quality_order.len() != QUALITIES.len()
+            || QUALITIES.iter().any(|quality| {
+                self.quality_order
+                    .iter()
+                    .filter(|item| item == quality)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(
+                "qualityOrder must contain hi_res, lossless, 320, v0, and other exactly once"
+                    .into(),
+            );
+        }
+        if !self.quality_order.contains(&self.minimum_quality) {
+            return Err("minimumQuality must be present in qualityOrder".into());
+        }
+        if self.media_tiers.is_empty() || self.media_tiers.iter().any(Vec::is_empty) {
+            return Err("mediaTiers must contain at least one non-empty tier".into());
+        }
+        let mut media = std::collections::HashSet::new();
+        for value in self.media_tiers.iter().flatten() {
+            let normalized = value.trim().to_ascii_lowercase();
+            if normalized.is_empty() || !media.insert(normalized) {
+                return Err("media values must be non-empty and unique across tiers".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn quality_class(format: Option<&str>, encoding: Option<&str>) -> &'static str {
+        let format = format.unwrap_or_default().to_ascii_lowercase();
+        let encoding = encoding.unwrap_or_default().to_ascii_lowercase();
+        if encoding.contains("24bit") || encoding.contains("24-bit") || encoding.contains("24 bit")
+        {
+            "hi_res"
+        } else if encoding.contains("lossless") || format.contains("flac") {
+            "lossless"
+        } else if encoding.contains("320") {
+            "320"
+        } else if encoding.contains("v0") {
+            "v0"
+        } else {
+            "other"
+        }
+    }
+
+    pub fn allows(&self, format: Option<&str>, encoding: Option<&str>) -> bool {
+        let Some(quality) = self
+            .quality_order
+            .iter()
+            .position(|item| item == Self::quality_class(format, encoding))
+        else {
+            return false;
+        };
+        let Some(cutoff) = self
+            .quality_order
+            .iter()
+            .position(|item| item == &self.minimum_quality)
+        else {
+            return false;
+        };
+        quality <= cutoff
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientDownloadState {
     Downloading,
@@ -120,12 +231,22 @@ pub enum ClientDownloadState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ClientDownload {
+pub struct DownloadDiagnostic {
+    pub code: String,
+    pub summary: String,
+    pub message: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDownloadStatus {
     pub client: String,
     pub info_hash: String,
-    pub name: String,
     pub state: ClientDownloadState,
     pub client_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<DownloadDiagnostic>,
     pub progress: f64,
     pub size: i64,
     pub downloaded: i64,
@@ -135,11 +256,241 @@ pub struct ClientDownload {
     pub eta: Option<i64>,
     pub ratio: f64,
     pub save_path: String,
-    pub category: String,
-    pub tags: Vec<String>,
-    pub tracker: Option<String>,
     pub added_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservedDownload {
+    pub live: LiveDownloadStatus,
+    pub announce_host: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseSummary {
+    pub tracker: String,
+    pub group_id: i64,
+    pub title: String,
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub artists: Vec<ArtistCredit>,
+    pub year: Option<i64>,
+    pub artwork: Option<String>,
+    pub release_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtistRole {
+    Primary,
+    Guest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtistCreditSource {
+    Structured,
+    DisplayFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistCredit {
+    pub key: String,
+    pub tracker: String,
+    pub artist_id: Option<i64>,
+    pub name: String,
+    pub role: ArtistRole,
+    pub source: ArtistCreditSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentVariant {
+    pub tracker: String,
+    pub torrent_id: i64,
+    pub group_id: i64,
+    pub info_hash: Option<String>,
+    pub format: Option<String>,
+    pub encoding: Option<String>,
+    pub media: Option<String>,
+    pub size: Option<i64>,
+    pub seeders: Option<i64>,
+    pub leechers: Option<i64>,
+    pub snatched: Option<i64>,
+    pub freeleech: bool,
+    pub can_use_token: bool,
+    #[serde(default)]
+    pub token_eligibility_known: bool,
+    pub remaster_title: Option<String>,
+    #[serde(default)]
+    pub downloads: Vec<LiveDownloadStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<LibraryVariantState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseDetail {
+    pub release: ReleaseSummary,
+    pub tags: Vec<String>,
+    pub description: Option<String>,
+    pub record_label: Option<String>,
+    pub variants: Vec<TorrentVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalTorrent {
+    pub release: ReleaseSummary,
+    pub variant: TorrentVariant,
+    pub tags: Vec<String>,
+    pub description: Option<String>,
+    pub record_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalDownload {
+    pub release: ReleaseSummary,
+    pub variant: TorrentVariant,
+    pub download: LiveDownloadStatus,
+    pub provenance: Provenance,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadIndexCounts {
+    pub linked: i64,
+    pub pending: i64,
+    pub resolving: i64,
+    pub failed: i64,
+    pub unconfigured: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadsPage {
+    pub items: Vec<CanonicalDownload>,
+    pub index: DownloadIndexCounts,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryAvailability {
+    Present,
+    Partial,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCopy {
+    pub client: String,
+    pub info_hash: String,
+    pub present: bool,
+    pub completed_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub missing_since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryVariantState {
+    pub availability: LibraryAvailability,
+    pub copies: Vec<LibraryCopy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryRelease {
+    pub release: ReleaseSummary,
+    pub variants: Vec<TorrentVariant>,
+    pub availability: LibraryAvailability,
+    pub added_at: DateTime<Utc>,
+    pub provenance: Provenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryArtistSummary {
+    pub key: String,
+    pub tracker: String,
+    pub artist_id: Option<i64>,
+    pub credit_source: ArtistCreditSource,
+    pub name: String,
+    pub release_count: usize,
+    pub missing_count: usize,
+    pub artworks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryIndexStatus {
+    pub last_successful_scan_at: Option<DateTime<Utc>>,
+    pub unresolved_credits: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryArtistsPage {
+    pub artists: Vec<LibraryArtistSummary>,
+    pub releases: Vec<LibraryRelease>,
+    pub artist_total: usize,
+    pub release_total: usize,
+    pub index: LibraryIndexStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryArtistPage {
+    pub artist: LibraryArtistSummary,
+    pub items: Vec<LibraryRelease>,
+    pub total: usize,
+    pub index: LibraryIndexStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtistCatalogRole {
+    Primary,
+    Guest,
+    Remixer,
+    Composer,
+    Conductor,
+    Dj,
+    Producer,
+    Arranger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistCatalogArtist {
+    pub tracker: String,
+    pub artist_id: i64,
+    pub name: String,
+    pub artwork: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistCatalogRelease {
+    pub release: ReleaseSummary,
+    pub tags: Vec<String>,
+    pub variants: Vec<TorrentVariant>,
+    pub roles: Vec<ArtistCatalogRole>,
+    pub listed_on_tracker: bool,
+    pub library_availability: Option<LibraryAvailability>,
+    pub library_added_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistCatalogPage {
+    pub artist: ArtistCatalogArtist,
+    pub groups: Vec<ArtistCatalogRelease>,
+    pub primary_count: usize,
+    pub appearance_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -265,4 +616,29 @@ pub fn value_bool(value: &Value, keys: &[&str]) -> bool {
             value.as_bool().or_else(|| value.as_i64().map(|v| v != 0))
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::ReleasePreferences;
+
+    #[test]
+    fn default_cutoff_accepts_lossless_and_hi_res_only() {
+        let preferences = ReleasePreferences::default();
+        assert!(preferences.allows(Some("FLAC"), Some("Lossless")));
+        assert!(preferences.allows(Some("FLAC"), Some("24bit Lossless")));
+        assert!(!preferences.allows(Some("MP3"), Some("320")));
+        assert!(!preferences.allows(Some("MP3"), Some("V0 (VBR)")));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_duplicate_preference_orders() {
+        let mut preferences = ReleasePreferences::default();
+        preferences.quality_order[4] = "lossless".into();
+        assert!(preferences.validate().is_err());
+
+        let mut preferences = ReleasePreferences::default();
+        preferences.media_tiers[1].push("web".into());
+        assert!(preferences.validate().is_err());
+    }
 }

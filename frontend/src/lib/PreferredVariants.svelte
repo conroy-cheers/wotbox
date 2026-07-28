@@ -1,0 +1,158 @@
+<script lang="ts">
+  import { createQuery } from "@tanstack/svelte-query";
+  import { ArrowDownToLine, ChevronDown, ChevronUp, Users } from "@lucide/svelte";
+  import {
+    api,
+    appPath,
+    formatBytes,
+    type RuntimePreferences
+  } from "./api";
+  import {
+    defaultReleasePreferences,
+    isQualityAllowed,
+    rankVariants,
+    type DisplayVariant
+  } from "./releasePreferences";
+  import StatusPill from "./StatusPill.svelte";
+
+  let {
+    variants,
+    tracker,
+    groupId,
+    title,
+    requestedTorrentId,
+    fromLibrary = false,
+    onadd
+  }: {
+    variants: DisplayVariant[];
+    tracker: string;
+    groupId: number;
+    title: string;
+    requestedTorrentId?: number;
+    fromLibrary?: boolean;
+    onadd?: (variant: DisplayVariant) => void;
+  } = $props();
+
+  let expanded = $state(false);
+  const preferences = createQuery({
+    queryKey: ["preferences"],
+    queryFn: () => api<RuntimePreferences>("/api/v1/preferences"),
+    staleTime: 30_000
+  });
+  const policy = $derived($preferences.data?.release ?? defaultReleasePreferences);
+  const ranked = $derived(rankVariants(variants, policy));
+  const preferred = $derived(
+    ranked.find((variant) => variant.torrentId === requestedTorrentId)
+      ?? ranked.find((variant) => isQualityAllowed(variant, policy))
+      ?? ranked[0]
+  );
+  const remaining = $derived(ranked.filter((variant) => variant.torrentId !== preferred?.torrentId));
+
+  function libraryState(variant: DisplayVariant) {
+    return "library" in variant ? variant.library : undefined;
+  }
+
+  function formatSummary(variant: DisplayVariant): string {
+    const format = variant.format?.trim() || "Unknown";
+    const encoding = variant.encoding?.trim() || "";
+    const media = variant.media?.trim();
+    let quality: string;
+    if (/24[\s-]*bit/i.test(encoding)) {
+      quality = `24-bit ${format}`;
+    } else if (/lossless/i.test(encoding)) {
+      quality = `Lossless ${format}`;
+    } else if (encoding) {
+      quality = `${format} ${encoding}`;
+    } else {
+      quality = format;
+    }
+    return media ? `${quality} · ${media}` : quality;
+  }
+</script>
+
+{#snippet toggleButton()}
+  <button
+    class="variant-toggle"
+    onclick={() => expanded = !expanded}
+    aria-expanded={expanded}
+    aria-label={expanded ? "Hide other formats" : `Show ${remaining.length} other ${remaining.length === 1 ? "format" : "formats"}`}
+    title={expanded ? "Hide other formats" : `${remaining.length} other ${remaining.length === 1 ? "format" : "formats"}`}
+  >
+    {#if expanded}<ChevronUp size={14} />{:else}<ChevronDown size={14} />{/if}
+    <span>{remaining.length}</span>
+  </button>
+{/snippet}
+
+{#snippet variantRow(variant: DisplayVariant, isPreferred = false, showToggle = false)}
+  {@const allowed = isQualityAllowed(variant, policy)}
+  {@const library = libraryState(variant)}
+  <div class="torrent-row preferred-torrent-row" class:matched={isPreferred}>
+    <div class="variant-toggle-slot">
+      {#if showToggle && remaining.length}
+        {@render toggleButton()}
+      {/if}
+    </div>
+    <div class="torrent-format">
+      <strong title={formatSummary(variant)}>{formatSummary(variant)}</strong>
+      {#if variant.remasterTitle}<small>{variant.remasterTitle}</small>{/if}
+    </div>
+    <span class="torrent-size">{formatBytes(variant.size)}</span>
+    <span class="peer-count" title="Seeders"><Users size={14} /> {variant.seeders ?? 0}</span>
+    <div class="torrent-flags">
+      {#if isPreferred && allowed}<span class="preferred-badge">Preferred</span>{/if}
+      {#if !allowed}<span class="cutoff-badge">Below cutoff</span>{/if}
+      {#if variant.freeleech}<span class="free-badge">Free</span>{/if}
+      {#if library?.availability === "present"}<span class="library-badge">In Library</span>{/if}
+      {#if library?.availability === "missing"}<span class="missing-badge">Missing</span>{/if}
+    </div>
+    <div class="variant-actions">
+      {#if variant.downloads.length}
+        <a class="download-status-link" href={appPath(`/releases/${tracker}/${groupId}?torrent=${variant.torrentId}${fromLibrary ? "&from=library" : ""}`)}>
+          <StatusPill state={variant.downloads[0].state} />
+        </a>
+      {:else if library?.availability === "present" || !onadd}
+        <a class="secondary-button compact-button" href={appPath(`/releases/${tracker}/${groupId}?torrent=${variant.torrentId}${fromLibrary ? "&from=library" : ""}`)}>View</a>
+      {:else}
+        <button
+          class="download-button catalog-add-button"
+          disabled={!allowed}
+          title={allowed ? `Add ${title}` : "This quality is below your configured cutoff"}
+          aria-label={allowed ? `Add ${title}` : `${title} is below the quality cutoff`}
+          onclick={() => allowed && onadd?.(variant)}
+        >
+          <ArrowDownToLine size={15} />
+          <span>{library?.availability === "missing" ? "Re-add" : "Add"}</span>
+        </button>
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
+{#if variants.length === 0}
+  <div class="variant-empty" role="status">
+    <strong>No active torrents</strong>
+    <span>{tracker.toUpperCase()} does not currently list a downloadable variant for this release.</span>
+  </div>
+{:else}
+  <div class="preferred-variants" class:expanded>
+    {#if expanded && remaining.length}
+      <div class="variant-control-anchor">
+        <div class="variant-toggle-slot">{@render toggleButton()}</div>
+      </div>
+      <div class="torrent-list compact-variant-list expanded">
+        {#if preferred}
+          {@render variantRow(preferred, true)}
+        {/if}
+        {#each remaining as variant}
+          {@render variantRow(variant)}
+        {/each}
+      </div>
+    {:else}
+      <div class="torrent-list compact-variant-list">
+        {#if preferred}
+          {@render variantRow(preferred, true, true)}
+        {/if}
+      </div>
+    {/if}
+  </div>
+{/if}
