@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     body::Body,
@@ -20,19 +20,24 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::time::MissedTickBehavior;
 use utoipa::{IntoParams, OpenApi, ToSchema};
+use uuid::Uuid;
 
 use crate::{
-    config::{Config, DownloadClientKind, TrackerKind},
+    channel,
+    config::{Config, DownloadClientKind, TrackerKind, read_secret},
     db::{Cached, Database},
     dedupe::{compute_raw_coverage, track_index_from_group},
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
         ArtistCredit, ArtistCreditSource, ArtistRole, CanonicalDownload, CanonicalTorrent,
-        ClientDownloadState, CreateDownload, DeduplicationIndexStatus, DownloadJob,
-        DownloadProfile, DownloadState, DownloadsPage, LibraryArtistPage, LibraryArtistSummary,
-        LibraryArtistsPage, LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease,
-        LibraryVariantState, LiveDownloadStatus, Provenance, PublicConfig, ReleaseDetail,
-        ReleaseSummary, RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant, value_i64,
+        ChannelBatchResult, ChannelConfig, ChannelKind, ChannelOverview, ChannelPack,
+        ChannelPackDecision, ChannelPackSummary, ChannelRun, ChannelRunStatus, ChannelRunTrigger,
+        ClientDownloadState, CreateDownload, DecideChannelPack, DeduplicationIndexStatus,
+        DownloadJob, DownloadProfile, DownloadState, DownloadsPage, LibraryArtistPage,
+        LibraryArtistSummary, LibraryArtistsPage, LibraryAvailability, LibraryCopy,
+        LibraryIndexStatus, LibraryRelease, LibraryVariantState, LiveDownloadStatus, Provenance,
+        PublicConfig, ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage,
+        TorrentMetadata, TorrentVariant, value_i64,
     },
     qbittorrent::{DownloadClient, QbittorrentClient},
     tracker::{
@@ -51,6 +56,8 @@ pub struct AppState {
     pub download_clients: HashMap<String, Arc<dyn DownloadClient>>,
     pub profiles: HashMap<String, DownloadProfile>,
     pub announce_hosts: HashMap<String, String>,
+    pub source_client: reqwest::Client,
+    pub lastfm_api_key: Option<String>,
 }
 
 impl AppState {
@@ -108,7 +115,17 @@ impl AppState {
             download_clients,
             profiles,
             announce_hosts,
+            source_client: reqwest::Client::builder()
+                .user_agent(format!("wotbox/{}", env!("CARGO_PKG_VERSION")))
+                .build()?,
+            lastfm_api_key: config
+                .lastfm_api_key_file
+                .as_deref()
+                .map(read_secret)
+                .transpose()?,
         });
+        state.db.ensure_default_channels().await?;
+        state.db.recover_channel_runs().await?;
         state.db.recover_resolving_links().await?;
         state.db.recover_track_indexes().await?;
         seed_existing_job_links(&state).await?;
@@ -178,6 +195,27 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(download_detail_compatibility),
         )
         .route("/api/v1/download-jobs/{id}", get(download_job))
+        .route("/api/v1/channels", get(channels))
+        .route("/api/v1/channels/{id}", axum::routing::put(update_channel))
+        .route(
+            "/api/v1/channels/{id}/refresh",
+            axum::routing::post(refresh_channel),
+        )
+        .route("/api/v1/channel-runs/{id}", get(channel_run))
+        .route("/api/v1/channels/{id}/packs", get(channel_packs))
+        .route("/api/v1/channel-packs/{id}", get(channel_pack))
+        .route(
+            "/api/v1/channel-packs/{id}/replan",
+            axum::routing::post(replan_channel_pack),
+        )
+        .route(
+            "/api/v1/channel-packs/{id}/accept",
+            axum::routing::post(accept_channel_pack),
+        )
+        .route(
+            "/api/v1/channel-packs/{id}/reject",
+            axum::routing::post(reject_channel_pack),
+        )
         .route(
             "/api/v1/downloads/{client}/{info_hash}/retry",
             axum::routing::post(retry_download_link),
@@ -253,6 +291,354 @@ async fn public_config(State(state): State<Arc<AppState>>) -> Json<PublicConfig>
         trackers,
         download_profiles,
     })
+}
+
+#[utoipa::path(get, path = "/api/v1/channels", responses((status = 200, body = [ChannelOverview])))]
+async fn channels(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ChannelOverview>>, AppError> {
+    let mut result = Vec::new();
+    for mut config in state.db.list_channels().await? {
+        hydrate_channel_config(&state, &mut config)?;
+        let latest_pack = state
+            .db
+            .list_channel_packs(&config.id, 1, 0)
+            .await?
+            .into_iter()
+            .next();
+        result.push(ChannelOverview {
+            active_run: state.db.active_channel_run(&config.id).await?,
+            latest_pack,
+            channel: config,
+        });
+    }
+    Ok(Json(result))
+}
+
+#[utoipa::path(put, path = "/api/v1/channels/{id}", request_body = ChannelConfig, responses((status = 200, body = ChannelConfig)))]
+async fn update_channel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(mut requested): Json<ChannelConfig>,
+) -> Result<Json<ChannelConfig>, AppError> {
+    let existing = state
+        .db
+        .get_channel(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found("channel_not_found", "Channel was not found"))?;
+    if requested.id != id || requested.kind != existing.kind {
+        return Err(AppError::bad_request(
+            "channel_identity_immutable",
+            "Channel id and kind cannot be changed",
+        ));
+    }
+    requested.country_chart = match requested.kind {
+        ChannelKind::CountryChart => requested.country_chart,
+        ChannelKind::Lastfm => None,
+    };
+    requested.lastfm = match requested.kind {
+        ChannelKind::Lastfm => requested.lastfm,
+        ChannelKind::CountryChart => None,
+    };
+    requested.credential_configured =
+        state.lastfm_api_key.is_some() || matches!(requested.kind, ChannelKind::CountryChart);
+    requested.last_successful_at = existing.last_successful_at;
+    requested.last_attempt_at = existing.last_attempt_at;
+    requested.last_error = existing.last_error;
+    requested.next_refresh_at = None;
+    requested.updated_at = Utc::now();
+    channel::validate_channel(&requested, state.lastfm_api_key.is_some())
+        .map_err(|error| AppError::bad_request("invalid_channel", error))?;
+    state.db.put_channel(&requested).await?;
+    hydrate_channel_config(&state, &mut requested)?;
+    Ok(Json(requested))
+}
+
+#[utoipa::path(post, path = "/api/v1/channels/{id}/refresh", responses((status = 202, body = ChannelRun)))]
+async fn refresh_channel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ChannelRun>), AppError> {
+    let config = state
+        .db
+        .get_channel(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found("channel_not_found", "Channel was not found"))?;
+    channel::validate_channel(&config, state.lastfm_api_key.is_some())
+        .map_err(|error| AppError::bad_request("invalid_channel", error))?;
+    let run = start_channel_run(state, config, ChannelRunTrigger::Manual).await?;
+    Ok((StatusCode::ACCEPTED, Json(run)))
+}
+
+#[utoipa::path(get, path = "/api/v1/channel-runs/{id}", responses((status = 200, body = ChannelRun)))]
+async fn channel_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ChannelRun>, AppError> {
+    state
+        .db
+        .get_channel_run(id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| AppError::not_found("channel_run_not_found", "Channel run was not found"))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+struct ChannelPacksQuery {
+    #[serde(default = "default_channel_pack_limit")]
+    limit: u64,
+    #[serde(default)]
+    offset: u64,
+}
+
+fn default_channel_pack_limit() -> u64 {
+    20
+}
+
+#[utoipa::path(get, path = "/api/v1/channels/{id}/packs", params(ChannelPacksQuery), responses((status = 200, body = [ChannelPackSummary])))]
+async fn channel_packs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ChannelPacksQuery>,
+) -> Result<Json<Vec<ChannelPackSummary>>, AppError> {
+    if state.db.get_channel(&id).await?.is_none() {
+        return Err(AppError::not_found(
+            "channel_not_found",
+            "Channel was not found",
+        ));
+    }
+    Ok(Json(
+        state
+            .db
+            .list_channel_packs(&id, query.limit, query.offset)
+            .await?,
+    ))
+}
+
+#[utoipa::path(get, path = "/api/v1/channel-packs/{id}", responses((status = 200, body = ChannelPack)))]
+async fn channel_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ChannelPack>, AppError> {
+    let fingerprint =
+        channel::preference_fingerprint(&state, &state.db.get_runtime_preferences().await?)?;
+    let mut pack = state
+        .db
+        .get_channel_pack(id, &fingerprint)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found("channel_pack_not_found", "Channel pack was not found")
+        })?;
+    hydrate_pack_jobs(&state, &mut pack).await?;
+    Ok(Json(pack))
+}
+
+#[utoipa::path(post, path = "/api/v1/channel-packs/{id}/replan", responses((status = 200, body = ChannelPack)))]
+async fn replan_channel_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ChannelPack>, AppError> {
+    let preferences = state.db.get_runtime_preferences().await?;
+    let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
+    let pack = state
+        .db
+        .get_channel_pack(id, &fingerprint)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found("channel_pack_not_found", "Channel pack was not found")
+        })?;
+    if pack.decision != ChannelPackDecision::Open {
+        return Err(AppError::conflict(
+            "channel_pack_decided",
+            "Only open packs can be replanned",
+        ));
+    }
+    let items = channel::replan_items(&state, pack.items).await?;
+    state
+        .db
+        .replace_channel_plan(id, &fingerprint, &items)
+        .await?;
+    let pack = state
+        .db
+        .get_channel_pack(id, &fingerprint)
+        .await?
+        .context("channel pack disappeared")?;
+    Ok(Json(pack))
+}
+
+#[utoipa::path(post, path = "/api/v1/channel-packs/{id}/reject", request_body = DecideChannelPack, responses((status = 200, body = ChannelPack)))]
+async fn reject_channel_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<DecideChannelPack>,
+) -> Result<Json<ChannelPack>, AppError> {
+    let fingerprint =
+        channel::preference_fingerprint(&state, &state.db.get_runtime_preferences().await?)?;
+    let pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
+    state
+        .db
+        .decide_channel_pack(pack.id, ChannelPackDecision::Rejected)
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .get_channel_pack(id, &fingerprint)
+            .await?
+            .context("channel pack disappeared")?,
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/channel-packs/{id}/accept", request_body = DecideChannelPack, responses((status = 202, body = ChannelBatchResult)))]
+async fn accept_channel_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<DecideChannelPack>,
+) -> Result<(StatusCode, Json<ChannelBatchResult>), AppError> {
+    let fingerprint =
+        channel::preference_fingerprint(&state, &state.db.get_runtime_preferences().await?)?;
+    let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
+    let mut jobs = Vec::new();
+    let mut submitted = 0;
+    for item in &mut pack.items {
+        if item.plan_state != crate::model::PackItemPlanState::Executable {
+            continue;
+        }
+        let Some(plan) = &item.plan else {
+            continue;
+        };
+        let request = CreateDownload {
+            tracker: plan.tracker.clone(),
+            torrent_id: plan.torrent_id,
+            profile: plan.profile.clone(),
+            use_token: plan.use_token,
+        };
+        let key = format!(
+            "channel-pack:{}:item:{}:plan:{}",
+            pack.id, item.ordinal, pack.plan_version
+        );
+        let job = enqueue_download(state.clone(), request, Some(&key)).await?;
+        item.plan_state = crate::model::PackItemPlanState::Submitted;
+        item.job_id = Some(job.id);
+        item.job = Some(job.clone());
+        state.db.update_channel_pack_item(pack.id, item).await?;
+        jobs.push(job);
+        submitted += 1;
+    }
+    state
+        .db
+        .decide_channel_pack(pack.id, ChannelPackDecision::Accepted)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ChannelBatchResult {
+            pack_id: pack.id,
+            submitted,
+            skipped: pack.items.len().saturating_sub(submitted),
+            jobs,
+        }),
+    ))
+}
+
+async fn hydrate_pack_jobs(state: &AppState, pack: &mut ChannelPack) -> Result<(), AppError> {
+    for item in &mut pack.items {
+        if let Some(id) = item.job_id {
+            item.job = state.db.get_job(id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn load_open_pack(
+    state: &Arc<AppState>,
+    id: Uuid,
+    plan_version: i32,
+    fingerprint: &str,
+) -> Result<ChannelPack, AppError> {
+    let pack = state
+        .db
+        .get_channel_pack(id, fingerprint)
+        .await?
+        .ok_or_else(|| {
+            AppError::not_found("channel_pack_not_found", "Channel pack was not found")
+        })?;
+    if pack.decision != ChannelPackDecision::Open {
+        return Err(AppError::conflict(
+            "channel_pack_decided",
+            "This pack has already been accepted or rejected",
+        ));
+    }
+    if pack.plan_version != plan_version || pack.plan_stale {
+        return Err(AppError::conflict(
+            "plan_stale",
+            "The download plan has changed; replan before deciding",
+        ));
+    }
+    Ok(pack)
+}
+
+fn hydrate_channel_config(state: &AppState, channel: &mut ChannelConfig) -> Result<(), AppError> {
+    channel.credential_configured =
+        !matches!(channel.kind, ChannelKind::Lastfm) || state.lastfm_api_key.is_some();
+    channel.next_refresh_at = channel::next_occurrence(channel, Utc::now()).ok();
+    Ok(())
+}
+
+async fn start_channel_run(
+    state: Arc<AppState>,
+    config: ChannelConfig,
+    trigger: ChannelRunTrigger,
+) -> Result<ChannelRun, AppError> {
+    channel::validate_channel(&config, state.lastfm_api_key.is_some())
+        .map_err(|error| AppError::bad_request("invalid_channel", error))?;
+    let run = state
+        .db
+        .create_channel_run(&config.id, trigger)
+        .await?
+        .ok_or_else(|| {
+            AppError::conflict(
+                "channel_refresh_running",
+                "A refresh is already running for this channel",
+            )
+        })?;
+    if let Some(mut current) = state.db.get_channel(&config.id).await? {
+        current.last_attempt_at = Some(Utc::now());
+        current.last_error = None;
+        current.updated_at = Utc::now();
+        state.db.put_channel(&current).await?;
+    }
+    let task_state = state.clone();
+    let task_run = run.clone();
+    tokio::spawn(async move {
+        let outcome = channel::refresh_channel(task_state.clone(), config.clone()).await;
+        match outcome {
+            Ok((pack_id, status)) => {
+                let _ = task_state
+                    .db
+                    .finish_channel_run(task_run.id, status, Some(pack_id), None)
+                    .await;
+                if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
+                    current.last_successful_at = Some(Utc::now());
+                    current.last_error = None;
+                    current.updated_at = Utc::now();
+                    let _ = task_state.db.put_channel(&current).await;
+                }
+            }
+            Err(error) => {
+                let message = truncate(&error.to_string(), 500);
+                tracing::error!(channel = %config.id, %message, "channel refresh failed");
+                let _ = task_state
+                    .db
+                    .finish_channel_run(task_run.id, ChannelRunStatus::Failed, None, Some(&message))
+                    .await;
+                if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
+                    current.last_error = Some(message);
+                    current.updated_at = Utc::now();
+                    let _ = task_state.db.put_channel(&current).await;
+                }
+            }
+        }
+    });
+    Ok(run)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -641,7 +1027,7 @@ async fn persist_release_match(
     Ok(())
 }
 
-async fn assign_search_ids(db: &Database, page: &mut SearchPage) -> Result<(), AppError> {
+pub(crate) async fn assign_search_ids(db: &Database, page: &mut SearchPage) -> Result<()> {
     for group in &mut page.groups {
         group.id = db
             .release_id_for_source(&group.tracker, group.group_id)
@@ -2285,6 +2671,18 @@ async fn create_download(
     headers: HeaderMap,
     Json(request): Json<CreateDownload>,
 ) -> Result<(StatusCode, Json<DownloadJob>), AppError> {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok());
+    let job = enqueue_download(state, request, idempotency_key).await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn enqueue_download(
+    state: Arc<AppState>,
+    request: CreateDownload,
+    idempotency_key: Option<&str>,
+) -> Result<DownloadJob, AppError> {
     get_tracker(&state, Some(&request.tracker))?;
     if !state.profiles.contains_key(&request.profile) {
         return Err(AppError::bad_request(
@@ -2292,9 +2690,6 @@ async fn create_download(
             "Unknown download profile",
         ));
     }
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok());
     let (job, created) = state
         .db
         .create_job(
@@ -2323,7 +2718,7 @@ async fn create_download(
             }
         });
     }
-    Ok((StatusCode::ACCEPTED, Json(job)))
+    Ok(job)
 }
 
 #[utoipa::path(
@@ -2604,6 +2999,45 @@ pub fn spawn_download_indexer(state: Arc<AppState>) {
                 tracing::warn!(%error, "download release resolution pass failed");
             }
             tick = tick.wrapping_add(1);
+        }
+    });
+}
+
+pub fn spawn_channel_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let channels = match state.db.list_channels().await {
+                Ok(channels) => channels,
+                Err(error) => {
+                    tracing::warn!(%error, "channel scheduler could not load configuration");
+                    continue;
+                }
+            };
+            for config in channels {
+                let due = channel::channel_is_due(&config, Utc::now()).unwrap_or(false);
+                if !due
+                    || state
+                        .db
+                        .active_channel_run(&config.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                {
+                    continue;
+                }
+                if let Err(error) =
+                    start_channel_run(state.clone(), config, ChannelRunTrigger::Scheduled).await
+                {
+                    tracing::warn!(
+                        message = %error.body.error.message,
+                        "scheduled channel refresh could not start"
+                    );
+                }
+            }
         }
     });
 }
@@ -3022,7 +3456,11 @@ async fn seed_existing_job_links(state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-async fn cache_search_canonical(db: &Database, tracker: &str, page: &SearchPage) -> Result<()> {
+pub(crate) async fn cache_search_canonical(
+    db: &Database,
+    tracker: &str,
+    page: &SearchPage,
+) -> Result<()> {
     let now = Utc::now();
     for group in &page.groups {
         let release = ReleaseSummary {
@@ -4293,8 +4731,17 @@ fn is_ui_route(path: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .collect();
     match segments.as_slice() {
-        [] | ["search"] | ["library"] | ["downloads"] | ["matches"] | ["preferences"] => true,
+        []
+        | ["search"]
+        | ["library"]
+        | ["downloads"]
+        | ["channels"]
+        | ["matches"]
+        | ["preferences"] => true,
         ["library", "artists", id] | ["releases", id] => uuid::Uuid::parse_str(id).is_ok(),
+        ["channels", channel, "packs", id] => {
+            matches!(*channel, "country_chart" | "lastfm") && uuid::Uuid::parse_str(id).is_ok()
+        }
         _ => false,
     }
 }
@@ -4384,7 +4831,9 @@ fn truncate(value: &str, max: usize) -> String {
     paths(
         live, ready, preferences, update_preferences, account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
         download_job,
-        library_artists, library_artist, artist_catalog
+        library_artists, library_artist, artist_catalog, channels, update_channel, refresh_channel,
+        channel_run, channel_packs, channel_pack, replan_channel_pack, accept_channel_pack,
+        reject_channel_pack
     ),
     components(schemas(
         Health, Account, crate::model::TrackerAccount, Provenance, RuntimePreferences,
@@ -4401,6 +4850,13 @@ fn truncate(value: &str, max: usize) -> String {
         LibraryArtistSummary, LibraryIndexStatus, LibraryArtistsPage, LibraryArtistPage,
         ArtistCatalogRole, crate::model::ArtistCatalogArtist, ArtistCatalogRelease,
         ArtistCatalogPage,
+        ChannelKind, crate::model::ChannelSchedule, crate::model::CountryChartChannelSettings,
+        crate::model::LastfmChannelSettings, ChannelConfig, ChannelRunStatus, ChannelRunTrigger,
+        ChannelRun, ChannelPackDecision, crate::model::RecommendationMatchState,
+        crate::model::PackItemPlanState, crate::model::RecommendationSource,
+        crate::model::PlannedDownload, crate::model::ChannelPackItem,
+        crate::model::ChannelPlanSummary, ChannelPack, ChannelPackSummary, ChannelOverview,
+        DecideChannelPack, ChannelBatchResult,
         ErrorBody, ErrorDetail
     )),
     tags((name = "wotbox", description = "Wotbox API"))
@@ -4534,6 +4990,8 @@ mod tests {
             "library",
             "library/artists/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
             "downloads",
+            "channels",
+            "channels/country_chart/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
             "matches",
             "preferences",
             "releases/d243a33e-93c5-4f85-b750-5aa301fbe1b5",
@@ -4545,6 +5003,8 @@ mod tests {
             "library/artists/ops",
             "downloads/music",
             "downloads/music/abc123",
+            "channels/unknown/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
+            "channels/lastfm/packs/not-a-uuid",
             "preferences/advanced",
             "releases/ops",
             "releases/ops/445818",

@@ -1,4 +1,5 @@
 mod api;
+mod channel;
 mod config;
 mod db;
 mod dedupe;
@@ -11,7 +12,8 @@ mod tracker;
 
 use anyhow::{Context, Result};
 use api::{
-    AppState, router, spawn_deduplication_indexer, spawn_download_indexer, spawn_reconciler,
+    AppState, router, spawn_channel_scheduler, spawn_deduplication_indexer, spawn_download_indexer,
+    spawn_reconciler,
 };
 use clap::Parser;
 use config::{Cli, Config};
@@ -31,6 +33,7 @@ async fn main() -> Result<()> {
     spawn_reconciler(state.clone());
     spawn_download_indexer(state.clone());
     spawn_deduplication_indexer(state.clone());
+    spawn_channel_scheduler(state.clone());
 
     let app = router(state)
         .layer(CompressionLayer::new())

@@ -874,6 +874,315 @@ pub struct PublicConfig {
     pub download_profiles: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelKind {
+    CountryChart,
+    Lastfm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSchedule {
+    /// Monday is 1 and Sunday is 7.
+    pub weekday: u8,
+    /// Local wall-clock time in HH:MM form.
+    pub time: String,
+    /// IANA timezone name.
+    pub timezone: String,
+}
+
+impl Default for ChannelSchedule {
+    fn default() -> Self {
+        Self {
+            weekday: 1,
+            time: "06:00".into(),
+            timezone: "Australia/Melbourne".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CountryChartChannelSettings {
+    pub country: String,
+}
+
+impl Default for CountryChartChannelSettings {
+    fn default() -> Self {
+        Self {
+            country: "AU".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LastfmChannelSettings {
+    pub username: String,
+    pub period: String,
+    pub pack_size: u16,
+    pub suppression_packs: u16,
+}
+
+impl Default for LastfmChannelSettings {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            period: "3month".into(),
+            pack_size: 25,
+            suppression_packs: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelConfig {
+    pub id: String,
+    pub kind: ChannelKind,
+    pub enabled: bool,
+    pub schedule: ChannelSchedule,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_chart: Option<CountryChartChannelSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lastfm: Option<LastfmChannelSettings>,
+    #[serde(default)]
+    pub credential_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_refresh_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ChannelConfig {
+    pub fn country_chart_default(now: DateTime<Utc>) -> Self {
+        Self {
+            id: "country_chart".into(),
+            kind: ChannelKind::CountryChart,
+            enabled: true,
+            schedule: ChannelSchedule::default(),
+            country_chart: Some(CountryChartChannelSettings::default()),
+            lastfm: None,
+            credential_configured: true,
+            next_refresh_at: None,
+            last_successful_at: None,
+            last_attempt_at: None,
+            last_error: None,
+            updated_at: now,
+        }
+    }
+
+    pub fn lastfm_default(now: DateTime<Utc>) -> Self {
+        Self {
+            id: "lastfm".into(),
+            kind: ChannelKind::Lastfm,
+            enabled: false,
+            schedule: ChannelSchedule::default(),
+            country_chart: None,
+            lastfm: Some(LastfmChannelSettings::default()),
+            credential_configured: false,
+            next_refresh_at: None,
+            last_successful_at: None,
+            last_attempt_at: None,
+            last_error: None,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelRunStatus {
+    Running,
+    Successful,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelRunTrigger {
+    Scheduled,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelRun {
+    pub id: Uuid,
+    pub channel_id: String,
+    pub trigger: ChannelRunTrigger,
+    pub status: ChannelRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelPackDecision {
+    Open,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationMatchState {
+    Matched,
+    Unmatched,
+    Ambiguous,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackItemPlanState {
+    Executable,
+    AlreadyOwned,
+    AlreadyDownloading,
+    Unmatched,
+    Ambiguous,
+    PolicyBlocked,
+    NoProfile,
+    SourceError,
+    Submitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationSource {
+    pub id: String,
+    pub rank: u32,
+    pub artist: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedDownload {
+    pub tracker: String,
+    pub torrent_id: i64,
+    pub profile: String,
+    pub use_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelPackItem {
+    pub ordinal: u32,
+    pub source: RecommendationSource,
+    pub match_state: RecommendationMatchState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<ReleaseSummary>,
+    #[serde(default)]
+    pub variants: Vec<TorrentVariant>,
+    pub plan_state: PackItemPlanState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlannedDownload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<DownloadJob>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelPlanSummary {
+    pub executable: usize,
+    pub skipped: usize,
+    pub total_size: i64,
+    pub token_uses: usize,
+    pub by_tracker: std::collections::BTreeMap<String, usize>,
+    pub by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelPack {
+    pub id: Uuid,
+    pub channel_id: String,
+    pub decision: ChannelPackDecision,
+    pub partial: bool,
+    pub source_title: String,
+    pub plan_version: i32,
+    pub plan_stale: bool,
+    pub summary: ChannelPlanSummary,
+    #[serde(default)]
+    pub items: Vec<ChannelPackItem>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelPackSummary {
+    pub id: Uuid,
+    pub channel_id: String,
+    pub decision: ChannelPackDecision,
+    pub partial: bool,
+    pub source_title: String,
+    pub plan_version: i32,
+    pub summary: ChannelPlanSummary,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelOverview {
+    pub channel: ChannelConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_run: Option<ChannelRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_pack: Option<ChannelPackSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DecideChannelPack {
+    pub plan_version: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelBatchResult {
+    pub pack_id: Uuid,
+    pub submitted: usize,
+    pub skipped: usize,
+    pub jobs: Vec<DownloadJob>,
+}
+
 pub fn sanitized(mut value: Value) -> Value {
     redact(&mut value);
     value

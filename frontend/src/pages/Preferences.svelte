@@ -1,8 +1,10 @@
 <script lang="ts">
   import { createQuery, useQueryClient } from "@tanstack/svelte-query";
-  import { ArrowDown, ArrowUp, RotateCcw, Save } from "@lucide/svelte";
+  import { ArrowDown, ArrowUp, Radio, RotateCcw, Save } from "@lucide/svelte";
   import {
     api,
+    type ChannelConfig,
+    type ChannelOverview,
     type QualityPreference,
     type RuntimePreferences,
     type TrackerPreference
@@ -17,6 +19,10 @@
     queryKey: ["preferences"],
     queryFn: () => api<RuntimePreferences>("/api/v1/preferences")
   });
+  const channels = createQuery({
+    queryKey: ["channels"],
+    queryFn: () => api<ChannelOverview[]>("/api/v1/channels")
+  });
   let qualityOrder = $state<QualityPreference[]>([...defaultReleasePreferences.qualityOrder]);
   let minimumQuality = $state<QualityPreference>(defaultReleasePreferences.minimumQuality);
   let mediaPriorities = $state<Record<string, number>>({});
@@ -28,6 +34,10 @@
   let saving = $state(false);
   let saved = $state(false);
   let error = $state("");
+  let channelDrafts = $state<ChannelConfig[]>([]);
+  let channelLoaded = $state(false);
+  let channelSaving = $state("");
+  let channelError = $state("");
 
   const knownMedia = ["WEB", "CD", "Vinyl", "SACD", "DVD", "Blu-ray", "Cassette", "Other"];
 
@@ -35,6 +45,12 @@
     if (!loaded && $preferences.data) {
       load($preferences.data);
       loaded = true;
+    }
+  });
+  $effect(() => {
+    if (!channelLoaded && $channels.data) {
+      channelDrafts = structuredClone($channels.data.map((overview) => overview.channel));
+      channelLoaded = true;
     }
   });
 
@@ -117,6 +133,29 @@
   function restoreDefaults() {
     load({ release: structuredClone(defaultReleasePreferences) });
     saved = false;
+  }
+
+  async function saveChannel(channel: ChannelConfig) {
+    channelSaving = channel.id;
+    channelError = "";
+    try {
+      const saved = await api<ChannelConfig>(`/api/v1/channels/${channel.id}`, {
+        method: "PUT",
+        body: JSON.stringify(channel)
+      });
+      const index = channelDrafts.findIndex((candidate) => candidate.id === channel.id);
+      channelDrafts[index] = saved;
+      channelDrafts = [...channelDrafts];
+      await queryClient.invalidateQueries({ queryKey: ["channels"] });
+    } catch (cause) {
+      channelError = cause instanceof Error ? cause.message : "Unable to save channel";
+    } finally {
+      channelSaving = "";
+    }
+  }
+
+  function channelLabel(id: string): string {
+    return id === "country_chart" ? "Country Top 100" : "Last.fm Discovery";
   }
 </script>
 
@@ -211,6 +250,77 @@
       </div>
     </section>
   </div>
+
+  <section class="preferences-panel channel-preferences" id="channels">
+    <div class="section-heading">
+      <div><p class="eyebrow">Scheduled discovery</p><h2>Recommendation channels</h2></div>
+      <Radio size={22} />
+    </div>
+    <p class="settings-help">Each enabled channel builds a new pack at its own local weekly time. Refreshing never downloads anything automatically.</p>
+    {#if $channels.isPending}
+      <div class="skeleton-card"></div>
+    {:else if $channels.isError}
+      <div class="error-panel compact">{$channels.error.message}</div>
+    {:else}
+      <div class="channel-settings-grid">
+        {#each channelDrafts as channel}
+          <div class="channel-setting-card">
+            <header>
+              <div><p class="eyebrow">{channel.kind.replace("_", " ")}</p><h3>{channelLabel(channel.id)}</h3></div>
+              <label class="inline-check"><input type="checkbox" bind:checked={channel.enabled} /> Enabled</label>
+            </header>
+            {#if channel.countryChart}
+              <label class="dialog-field">
+                <span>Country code</span>
+                <input maxlength="2" bind:value={channel.countryChart.country} placeholder="AU" />
+              </label>
+            {/if}
+            {#if channel.lastfm}
+              <label class="dialog-field">
+                <span>Last.fm username</span>
+                <input bind:value={channel.lastfm.username} placeholder="Username" />
+              </label>
+              <div class="channel-setting-row">
+                <label class="dialog-field">
+                  <span>Listening seed</span>
+                  <select bind:value={channel.lastfm.period}>
+                    <option value="7day">Last 7 days</option>
+                    <option value="1month">Last month</option>
+                    <option value="3month">Last 3 months</option>
+                    <option value="6month">Last 6 months</option>
+                    <option value="12month">Last year</option>
+                    <option value="overall">All time</option>
+                  </select>
+                </label>
+                <label class="dialog-field"><span>Pack size</span><input type="number" min="1" max="100" bind:value={channel.lastfm.packSize} /></label>
+                <label class="dialog-field"><span>Suppress packs</span><input type="number" min="0" max="52" bind:value={channel.lastfm.suppressionPacks} /></label>
+              </div>
+              {#if !channel.credentialConfigured}
+                <div class="notice-banner compact">Set <code>lastfm_api_key_file</code> or <code>LASTFM_API_KEY</code> before enabling this channel.</div>
+              {/if}
+            {/if}
+            <div class="channel-setting-row schedule-row">
+              <label class="dialog-field">
+                <span>Weekday</span>
+                <select bind:value={channel.schedule.weekday}>
+                  <option value={1}>Monday</option><option value={2}>Tuesday</option>
+                  <option value={3}>Wednesday</option><option value={4}>Thursday</option>
+                  <option value={5}>Friday</option><option value={6}>Saturday</option>
+                  <option value={7}>Sunday</option>
+                </select>
+              </label>
+              <label class="dialog-field"><span>Local time</span><input type="time" bind:value={channel.schedule.time} /></label>
+              <label class="dialog-field"><span>IANA timezone</span><input bind:value={channel.schedule.timezone} /></label>
+            </div>
+            <button class="secondary-button" disabled={channelSaving === channel.id} onclick={() => saveChannel(channel)}>
+              <Save size={15} /> {channelSaving === channel.id ? "Saving…" : "Save channel"}
+            </button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    {#if channelError}<div class="error-panel compact">{channelError}</div>{/if}
+  </section>
 
   {#if error}<div class="error-panel compact">{error}</div>{/if}
   <div class="settings-actions">

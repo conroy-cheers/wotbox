@@ -40,7 +40,7 @@
   const source = oneOf(
     pageParams,
     "from",
-    ["search", "library", "downloads"] as const,
+    ["search", "library", "downloads", "channels"] as const,
     "search"
   );
   let variantsExpanded = $state(pageParams.get("expanded") === "1");
@@ -137,8 +137,8 @@
 
 <svelte:head><title>{$release.data?.data.release.title ?? "Release"} · Wotbox</title></svelte:head>
 
-<a class="back-link" href={appPath(source === "library" ? "/library" : source === "downloads" ? "/downloads" : "/search")}>
-  <ArrowLeft size={16} /> Back to {source === "library" ? "Library" : source === "downloads" ? "downloads" : "search"}
+<a class="back-link" href={appPath(source === "library" ? "/library" : source === "downloads" ? "/downloads" : source === "channels" ? "/channels" : "/search")}>
+  <ArrowLeft size={16} /> Back to {source === "library" ? "Library" : source === "downloads" ? "downloads" : source === "channels" ? "channels" : "search"}
 </a>
 <StaleNotice provenance={$release.data?.provenance} />
 

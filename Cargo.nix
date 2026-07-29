@@ -2014,6 +2014,42 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "clock" "default" "iana-time-zone" "js-sys" "now" "oldtime" "serde" "std" "wasm-bindgen" "wasmbind" "winapi" "windows-link" ];
       };
+      "chrono-tz" = rec {
+        crateName = "chrono-tz";
+        version = "0.10.4";
+        edition = "2021";
+        sha256 = "1hr6rmdvqwgk748g2f69mnk97fzhdkfzaczvdn0wz4pdjy2rl4x6";
+        libName = "chrono_tz";
+        dependencies = [
+          {
+            name = "chrono";
+            packageId = "chrono";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "phf";
+            packageId = "phf";
+            usesDefaultFeatures = false;
+          }
+        ];
+        devDependencies = [
+          {
+            name = "chrono";
+            packageId = "chrono";
+            usesDefaultFeatures = false;
+            features = [ "alloc" ];
+          }
+        ];
+        features = {
+          "arbitrary" = [ "dep:arbitrary" ];
+          "case-insensitive" = [ "dep:uncased" "chrono-tz-build" "chrono-tz-build/case-insensitive" "phf/uncased" ];
+          "chrono-tz-build" = [ "dep:chrono-tz-build" ];
+          "default" = [ "std" ];
+          "filter-by-regex" = [ "chrono-tz-build" "chrono-tz-build/filter-by-regex" ];
+          "serde" = [ "dep:serde" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
       "clap" = rec {
         crateName = "clap";
         version = "4.6.4";
@@ -6867,6 +6903,51 @@ rec {
         };
         resolvedDefaultFeatures = [ "serde" ];
       };
+      "phf" = rec {
+        crateName = "phf";
+        version = "0.12.1";
+        edition = "2021";
+        sha256 = "1dz85g1wshfca83mrq3va9rm9n8qcdjlpv1i3908y5zc9j4p6cli";
+        authors = [
+          "Steven Fackler <sfackler@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "phf_shared";
+            packageId = "phf_shared";
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "macros" = [ "phf_macros" ];
+          "phf_macros" = [ "dep:phf_macros" ];
+          "serde" = [ "dep:serde" ];
+          "std" = [ "phf_shared/std" "serde?/std" ];
+          "uncased" = [ "phf_macros?/uncased" "phf_shared/uncased" ];
+          "unicase" = [ "phf_macros?/unicase" "phf_shared/unicase" ];
+        };
+      };
+      "phf_shared" = rec {
+        crateName = "phf_shared";
+        version = "0.12.1";
+        edition = "2021";
+        sha256 = "10cr16wpmbjxd7w6k98sxw9yw3zxnzscybl9jzyq3digi045a006";
+        authors = [
+          "Steven Fackler <sfackler@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "siphasher";
+            packageId = "siphasher";
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "uncased" = [ "dep:uncased" ];
+          "unicase" = [ "dep:unicase" ];
+        };
+      };
       "pin-project-lite" = rec {
         crateName = "pin-project-lite";
         version = "0.2.17";
@@ -10380,6 +10461,23 @@ rec {
           "default" = [ "std" ];
         };
         resolvedDefaultFeatures = [ "std" ];
+      };
+      "siphasher" = rec {
+        crateName = "siphasher";
+        version = "1.0.3";
+        edition = "2018";
+        sha256 = "0jg6l9xyzca5vy4h6gf8r6p4kk84g98fk95pzig1kq6cr4z8grcf";
+        authors = [
+          "Frank Denis <github@pureftpd.org>"
+        ];
+        features = {
+          "default" = [ "std" ];
+          "serde" = [ "dep:serde" ];
+          "serde_json" = [ "dep:serde_json" ];
+          "serde_no_std" = [ "serde/alloc" ];
+          "serde_std" = [ "std" "serde/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
       };
       "slab" = rec {
         crateName = "slab";
@@ -15386,6 +15484,10 @@ rec {
             name = "chrono";
             packageId = "chrono";
             features = [ "serde" ];
+          }
+          {
+            name = "chrono-tz";
+            packageId = "chrono-tz";
           }
           {
             name = "clap";

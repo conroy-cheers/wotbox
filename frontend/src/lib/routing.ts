@@ -11,7 +11,7 @@ export type ViewQueryValue =
 
 export type ViewQuery = Record<string, ViewQueryValue>;
 
-export type ReleaseSource = "search" | "library" | "downloads";
+export type ReleaseSource = "search" | "library" | "downloads" | "channels";
 
 export type ReleaseAttachment = {
   client: string;

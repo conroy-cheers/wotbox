@@ -2,10 +2,12 @@
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
   import { onMount } from "svelte";
   import page from "page";
-  import { ArrowDownToLine, BookOpen, GitMerge, LayoutDashboard, Search, Settings2 } from "@lucide/svelte";
+  import { ArrowDownToLine, BookOpen, GitMerge, LayoutDashboard, Radio, Search, Settings2 } from "@lucide/svelte";
   import { appPath, basePath } from "./lib/api";
   import Dashboard from "./pages/Dashboard.svelte";
   import Downloads from "./pages/Downloads.svelte";
+  import Channels from "./pages/Channels.svelte";
+  import ChannelPack from "./pages/ChannelPack.svelte";
   import Library from "./pages/Library.svelte";
   import LibraryArtist from "./pages/LibraryArtist.svelte";
   import Matches from "./pages/Matches.svelte";
@@ -21,6 +23,8 @@
     | { name: "library"; key: string }
     | { name: "libraryArtist"; id: string; key: string }
     | { name: "downloads"; key: string }
+    | { name: "channels"; key: string }
+    | { name: "channelPack"; channel: string; id: string; key: string }
     | { name: "preferences"; key: string }
     | { name: "matches"; key: string }
     | { name: "release"; id: string; source: string; key: string }
@@ -52,6 +56,13 @@
       key: routeKey(context)
     });
     page("/downloads", (context) => route = { name: "downloads", key: routeKey(context) });
+    page("/channels", (context) => route = { name: "channels", key: routeKey(context) });
+    page("/channels/:channel/packs/:id", (context) => route = {
+      name: "channelPack",
+      channel: context.params.channel,
+      id: context.params.id,
+      key: routeKey(context)
+    });
     page("/preferences", (context) => route = { name: "preferences", key: routeKey(context) });
     page("/matches", (context) => route = { name: "matches", key: routeKey(context) });
     page("/releases/:id", (context) => route = {
@@ -74,6 +85,7 @@
     { name: "search", label: "Search", path: "/search", icon: Search },
     { name: "library", label: "Library", path: "/library", icon: BookOpen },
     { name: "downloads", label: "Downloads", path: "/downloads", icon: ArrowDownToLine },
+    { name: "channels", label: "Channels", path: "/channels", icon: Radio },
     { name: "matches", label: "Match review", path: "/matches", icon: GitMerge },
     { name: "preferences", label: "Preferences", path: "/preferences", icon: Settings2 }
   ];
@@ -86,6 +98,10 @@
     }
     if (name === "downloads") {
       return route.name === "release" && route.source === "downloads";
+    }
+    if (name === "channels") {
+      return route.name === "channelPack"
+        || (route.name === "release" && route.source === "channels");
     }
     return name === "search"
       && route.name === "release"
@@ -125,6 +141,10 @@
           <LibraryArtist id={route.id} />
         {:else if route.name === "downloads"}
           <Downloads />
+        {:else if route.name === "channels"}
+          <Channels />
+        {:else if route.name === "channelPack"}
+          <ChannelPack id={route.id} />
         {:else if route.name === "preferences"}
           <Preferences />
         {:else if route.name === "matches"}

@@ -433,6 +433,125 @@ export type RuntimePreferences = {
   release: ReleasePreferences;
 };
 
+export type ChannelKind = "country_chart" | "lastfm";
+
+export type ChannelConfig = {
+  id: string;
+  kind: ChannelKind;
+  enabled: boolean;
+  schedule: {
+    weekday: number;
+    time: string;
+    timezone: string;
+  };
+  countryChart?: {
+    country: string;
+  };
+  lastfm?: {
+    username: string;
+    period: "7day" | "1month" | "3month" | "6month" | "12month" | "overall";
+    packSize: number;
+    suppressionPacks: number;
+  };
+  credentialConfigured: boolean;
+  nextRefreshAt?: string;
+  lastSuccessfulAt?: string;
+  lastAttemptAt?: string;
+  lastError?: string;
+  updatedAt: string;
+};
+
+export type ChannelRun = {
+  id: string;
+  channelId: string;
+  trigger: "scheduled" | "manual";
+  status: "running" | "successful" | "partial" | "failed";
+  packId?: string;
+  error?: string;
+  startedAt: string;
+  finishedAt?: string;
+};
+
+export type ChannelPlanSummary = {
+  executable: number;
+  skipped: number;
+  totalSize: number;
+  tokenUses: number;
+  byTracker: Record<string, number>;
+  byReason: Record<string, number>;
+};
+
+export type ChannelPackSummary = {
+  id: string;
+  channelId: string;
+  decision: "open" | "accepted" | "rejected";
+  partial: boolean;
+  sourceTitle: string;
+  planVersion: number;
+  summary: ChannelPlanSummary;
+  createdAt: string;
+};
+
+export type ChannelOverview = {
+  channel: ChannelConfig;
+  activeRun?: ChannelRun;
+  latestPack?: ChannelPackSummary;
+};
+
+export type ChannelPackItem = {
+  ordinal: number;
+  source: {
+    id: string;
+    rank: number;
+    artist: string;
+    title: string;
+    year?: number;
+    artwork?: string;
+    url?: string;
+    mbid?: string;
+    score?: number;
+  };
+  matchState: "matched" | "unmatched" | "ambiguous" | "error";
+  release?: ReleaseSummary;
+  variants: TorrentVariant[];
+  planState:
+    | "executable"
+    | "already_owned"
+    | "already_downloading"
+    | "unmatched"
+    | "ambiguous"
+    | "policy_blocked"
+    | "no_profile"
+    | "source_error"
+    | "submitted";
+  plan?: {
+    tracker: string;
+    torrentId: number;
+    profile: string;
+    useToken: boolean;
+    size?: number;
+    format?: string;
+    encoding?: string;
+    media?: string;
+  };
+  reason?: string;
+  jobId?: string;
+  job?: DownloadJob;
+};
+
+export type ChannelPack = ChannelPackSummary & {
+  planStale: boolean;
+  items: ChannelPackItem[];
+  decidedAt?: string;
+};
+
+export type ChannelBatchResult = {
+  packId: string;
+  submitted: number;
+  skipped: number;
+  jobs: DownloadJob[];
+};
+
 export type DownloadSelection = {
   name: string;
   artist?: string;

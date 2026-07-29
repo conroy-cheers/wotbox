@@ -25,6 +25,7 @@ pub struct Config {
     pub trackers: BTreeMap<String, TrackerConfig>,
     pub download_clients: BTreeMap<String, DownloadClientConfig>,
     pub download_profiles: BTreeMap<String, DownloadProfileConfig>,
+    pub lastfm_api_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +76,7 @@ impl Default for Config {
             trackers: BTreeMap::new(),
             download_clients: BTreeMap::new(),
             download_profiles: BTreeMap::new(),
+            lastfm_api_key_file: None,
         }
     }
 }
@@ -142,6 +144,13 @@ impl Config {
             write_secret(&red_path, token)?;
         }
         write_secret(&qbit_path, &qbit_key)?;
+        if let Ok(lastfm_key) = std::env::var("LASTFM_API_KEY")
+            && !lastfm_key.trim().is_empty()
+        {
+            let lastfm_path = secret_dir.join("lastfm-api-key");
+            write_secret(&lastfm_path, &lastfm_key)?;
+            config.lastfm_api_key_file = Some(lastfm_path);
+        }
 
         config.trackers.insert(
             "ops".into(),

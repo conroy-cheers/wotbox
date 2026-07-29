@@ -17,15 +17,17 @@ use crate::{
     entity::{
         artist_source, canonical_alias, canonical_artist, canonical_backfill_state,
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
-        dedupe_catalog_membership, download_client_scan, download_event, download_job,
-        download_release_link, match_candidate, release_source, release_track_index,
-        runtime_preference, single_album_coverage, tracker_snapshot,
+        channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
+        download_client_scan, download_event, download_job, download_release_link, match_candidate,
+        release_source, release_track_index, runtime_preference, single_album_coverage,
+        tracker_snapshot,
     },
     migration::Migrator,
     model::{
-        ArtistCatalogPage, ArtistCreditSource, ArtistRole, CanonicalTorrent, DownloadIndexCounts,
-        DownloadJob, DownloadState, LiveDownloadStatus, ReleaseDetail, ReleaseSummary,
-        RuntimePreferences,
+        ArtistCatalogPage, ArtistCreditSource, ArtistRole, CanonicalTorrent, ChannelConfig,
+        ChannelPack, ChannelPackDecision, ChannelPackItem, ChannelPackSummary, ChannelRun,
+        ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob, DownloadState,
+        LiveDownloadStatus, ReleaseDetail, ReleaseSummary, RuntimePreferences,
     },
 };
 
@@ -165,6 +167,372 @@ impl Database {
             .await?;
         }
         Ok(())
+    }
+
+    pub async fn ensure_default_channels(&self) -> Result<()> {
+        let now = Utc::now();
+        for channel in [
+            ChannelConfig::country_chart_default(now),
+            ChannelConfig::lastfm_default(now),
+        ] {
+            if channel_config::Entity::find_by_id(channel.id.clone())
+                .one(&self.connection)
+                .await?
+                .is_none()
+            {
+                self.put_channel(&channel).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_channels(&self) -> Result<Vec<ChannelConfig>> {
+        channel_config::Entity::find()
+            .order_by_asc(channel_config::Column::Id)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| serde_json::from_value(model.config_json).map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn get_channel(&self, id: &str) -> Result<Option<ChannelConfig>> {
+        channel_config::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await?
+            .map(|model| serde_json::from_value(model.config_json).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn put_channel(&self, channel: &ChannelConfig) -> Result<()> {
+        let value = serde_json::to_value(channel)?;
+        let kind = match channel.kind {
+            crate::model::ChannelKind::CountryChart => "country_chart",
+            crate::model::ChannelKind::Lastfm => "lastfm",
+        };
+        if let Some(model) = channel_config::Entity::find_by_id(channel.id.clone())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.kind = Set(kind.into());
+            active.enabled = Set(channel.enabled);
+            active.config_json = Set(value);
+            active.last_successful_at =
+                Set(channel.last_successful_at.map(|value| value.to_rfc3339()));
+            active.last_error = Set(channel.last_error.clone());
+            active.updated_at = Set(channel.updated_at.to_rfc3339());
+            active.update(&self.connection).await?;
+        } else {
+            channel_config::ActiveModel {
+                id: Set(channel.id.clone()),
+                kind: Set(kind.into()),
+                enabled: Set(channel.enabled),
+                config_json: Set(value),
+                last_successful_at: Set(channel.last_successful_at.map(|value| value.to_rfc3339())),
+                last_error: Set(channel.last_error.clone()),
+                updated_at: Set(channel.updated_at.to_rfc3339()),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn active_channel_run(&self, channel_id: &str) -> Result<Option<ChannelRun>> {
+        channel_run::Entity::find()
+            .filter(channel_run::Column::ChannelId.eq(channel_id))
+            .filter(channel_run::Column::Status.eq("running"))
+            .order_by_desc(channel_run::Column::StartedAt)
+            .one(&self.connection)
+            .await?
+            .map(channel_run_from_model)
+            .transpose()
+    }
+
+    pub async fn recover_channel_runs(&self) -> Result<()> {
+        for model in channel_run::Entity::find()
+            .filter(channel_run::Column::Status.eq("running"))
+            .all(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.status = Set("failed".into());
+            active.error = Set(Some("Service restarted during channel refresh".into()));
+            active.finished_at = Set(Some(Utc::now().to_rfc3339()));
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn create_channel_run(
+        &self,
+        channel_id: &str,
+        trigger: ChannelRunTrigger,
+    ) -> Result<Option<ChannelRun>> {
+        let transaction = self.connection.begin().await?;
+        if channel_run::Entity::find()
+            .filter(channel_run::Column::ChannelId.eq(channel_id))
+            .filter(channel_run::Column::Status.eq("running"))
+            .one(&transaction)
+            .await?
+            .is_some()
+        {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let run = ChannelRun {
+            id: Uuid::new_v4(),
+            channel_id: channel_id.into(),
+            trigger,
+            status: ChannelRunStatus::Running,
+            pack_id: None,
+            error: None,
+            started_at: Utc::now(),
+            finished_at: None,
+        };
+        channel_run::ActiveModel {
+            id: Set(run.id.to_string()),
+            channel_id: Set(run.channel_id.clone()),
+            trigger: Set(channel_run_trigger(&run.trigger).into()),
+            status: Set("running".into()),
+            pack_id: Set(None),
+            error: Set(None),
+            started_at: Set(run.started_at.to_rfc3339()),
+            finished_at: Set(None),
+        }
+        .insert(&transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(run))
+    }
+
+    pub async fn get_channel_run(&self, id: Uuid) -> Result<Option<ChannelRun>> {
+        channel_run::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+            .map(channel_run_from_model)
+            .transpose()
+    }
+
+    pub async fn finish_channel_run(
+        &self,
+        id: Uuid,
+        status: ChannelRunStatus,
+        pack_id: Option<Uuid>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if let Some(model) = channel_run::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.status = Set(channel_run_status(&status).into());
+            active.pack_id = Set(pack_id.map(|value| value.to_string()));
+            active.error = Set(error.map(|value| value.chars().take(500).collect()));
+            active.finished_at = Set(Some(Utc::now().to_rfc3339()));
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn create_channel_pack(
+        &self,
+        channel_id: &str,
+        source_title: &str,
+        partial: bool,
+        preference_fingerprint: &str,
+        items: &[ChannelPackItem],
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        let transaction = self.connection.begin().await?;
+        channel_pack::ActiveModel {
+            id: Set(id.to_string()),
+            channel_id: Set(channel_id.into()),
+            decision: Set("open".into()),
+            partial: Set(partial),
+            source_title: Set(source_title.into()),
+            plan_version: Set(1),
+            preference_fingerprint: Set(preference_fingerprint.into()),
+            created_at: Set(Utc::now().to_rfc3339()),
+            decided_at: Set(None),
+        }
+        .insert(&transaction)
+        .await?;
+        for item in items {
+            channel_pack_item::ActiveModel {
+                pack_id: Set(id.to_string()),
+                ordinal: Set(item.ordinal as i32),
+                item_json: Set(serde_json::to_value(item)?),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn get_channel_pack(
+        &self,
+        id: Uuid,
+        current_fingerprint: &str,
+    ) -> Result<Option<ChannelPack>> {
+        let Some(model) = channel_pack::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let items = channel_pack_item::Entity::find()
+            .filter(channel_pack_item::Column::PackId.eq(id.to_string()))
+            .order_by_asc(channel_pack_item::Column::Ordinal)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| serde_json::from_value(model.item_json).map_err(Into::into))
+            .collect::<Result<Vec<ChannelPackItem>>>()?;
+        Ok(Some(channel_pack_from_model(
+            model,
+            items,
+            current_fingerprint,
+        )?))
+    }
+
+    pub async fn list_channel_packs(
+        &self,
+        channel_id: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<ChannelPackSummary>> {
+        let models = channel_pack::Entity::find()
+            .filter(channel_pack::Column::ChannelId.eq(channel_id))
+            .order_by_desc(channel_pack::Column::CreatedAt)
+            .limit(limit.min(100))
+            .offset(offset)
+            .all(&self.connection)
+            .await?;
+        let mut result = Vec::with_capacity(models.len());
+        for model in models {
+            let items = channel_pack_item::Entity::find()
+                .filter(channel_pack_item::Column::PackId.eq(model.id.clone()))
+                .all(&self.connection)
+                .await?
+                .into_iter()
+                .map(|item| serde_json::from_value(item.item_json).map_err(Into::into))
+                .collect::<Result<Vec<ChannelPackItem>>>()?;
+            let pack = channel_pack_from_model(model, items, "")?;
+            result.push(ChannelPackSummary {
+                id: pack.id,
+                channel_id: pack.channel_id,
+                decision: pack.decision,
+                partial: pack.partial,
+                source_title: pack.source_title,
+                plan_version: pack.plan_version,
+                summary: pack.summary,
+                created_at: pack.created_at,
+            });
+        }
+        Ok(result)
+    }
+
+    pub async fn recent_channel_sources(
+        &self,
+        channel_id: &str,
+        pack_limit: u64,
+    ) -> Result<Vec<crate::model::RecommendationSource>> {
+        let packs = channel_pack::Entity::find()
+            .filter(channel_pack::Column::ChannelId.eq(channel_id))
+            .order_by_desc(channel_pack::Column::CreatedAt)
+            .limit(pack_limit)
+            .all(&self.connection)
+            .await?;
+        let mut sources = Vec::new();
+        for pack in packs {
+            for item in channel_pack_item::Entity::find()
+                .filter(channel_pack_item::Column::PackId.eq(pack.id))
+                .all(&self.connection)
+                .await?
+            {
+                let item: ChannelPackItem = serde_json::from_value(item.item_json)?;
+                sources.push(item.source);
+            }
+        }
+        Ok(sources)
+    }
+
+    pub async fn replace_channel_plan(
+        &self,
+        id: Uuid,
+        fingerprint: &str,
+        items: &[ChannelPackItem],
+    ) -> Result<i32> {
+        let transaction = self.connection.begin().await?;
+        let model = channel_pack::Entity::find_by_id(id.to_string())
+            .one(&transaction)
+            .await?
+            .context("channel pack disappeared")?;
+        let version = model.plan_version + 1;
+        let mut active = model.into_active_model();
+        active.plan_version = Set(version);
+        active.preference_fingerprint = Set(fingerprint.into());
+        active.update(&transaction).await?;
+        channel_pack_item::Entity::delete_many()
+            .filter(channel_pack_item::Column::PackId.eq(id.to_string()))
+            .exec(&transaction)
+            .await?;
+        for item in items {
+            channel_pack_item::ActiveModel {
+                pack_id: Set(id.to_string()),
+                ordinal: Set(item.ordinal as i32),
+                item_json: Set(serde_json::to_value(item)?),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(version)
+    }
+
+    pub async fn update_channel_pack_item(
+        &self,
+        pack_id: Uuid,
+        item: &ChannelPackItem,
+    ) -> Result<()> {
+        if let Some(model) =
+            channel_pack_item::Entity::find_by_id((pack_id.to_string(), item.ordinal as i32))
+                .one(&self.connection)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.item_json = Set(serde_json::to_value(item)?);
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn decide_channel_pack(&self, id: Uuid, decision: ChannelPackDecision) -> Result<()> {
+        if let Some(model) = channel_pack::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.decision = Set(channel_pack_decision(&decision).into());
+            active.decided_at = Set(Some(Utc::now().to_rfc3339()));
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn release_download_flags(&self, release_id: Uuid) -> Result<(bool, bool)> {
+        let links = download_release_link::Entity::find()
+            .filter(download_release_link::Column::ReleaseId.eq(release_id.to_string()))
+            .all(&self.connection)
+            .await?;
+        let owned = links.iter().any(|link| link.library_added_at.is_some());
+        let downloading = links
+            .iter()
+            .any(|link| link.present && link.library_added_at.is_none());
+        Ok((owned, downloading))
     }
 
     pub async fn enqueue_track_index(&self, tracker: &str, group_id: i64) -> Result<()> {
@@ -2585,6 +2953,108 @@ fn snapshot_from_model<T: DeserializeOwned>(model: tracker_snapshot::Model) -> R
     })
 }
 
+fn channel_run_trigger(value: &ChannelRunTrigger) -> &'static str {
+    match value {
+        ChannelRunTrigger::Scheduled => "scheduled",
+        ChannelRunTrigger::Manual => "manual",
+    }
+}
+
+fn channel_run_status(value: &ChannelRunStatus) -> &'static str {
+    match value {
+        ChannelRunStatus::Running => "running",
+        ChannelRunStatus::Successful => "successful",
+        ChannelRunStatus::Partial => "partial",
+        ChannelRunStatus::Failed => "failed",
+    }
+}
+
+fn channel_pack_decision(value: &ChannelPackDecision) -> &'static str {
+    match value {
+        ChannelPackDecision::Open => "open",
+        ChannelPackDecision::Accepted => "accepted",
+        ChannelPackDecision::Rejected => "rejected",
+    }
+}
+
+fn channel_run_from_model(model: channel_run::Model) -> Result<ChannelRun> {
+    Ok(ChannelRun {
+        id: Uuid::parse_str(&model.id)?,
+        channel_id: model.channel_id,
+        trigger: match model.trigger.as_str() {
+            "scheduled" => ChannelRunTrigger::Scheduled,
+            _ => ChannelRunTrigger::Manual,
+        },
+        status: match model.status.as_str() {
+            "successful" => ChannelRunStatus::Successful,
+            "partial" => ChannelRunStatus::Partial,
+            "failed" => ChannelRunStatus::Failed,
+            _ => ChannelRunStatus::Running,
+        },
+        pack_id: model.pack_id.as_deref().map(Uuid::parse_str).transpose()?,
+        error: model.error,
+        started_at: parse_timestamp(&model.started_at)?,
+        finished_at: model
+            .finished_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+    })
+}
+
+fn channel_pack_from_model(
+    model: channel_pack::Model,
+    items: Vec<ChannelPackItem>,
+    current_fingerprint: &str,
+) -> Result<ChannelPack> {
+    let mut summary = crate::model::ChannelPlanSummary::default();
+    for item in &items {
+        if matches!(
+            item.plan_state,
+            crate::model::PackItemPlanState::Executable
+                | crate::model::PackItemPlanState::Submitted
+        ) {
+            summary.executable += 1;
+            if let Some(plan) = &item.plan {
+                summary.total_size += plan.size.unwrap_or_default();
+                summary.token_uses += usize::from(plan.use_token);
+                *summary.by_tracker.entry(plan.tracker.clone()).or_default() += 1;
+            }
+        } else {
+            summary.skipped += 1;
+            let reason = item
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", item.plan_state).to_ascii_lowercase());
+            *summary.by_reason.entry(reason).or_default() += 1;
+        }
+    }
+    let decision = match model.decision.as_str() {
+        "accepted" => ChannelPackDecision::Accepted,
+        "rejected" => ChannelPackDecision::Rejected,
+        _ => ChannelPackDecision::Open,
+    };
+    Ok(ChannelPack {
+        id: Uuid::parse_str(&model.id)?,
+        channel_id: model.channel_id,
+        decision: decision.clone(),
+        partial: model.partial,
+        source_title: model.source_title,
+        plan_version: model.plan_version,
+        plan_stale: decision == ChannelPackDecision::Open
+            && !current_fingerprint.is_empty()
+            && model.preference_fingerprint != current_fingerprint,
+        summary,
+        items,
+        created_at: parse_timestamp(&model.created_at)?,
+        decided_at: model
+            .decided_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+    })
+}
+
 fn canonical_from_model(model: canonical_torrent::Model) -> Result<Cached<CanonicalTorrent>> {
     Ok(Cached {
         value: serde_json::from_value(model.canonical_json)?,
@@ -2712,7 +3182,8 @@ mod tests {
     use crate::{
         entity::download_release_link,
         model::{
-            CanonicalTorrent, ClientDownloadState, LiveDownloadStatus, ReleaseSummary,
+            CanonicalTorrent, ChannelPackItem, ClientDownloadState, LiveDownloadStatus,
+            PackItemPlanState, RecommendationMatchState, RecommendationSource, ReleaseSummary,
             TorrentVariant,
         },
         tracker::fallback_artist_credit,
@@ -2756,6 +3227,65 @@ mod tests {
                 .await
                 .expect("load preferences"),
             preferences
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_channel_configuration_and_immutable_pack_items() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        db.ensure_default_channels().await.expect("seed channels");
+        let channels = db.list_channels().await.expect("channels");
+        assert_eq!(channels.len(), 2);
+        assert!(
+            channels
+                .iter()
+                .find(|channel| channel.id == "country_chart")
+                .expect("chart")
+                .enabled
+        );
+        let item = ChannelPackItem {
+            ordinal: 1,
+            source: RecommendationSource {
+                id: "apple:42".into(),
+                rank: 1,
+                artist: "Artist".into(),
+                title: "Album".into(),
+                year: Some(2026),
+                artwork: None,
+                url: None,
+                mbid: None,
+                score: None,
+            },
+            match_state: RecommendationMatchState::Unmatched,
+            release: None,
+            variants: Vec::new(),
+            plan_state: PackItemPlanState::Unmatched,
+            plan: None,
+            reason: Some("Unavailable".into()),
+            job_id: None,
+            job: None,
+        };
+        let id = db
+            .create_channel_pack("country_chart", "AU Top 100", false, "fingerprint", &[item])
+            .await
+            .expect("create pack");
+        let pack = db
+            .get_channel_pack(id, "fingerprint")
+            .await
+            .expect("load pack")
+            .expect("pack");
+        assert_eq!(pack.items.len(), 1);
+        assert_eq!(pack.summary.skipped, 1);
+        assert!(!pack.plan_stale);
+        assert!(
+            db.get_channel_pack(id, "changed")
+                .await
+                .expect("load stale pack")
+                .expect("pack")
+                .plan_stale
         );
     }
 

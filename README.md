@@ -72,6 +72,9 @@ query-backed state:
 - `/library/artists/{artistId}` — one artist's combined catalog with filters,
   sorting, covered Singles, expanded variants, and add confirmation
 - `/downloads` — canonical downloads with links to their releases
+- `/channels` — independently scheduled recommendation channels and pack history
+- `/channels/{channel}/packs/{packId}` — one immutable recommendation pack and
+  its current download plan
 - `/releases/{releaseId}` — canonical release detail, selected torrent,
   exact live client attachment, expanded variants, and source context
 - `/matches` — review ambiguous artist and release matches
@@ -173,6 +176,20 @@ Release pages also expose read-only cross-seed compatibility plans. They
 compare the target tracker file list with completed qBittorrent files by name
 and size; generating a plan never adds, resumes, relocates, or otherwise
 changes a torrent.
+
+Recommendation Channels turn external album discovery into reviewable,
+historical packs. The country chart channel reads Apple's country-specific Top
+100 Albums feed; the Last.fm channel expands recent top artists through
+similar artists and their leading albums. Each channel has its own weekly,
+timezone-aware schedule. Refreshing resolves Albums and EPs against configured
+trackers and creates a plan under the normal quality, tracker, freeleech, and
+token rules, but never downloads automatically. A user may accept every
+executable plan item, reject the batch while retaining it in history, or add
+individual releases through the normal confirmation dialog.
+
+Channel settings live in Preferences. The Last.fm API key remains a file-based
+secret configured with `lastfm_api_key_file`; environment-based development
+may instead provide `LASTFM_API_KEY`.
 
 `flake.nix` exports the packaged service, the separately buildable frontend,
 the development shell, and `nixosModules.default`. See

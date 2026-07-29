@@ -2,6 +2,8 @@ listen_address = "127.0.0.1"
 port = 8780
 base_path = "/"
 database_path = "./wotbox.sqlite"
+# Optional. Required only when the Last.fm channel is enabled.
+lastfm_api_key_file = "./lastfm-api-key"
 
 [trackers.ops]
 kind = "ops"

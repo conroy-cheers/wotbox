@@ -119,6 +119,27 @@ pub fn summary_score(left: &ReleaseSummary, right: &ReleaseSummary) -> f64 {
     )
 }
 
+pub fn external_score(
+    source_title: &str,
+    source_artist: &str,
+    source_year: Option<i64>,
+    tracker_title: &str,
+    tracker_artist: Option<&str>,
+    tracker_year: Option<i64>,
+    tracker_type: Option<&str>,
+) -> f64 {
+    identity_score(
+        source_title,
+        Some(source_artist),
+        source_year,
+        None,
+        tracker_title,
+        tracker_artist,
+        tracker_year,
+        tracker_type,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn identity_score(
     left_title: &str,
@@ -246,7 +267,7 @@ mod tests {
 
     use crate::model::SearchGroup;
 
-    use super::{AUTO_MERGE_THRESHOLD, group_score, normalized};
+    use super::{AUTO_MERGE_THRESHOLD, external_score, group_score, normalized};
 
     #[derive(Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -302,6 +323,31 @@ mod tests {
     #[test]
     fn normalizes_cross_tracker_spelling_noise() {
         assert_eq!(normalized("Beyoncé & Jay-Z"), "beyonce and jay z");
+    }
+
+    #[test]
+    fn album_feed_identity_can_match_without_release_type() {
+        let score = external_score(
+            "Discovery",
+            "Daft Punk",
+            Some(2001),
+            "Discovery",
+            Some("Daft Punk"),
+            Some(2001),
+            Some("Album"),
+        );
+        assert!(score >= AUTO_MERGE_THRESHOLD);
+        assert!(
+            external_score(
+                "Discovery",
+                "Daft Punk",
+                Some(2001),
+                "Homework",
+                Some("Daft Punk"),
+                Some(1997),
+                Some("Album"),
+            ) < AUTO_MERGE_THRESHOLD
+        );
     }
 
     #[test]

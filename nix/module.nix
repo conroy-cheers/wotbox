@@ -67,6 +67,8 @@ let
       save_path = profile.savePath;
       start_paused = profile.startPaused;
     }) cfg.downloadProfiles;
+  } // lib.optionalAttrs (cfg.lastfmApiKeyFile != null) {
+    lastfm_api_key_file = cfg.lastfmApiKeyFile;
   };
   configFile = toml.generate "wotbox.toml" settings;
 in
@@ -114,6 +116,11 @@ in
     downloadProfiles = mkOption {
       type = lib.types.attrsOf profileType;
       default = { };
+    };
+    lastfmApiKeyFile = mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Path to the Last.fm API key used by the optional discovery channel.";
     };
   };
 

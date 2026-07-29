@@ -428,6 +428,96 @@ pub mod runtime_preference {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod channel_config {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "channel_configs")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub kind: String,
+        pub enabled: bool,
+        #[sea_orm(column_type = "Json")]
+        pub config_json: Json,
+        pub last_successful_at: Option<String>,
+        pub last_error: Option<String>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod channel_run {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "channel_runs")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub channel_id: String,
+        pub trigger: String,
+        pub status: String,
+        pub pack_id: Option<String>,
+        pub error: Option<String>,
+        pub started_at: String,
+        pub finished_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod channel_pack {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "channel_packs")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub channel_id: String,
+        pub decision: String,
+        pub partial: bool,
+        pub source_title: String,
+        pub plan_version: i32,
+        pub preference_fingerprint: String,
+        pub created_at: String,
+        pub decided_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod channel_pack_item {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "channel_pack_items")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub pack_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub ordinal: i32,
+        #[sea_orm(column_type = "Json")]
+        pub item_json: Json,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod release_track_index {
     use sea_orm::entity::prelude::*;
 

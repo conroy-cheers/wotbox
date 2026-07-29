@@ -6,10 +6,10 @@ use sea_orm_migration::{
 
 use crate::entity::{
     artist_source, canonical_alias, canonical_artist, canonical_backfill_state, canonical_release,
-    canonical_release_artist, canonical_release_credit, canonical_torrent,
-    dedupe_catalog_membership, download_client_scan, download_event, download_job,
-    download_release_link, match_candidate, release_source, release_track_index,
-    runtime_preference, single_album_coverage, tracker_snapshot,
+    canonical_release_artist, canonical_release_credit, canonical_torrent, channel_config,
+    channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership, download_client_scan,
+    download_event, download_job, download_release_link, match_candidate, release_source,
+    release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
 };
 
 pub struct Migrator;
@@ -17,7 +17,53 @@ pub struct Migrator;
 #[async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(InitialSchema), Box::new(CanonicalIdentitySchema)]
+        vec![
+            Box::new(InitialSchema),
+            Box::new(CanonicalIdentitySchema),
+            Box::new(ChannelSchema),
+        ]
+    }
+}
+
+struct ChannelSchema;
+
+impl MigrationName for ChannelSchema {
+    fn name(&self) -> &str {
+        "m20260730_000003_channels"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ChannelSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, channel_config::Entity).await?;
+        create_entity(manager, &schema, channel_run::Entity).await?;
+        create_entity(manager, &schema, channel_pack::Entity).await?;
+        create_entity(manager, &schema, channel_pack_item::Entity).await?;
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .name("idx_channel_runs_status")
+                .table(channel_run::Entity)
+                .col(channel_run::Column::ChannelId)
+                .col(channel_run::Column::Status)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_channel_packs_history")
+                .table(channel_pack::Entity)
+                .col(channel_pack::Column::ChannelId)
+                .col(channel_pack::Column::CreatedAt)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 
