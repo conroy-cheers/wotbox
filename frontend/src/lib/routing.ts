@@ -52,8 +52,7 @@ export function browserViewPath(path: string, query: ViewQuery = {}): string {
 }
 
 export function releaseViewPath(
-  tracker: string,
-  groupId: string | number,
+  releaseId: string | undefined,
   torrentId?: number,
   source: ReleaseSource = "search",
   attachment?: ReleaseAttachment,
@@ -61,13 +60,13 @@ export function releaseViewPath(
   showClientDetails = false
 ): string {
   return browserViewPath(
-    `/releases/${encodeURIComponent(tracker)}/${encodeURIComponent(String(groupId))}`,
+    `/releases/${encodeURIComponent(releaseId ?? "unresolved")}`,
     {
       torrent: torrentId,
       client: attachment?.client,
       hash: attachment?.infoHash,
       from: source,
-      expanded: expanded ? groupId : undefined,
+      expanded: expanded ? 1 : undefined,
       details: showClientDetails ? "client" : undefined
     }
   );

@@ -132,8 +132,15 @@ impl Config {
             .tempdir()?;
         let secret_dir = secret_dir.keep();
         let ops_path = secret_dir.join("ops-token");
+        let red_path = secret_dir.join("red-token");
         let qbit_path = secret_dir.join("qbit-api-key");
         write_secret(&ops_path, &ops_token)?;
+        let red_token = std::env::var("RED_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if let Some(token) = &red_token {
+            write_secret(&red_path, token)?;
+        }
         write_secret(&qbit_path, &qbit_key)?;
 
         config.trackers.insert(
@@ -145,6 +152,17 @@ impl Config {
                 announce_hosts: vec!["home.opsfet.ch".into()],
             },
         );
+        if red_token.is_some() {
+            config.trackers.insert(
+                "red".into(),
+                TrackerConfig {
+                    kind: TrackerKind::Red,
+                    base_url: "https://redacted.sh".into(),
+                    token_file: red_path,
+                    announce_hosts: vec!["flacsfor.me".into()],
+                },
+            );
+        }
         config.download_clients.insert(
             "music".into(),
             DownloadClientConfig {
@@ -163,6 +181,17 @@ impl Config {
                 start_paused: false,
             },
         );
+        if red_token.is_some() {
+            config.download_profiles.insert(
+                "red".into(),
+                DownloadProfileConfig {
+                    client: "music".into(),
+                    save_path: "/mnt/media/Downloads/torrent/complete/red".into(),
+                    tag: "red".into(),
+                    start_paused: false,
+                },
+            );
+        }
         Ok(config)
     }
 }

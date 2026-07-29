@@ -5,9 +5,11 @@ use sea_orm_migration::{
 };
 
 use crate::entity::{
-    canonical_release_artist, canonical_torrent, dedupe_catalog_membership, download_client_scan,
-    download_event, download_job, download_release_link, release_track_index, runtime_preference,
-    single_album_coverage, tracker_snapshot,
+    artist_source, canonical_alias, canonical_artist, canonical_backfill_state, canonical_release,
+    canonical_release_artist, canonical_release_credit, canonical_torrent,
+    dedupe_catalog_membership, download_client_scan, download_event, download_job,
+    download_release_link, match_candidate, release_source, release_track_index,
+    runtime_preference, single_album_coverage, tracker_snapshot,
 };
 
 pub struct Migrator;
@@ -15,7 +17,115 @@ pub struct Migrator;
 #[async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(InitialSchema)]
+        vec![Box::new(InitialSchema), Box::new(CanonicalIdentitySchema)]
+    }
+}
+
+struct CanonicalIdentitySchema;
+
+impl MigrationName for CanonicalIdentitySchema {
+    fn name(&self) -> &str {
+        "m20260729_000002_canonical_identity"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for CanonicalIdentitySchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, canonical_release::Entity).await?;
+        create_entity(manager, &schema, release_source::Entity).await?;
+        create_entity(manager, &schema, canonical_artist::Entity).await?;
+        create_entity(manager, &schema, artist_source::Entity).await?;
+        create_entity(manager, &schema, canonical_release_credit::Entity).await?;
+        create_entity(manager, &schema, canonical_alias::Entity).await?;
+        create_entity(manager, &schema, match_candidate::Entity).await?;
+        create_entity(manager, &schema, canonical_backfill_state::Entity).await?;
+        add_column_if_missing(
+            manager,
+            &schema,
+            canonical_torrent::Entity,
+            canonical_torrent::Column::ReleaseId,
+        )
+        .await?;
+        add_column_if_missing(
+            manager,
+            &schema,
+            download_release_link::Entity,
+            download_release_link::Column::ReleaseId,
+        )
+        .await?;
+
+        let indexes = [
+            Index::create()
+                .if_not_exists()
+                .name("idx_release_sources_canonical")
+                .table(release_source::Entity)
+                .col(release_source::Column::ReleaseId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_release_sources_match")
+                .table(release_source::Entity)
+                .col(release_source::Column::NormalizedTitle)
+                .col(release_source::Column::NormalizedArtist)
+                .col(release_source::Column::Year)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_artist_sources_canonical")
+                .table(artist_source::Entity)
+                .col(artist_source::Column::CanonicalArtistId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_artist_sources_match")
+                .table(artist_source::Entity)
+                .col(artist_source::Column::NormalizedName)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_canonical_credits_artist")
+                .table(canonical_release_credit::Entity)
+                .col(canonical_release_credit::Column::ArtistId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .unique()
+                .name("idx_match_candidates_pair")
+                .table(match_candidate::Entity)
+                .col(match_candidate::Column::Kind)
+                .col(match_candidate::Column::LeftId)
+                .col(match_candidate::Column::RightId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_match_candidates_status")
+                .table(match_candidate::Entity)
+                .col(match_candidate::Column::Status)
+                .col(match_candidate::Column::Score)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_canonical_torrents_release_id")
+                .table(canonical_torrent::Entity)
+                .col(canonical_torrent::Column::ReleaseId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_download_links_release_id")
+                .table(download_release_link::Entity)
+                .col(download_release_link::Column::ReleaseId)
+                .to_owned(),
+        ];
+        for index in indexes {
+            manager.create_index(index).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

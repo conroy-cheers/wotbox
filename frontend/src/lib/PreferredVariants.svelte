@@ -17,6 +17,7 @@
 
   let {
     variants,
+    releaseId,
     tracker,
     groupId,
     title,
@@ -27,6 +28,7 @@
     onadd
   }: {
     variants: DisplayVariant[];
+    releaseId?: string;
     tracker: string;
     groupId: number;
     title: string;
@@ -48,13 +50,51 @@
   const ranked = $derived(rankVariants(variants, policy));
   const preferred = $derived(
     ranked.find((variant) => variant.torrentId === requestedTorrentId)
-      ?? ranked.find((variant) => isQualityAllowed(variant, policy))
+      ?? ranked.find((variant) => isDownloadable(variant))
       ?? ranked[0]
   );
   const remaining = $derived(ranked.filter((variant) => variant.torrentId !== preferred?.torrentId));
 
   function libraryState(variant: DisplayVariant) {
     return "library" in variant ? variant.library : undefined;
+  }
+
+  function isDownloadable(variant: DisplayVariant): boolean {
+    if (!isQualityAllowed(variant, policy)) return false;
+    if ("eligibility" in variant && variant.eligibility) return variant.eligibility.eligible;
+    const variantTracker = variant.tracker ?? tracker;
+    const trackerPolicy = policyFor(variantTracker);
+    if (trackerPolicy.mode === "disabled") return false;
+    if (variant.freeleech) return true;
+    if (trackerPolicy.mode === "freeleech_only") return false;
+    if (trackerPolicy.mode === "freeleech_or_token") return variant.canUseToken;
+    return true;
+  }
+
+  function policyFor(variantTracker: string) {
+    return policy.trackerPolicies.find((candidate) =>
+      candidate.tracker.toLowerCase() === variantTracker.toLowerCase()
+    ) ?? { tracker: variantTracker, mode: "freeleech_only" as const, autoUseTokens: false };
+  }
+
+  function policyBlockExplanation(variant: DisplayVariant): string {
+    const variantTracker = variant.tracker ?? tracker;
+    const trackerLabel = variantTracker.toUpperCase();
+    const reason = "eligibility" in variant ? variant.eligibility?.reason : undefined;
+    let explanation: string;
+    if (reason === "tracker_disabled" || policyFor(variantTracker).mode === "disabled") {
+      explanation = `${trackerLabel} downloads are disabled.`;
+    } else if (
+      reason === "freeleech_required"
+      || policyFor(variantTracker).mode === "freeleech_only"
+    ) {
+      explanation = `${trackerLabel} is set to “Already free only”, and this torrent is not freeleech.`;
+    } else if (reason === "token_unavailable") {
+      explanation = `${trackerLabel} is set to “Free or token”, but this torrent cannot use a freeleech token.`;
+    } else {
+      explanation = `This ${trackerLabel} torrent does not satisfy the current download-cost policy.`;
+    }
+    return `${explanation} Change this under Preferences → Trackers and download cost.`;
   }
 
   function formatSummary(variant: DisplayVariant): string {
@@ -83,8 +123,7 @@
   function variantPath(variant: DisplayVariant): string {
     const download = variant.downloads[0];
     return releaseViewPath(
-      tracker,
-      groupId,
+      releaseId,
       variant.torrentId,
       source,
       download
@@ -109,8 +148,10 @@
 {/snippet}
 
 {#snippet variantRow(variant: DisplayVariant, isPreferred = false, showToggle = false)}
-  {@const allowed = isQualityAllowed(variant, policy)}
+  {@const qualityAllowed = isQualityAllowed(variant, policy)}
+  {@const allowed = isDownloadable(variant)}
   {@const library = libraryState(variant)}
+  {@const policyTooltipId = `policy-${variant.tracker ?? tracker}-${variant.torrentId}`}
   <div class="torrent-row preferred-torrent-row" class:matched={isPreferred}>
     <div class="variant-toggle-slot">
       {#if showToggle && remaining.length}
@@ -119,13 +160,28 @@
     </div>
     <div class="torrent-format">
       <strong title={formatSummary(variant)}>{formatSummary(variant)}</strong>
-      {#if variant.remasterTitle}<small>{variant.remasterTitle}</small>{/if}
+      <small>
+        {(variant.tracker ?? tracker).toUpperCase()}
+        {#if variant.remasterTitle} · {variant.remasterTitle}{/if}
+      </small>
     </div>
     <span class="torrent-size">{formatBytes(variant.size)}</span>
     <span class="peer-count" title="Seeders"><Users size={14} /> {variant.seeders ?? 0}</span>
     <div class="torrent-flags">
       {#if isPreferred && allowed}<span class="preferred-badge">Preferred</span>{/if}
-      {#if !allowed}<span class="cutoff-badge">Below cutoff</span>{/if}
+      {#if !qualityAllowed}<span class="cutoff-badge">Below cutoff</span>
+      {:else if !allowed}
+        <span class="policy-tooltip">
+          <button
+            type="button"
+            class="cutoff-badge policy-badge"
+            aria-describedby={policyTooltipId}
+          >Policy blocked</button>
+          <span id={policyTooltipId} role="tooltip" class="policy-tooltip-content">
+            {policyBlockExplanation(variant)}
+          </span>
+        </span>
+      {/if}
       {#if variant.freeleech}<span class="free-badge">Free</span>{/if}
       {#if library?.availability === "present"}<span class="library-badge">In Library</span>{/if}
       {#if library?.availability === "missing"}<span class="missing-badge">Missing</span>{/if}
@@ -141,8 +197,8 @@
         <button
           class="download-button catalog-add-button"
           disabled={!allowed}
-          title={allowed ? `Add ${title}` : "This quality is below your configured cutoff"}
-          aria-label={allowed ? `Add ${title}` : `${title} is below the quality cutoff`}
+          title={allowed ? `Add ${title}` : "This variant is blocked by your release preferences"}
+          aria-label={allowed ? `Add ${title}` : `${title} is blocked by release preferences`}
           onclick={() => allowed && onadd?.(variant)}
         >
           <ArrowDownToLine size={15} />

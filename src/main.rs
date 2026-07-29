@@ -6,6 +6,7 @@ mod entity;
 mod migration;
 mod model;
 mod qbittorrent;
+mod release_matcher;
 mod tracker;
 
 use anyhow::{Context, Result};

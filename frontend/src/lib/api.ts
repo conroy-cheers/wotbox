@@ -16,6 +16,14 @@ export type PublicConfig = {
   downloadProfiles: string[];
 };
 
+export type CanonicalBackfillProgress = {
+  state: "pending" | "running" | "complete";
+  processed: number;
+  total: number;
+  remaining: number;
+  lastError?: string;
+};
+
 export type Account = {
   id?: number;
   username: string;
@@ -28,7 +36,15 @@ export type Account = {
   raw: unknown;
 };
 
+export type TrackerAccount = {
+  tracker: string;
+  account: Account;
+  provenance: Provenance;
+  error?: string;
+};
+
 export type SearchTorrent = {
+  tracker?: string;
   torrentId: number;
   editionId?: number;
   format?: string;
@@ -39,6 +55,7 @@ export type SearchTorrent = {
   leechers?: number;
   snatched?: number;
   freeleech: boolean;
+  leechStatus?: LeechStatus;
   canUseToken: boolean;
   remasterTitle?: string;
   infoHash?: string;
@@ -46,6 +63,8 @@ export type SearchTorrent = {
 };
 
 export type SearchGroup = {
+  id?: string;
+  tracker: string;
   groupId: number;
   name: string;
   artist?: string;
@@ -54,6 +73,7 @@ export type SearchGroup = {
   image?: string;
   tags: string[];
   torrents: SearchTorrent[];
+  sources: ReleaseSource[];
   albumCoverage?: AlbumCoverage;
 };
 
@@ -63,6 +83,11 @@ export type SearchPage = {
   totalResults?: number;
   groups: SearchGroup[];
   deduplication: DeduplicationIndexStatus;
+  sourceStatus: {
+    tracker: string;
+    state: string;
+    error?: string;
+  }[];
 };
 
 export type AlbumReference = {
@@ -137,6 +162,7 @@ export type LiveDownloadStatus = {
 };
 
 export type ReleaseSummary = {
+  id?: string;
   tracker: string;
   groupId: number;
   title: string;
@@ -145,10 +171,37 @@ export type ReleaseSummary = {
   year?: number;
   artwork?: string;
   releaseType?: string;
+  sources: ReleaseSource[];
   albumCoverage?: AlbumCoverage;
 };
 
+export type ReleaseSource = {
+  tracker: string;
+  groupId: number;
+  matchScore: number;
+};
+
+export type LeechStatus =
+  | "regular"
+  | "freeleech"
+  | "personal_freeleech"
+  | "neutral"
+  | "freeload";
+
+export type DownloadEligibility = {
+  eligible: boolean;
+  reason:
+    | "eligible"
+    | "tracker_disabled"
+    | "freeleech_required"
+    | "token_unavailable"
+    | "below_quality_cutoff";
+  requiresToken: boolean;
+  tokenAvailable: boolean;
+};
+
 export type ArtistCredit = {
+  canonicalId?: string;
   key: string;
   tracker: string;
   artistId?: number;
@@ -186,8 +239,10 @@ export type TorrentVariant = {
   leechers?: number;
   snatched?: number;
   freeleech: boolean;
+  leechStatus: LeechStatus;
   canUseToken: boolean;
   tokenEligibilityKnown: boolean;
+  eligibility?: DownloadEligibility;
   remasterTitle?: string;
   downloads: LiveDownloadStatus[];
   library?: LibraryVariantState;
@@ -195,6 +250,11 @@ export type TorrentVariant = {
 
 export type ReleaseDetail = {
   release: ReleaseSummary;
+  fieldProvenance: Record<string, {
+    tracker?: string;
+    groupId?: number;
+    manual?: boolean;
+  }>;
   tags: string[];
   description?: string;
   recordLabel?: string;
@@ -219,6 +279,23 @@ export type DownloadsPage = {
   };
 };
 
+export type CrossSeedPlan = {
+  sourceTracker: string;
+  sourceTorrentId: number;
+  sourceClient: string;
+  sourceInfoHash: string;
+  sourcePath: string;
+  targetTracker: string;
+  targetTorrentId: number;
+  compatible: boolean;
+  matchedFiles: number;
+  targetFiles: number;
+  missingFiles: string[];
+  policyEligible: boolean;
+  summary: string;
+  dryRun: boolean;
+};
+
 export type LibraryRelease = {
   release: ReleaseSummary;
   variants: TorrentVariant[];
@@ -228,6 +305,7 @@ export type LibraryRelease = {
 };
 
 export type LibraryArtistSummary = {
+  id?: string;
   key: string;
   tracker: string;
   artistId?: number;
@@ -281,6 +359,7 @@ export type ArtistCatalogRelease = {
 
 export type ArtistCatalogPage = {
   artist: {
+    id?: string;
     tracker: string;
     artistId: number;
     name: string;
@@ -334,6 +413,20 @@ export type ReleasePreferences = {
   qualityOrder: QualityPreference[];
   minimumQuality: QualityPreference;
   mediaTiers: string[][];
+  trackerOrder: string[];
+  trackerPolicies: TrackerPreference[];
+};
+
+export type TrackerDownloadMode =
+  | "disabled"
+  | "freeleech_only"
+  | "freeleech_or_token"
+  | "any";
+
+export type TrackerPreference = {
+  tracker: string;
+  mode: TrackerDownloadMode;
+  autoUseTokens: boolean;
 };
 
 export type RuntimePreferences = {
@@ -344,12 +437,15 @@ export type DownloadSelection = {
   name: string;
   artist?: string;
   torrent: {
+    tracker?: string;
     torrentId: number;
     format?: string;
     encoding?: string;
     freeleech: boolean;
+    leechStatus?: LeechStatus;
     canUseToken: boolean;
     tokenEligibilityKnown?: boolean;
+    eligibility?: DownloadEligibility;
   };
 };
 

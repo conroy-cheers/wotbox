@@ -33,10 +33,9 @@
     type ViewQuery
   } from "../lib/routing";
 
-  let { tracker, artistKey }: { tracker: string; artistKey: string } = $props();
-  const initialTracker = untrack(() => tracker);
-  const initialArtistKey = untrack(() => artistKey);
-  const routePath = `/library/artists/${encodeURIComponent(initialTracker)}/${encodeURIComponent(initialArtistKey)}`;
+  let { id }: { id: string } = $props();
+  const initialId = untrack(() => id);
+  const routePath = `/library/artists/${encodeURIComponent(initialId)}`;
   const initial = new URLSearchParams(location.search);
   const search = writable(initial.get("q") ?? "");
   const format = writable(initial.get("format") ?? "");
@@ -59,23 +58,23 @@
   let urlSyncReady = false;
 
   const artist = createQuery({
-    queryKey: ["library-artist", initialTracker, initialArtistKey],
+    queryKey: ["library-artist", initialId],
     queryFn: () => api<LibraryArtistPage>(
-      `/api/v1/library/artists/${encodeURIComponent(initialTracker)}/${encodeURIComponent(initialArtistKey)}?limit=5000`
+      `/api/v1/library/artists/${encodeURIComponent(initialId)}?limit=5000`
     ),
     staleTime: 30_000
   });
 
   const catalogOptions = derived(artist, ($artist) => {
-    const artistId = $artist.data?.artist.artistId;
     return {
-      queryKey: ["artist-catalog", initialTracker, artistId] as const,
+      queryKey: ["artist-catalog", initialId] as const,
       queryFn: () => api<Envelope<ArtistCatalogPage>>(
-        `/api/v1/artists/${encodeURIComponent(initialTracker)}/${artistId}/releases`
+        `/api/v1/artists/${encodeURIComponent(initialId)}`
       ),
-      enabled: artistId != null,
+      enabled: true,
       staleTime: 60_000,
-      refetchInterval: 5_000
+      refetchInterval: 30_000,
+      retry: false
     };
   });
   const catalog = createQuery(catalogOptions);
@@ -83,21 +82,33 @@
   const filteredGroups = derived(
     [artist, catalog, search, format, ownership, sort],
     ([$artist, $catalog, $search, $format, $ownership, $sort]) => {
-      const catalogGroups = $catalog.data?.data.groups;
-      let items: ArtistCatalogRelease[] = catalogGroups
-        ? [...catalogGroups]
-        : ($artist.data?.items ?? []).map((item) => {
-            const credit = item.release.artists.find((candidate) => candidate.key === initialArtistKey);
-            return {
-              release: item.release,
-              tags: [],
-              variants: item.variants,
-              roles: [credit?.role === "primary" ? "primary" : "guest"],
-              listedOnTracker: true,
-              libraryAvailability: item.availability,
-              libraryAddedAt: item.addedAt
-            };
-          });
+      const libraryGroups: ArtistCatalogRelease[] = ($artist.data?.items ?? []).map((item) => {
+        const credit = item.release.artists.find((candidate) => candidate.canonicalId === initialId);
+        return {
+          release: item.release,
+          tags: [],
+          variants: item.variants,
+          roles: [credit?.role === "primary" ? "primary" : "guest"],
+          listedOnTracker: true,
+          libraryAvailability: item.availability,
+          libraryAddedAt: item.addedAt
+        };
+      });
+      const byRelease = new Map(
+        libraryGroups.map((group) => [group.release.id ?? `${group.release.tracker}:${group.release.groupId}`, group])
+      );
+      for (const group of $catalog.data?.data.groups ?? []) {
+        const key = group.release.id ?? `${group.release.tracker}:${group.release.groupId}`;
+        const libraryGroup = byRelease.get(key);
+        byRelease.set(key, libraryGroup
+          ? {
+              ...group,
+              libraryAvailability: libraryGroup.libraryAvailability,
+              libraryAddedAt: libraryGroup.libraryAddedAt
+            }
+          : group);
+      }
+      let items = [...byRelease.values()];
       const needle = $search.trim().toLowerCase();
       items = items.filter((item) => {
         if (needle && !item.release.title.toLowerCase().includes(needle)) return false;
@@ -239,11 +250,11 @@
       {/if}
     </div>
     <div>
-      <p class="eyebrow">{$artist.data.artist.tracker.toUpperCase()} artist</p>
+      <p class="eyebrow">Canonical artist · {$artist.data.artist.tracker.toUpperCase()} source</p>
       <h1>{$catalog.data?.data.artist.name ?? $artist.data.artist.name}</h1>
       <p>
         {$artist.data.artist.releaseCount} {$artist.data.artist.releaseCount === 1 ? "release" : "releases"} in your library
-        {#if $catalog.data} · {$catalog.data.data.groups.length} on the tracker{/if}
+        {#if $catalog.data} · {$catalog.data.data.groups.length} across configured catalogs{/if}
       </p>
       {#if $artist.data.artist.missingCount}
         <span class="availability-warning"><AlertTriangle size={13} /> {$artist.data.artist.missingCount} need attention</span>
@@ -259,10 +270,21 @@
   {:else if $catalog.isPending}
     <div class="index-banner">
       <span class="index-pulse"></span>
-      <p><strong>Loading tracker discography</strong> Your Library releases are already visible while Gazelle responds.</p>
+      <p><strong>Loading catalog sources</strong> Your Library releases are already visible while each Gazelle source refreshes independently.</p>
     </div>
   {:else if $catalog.isError}
-    <div class="error-panel compact">The tracker catalog is temporarily unavailable. Showing your Library releases instead.</div>
+    <div class="error-panel compact">
+      <span>
+        <strong>Tracker discography unavailable.</strong>
+        {$catalog.error.message}. Showing your Library releases instead; Wotbox will retry
+        automatically.
+      </span>
+      <button
+        type="button"
+        class="secondary-button compact-button"
+        onclick={() => $catalog.refetch()}
+      >Retry now</button>
+    </div>
   {/if}
 
   <StaleNotice provenance={$catalog.data?.provenance} />
@@ -329,7 +351,7 @@
         <div class="result-list artist-catalog-list">
           {#each items as group}
             <article class="release-card catalog-release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(group.release.releaseType)}`}>
-              <a class="cover" href={appPath(`/releases/${group.release.tracker}/${group.release.groupId}?from=library`)}>
+              <a class="cover" href={group.release.id ? appPath(`/releases/${group.release.id}?from=library`) : undefined}>
                 <Disc3 size={36} />
                 {#if group.release.artwork}
                   <img src={group.release.artwork} alt="" referrerpolicy="no-referrer" loading="lazy" onerror={(event) => (event.currentTarget as HTMLImageElement).remove()} />
@@ -343,7 +365,7 @@
                       {#if appearances}<span class="role-badge">{roleLabel(group.roles)}</span>{/if}
                       {#if !group.listedOnTracker}<span class="availability-warning"><AlertTriangle size={12} /> Library only</span>{/if}
                     </p>
-                    <h3><a href={appPath(`/releases/${group.release.tracker}/${group.release.groupId}?from=library`)}>{group.release.title}</a></h3>
+                    <h3><a href={group.release.id ? appPath(`/releases/${group.release.id}?from=library`) : undefined}>{group.release.title}</a></h3>
                     <span>
                       {[group.release.year, group.release.releaseType].filter(Boolean).join(" · ") || "Release details unavailable"}
                       {#if group.release.albumCoverage}
@@ -352,7 +374,7 @@
                         </span>
                         <span class="album-coverage-links">
                           {#each group.release.albumCoverage.albums as album, index}
-                            {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}?from=library`)}>{album.title}</a>
+                            {#if index}, {/if}<span>{album.title}</span>
                           {/each}
                         </span>
                       {/if}
@@ -364,6 +386,7 @@
                 </div>
                 <PreferredVariants
                   variants={group.variants}
+                  releaseId={group.release.id}
                   tracker={group.release.tracker}
                   groupId={group.release.groupId}
                   title={group.release.title}
@@ -394,6 +417,6 @@
 
 <AddDownloadDialog
   selection={selected}
-  tracker={initialTracker}
+  tracker={selected?.torrent.tracker ?? $artist.data?.artist.tracker ?? ""}
   onclose={closeAddDialog}
 />

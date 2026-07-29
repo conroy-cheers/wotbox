@@ -34,16 +34,15 @@ describe("routing helpers", () => {
 
   it("builds a canonical release URL for an exact download attachment", () => {
     expect(releaseViewPath(
-      "ops",
-      176023,
+      "8972f7ba-e662-4bdf-a470-47774964fd3e",
       345678,
       "downloads",
       { client: "music client", infoHash: "ABC123" },
       true,
       true
     )).toBe(
-      "/releases/ops/176023?torrent=345678&client=music+client&hash=ABC123"
-      + "&from=downloads&expanded=176023&details=client"
+      "/releases/8972f7ba-e662-4bdf-a470-47774964fd3e?torrent=345678"
+      + "&client=music+client&hash=ABC123&from=downloads&expanded=1&details=client"
     );
   });
 

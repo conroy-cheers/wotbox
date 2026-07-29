@@ -7,8 +7,10 @@
     type CreateDownload,
     type DownloadJob,
     type DownloadProfile,
-    type DownloadSelection
+    type DownloadSelection,
+    type RuntimePreferences
   } from "./api";
+  import { defaultReleasePreferences } from "./releasePreferences";
 
   let {
     selection,
@@ -22,7 +24,7 @@
 
   let useToken = $state(false);
   let selectedProfile = $state("");
-  let initializedTorrent = $state<number | null>(null);
+  let initializedTorrent = $state("");
   let submittedJob = $state<DownloadJob | null>(null);
   let monitorError = $state("");
   let monitorGeneration = 0;
@@ -36,19 +38,47 @@
     queryKey: ["download-profiles"],
     queryFn: () => api<DownloadProfile[]>("/api/v1/download-profiles")
   });
+  const preferences = createQuery({
+    queryKey: ["preferences"],
+    queryFn: () => api<RuntimePreferences>("/api/v1/preferences")
+  });
+  const activeTracker = $derived(selection?.torrent.tracker ?? tracker);
+  const policy = $derived(
+    ($preferences.data?.release ?? defaultReleasePreferences).trackerPolicies
+      .find((candidate) => candidate.tracker.toLowerCase() === activeTracker.toLowerCase())
+      ?? { tracker: activeTracker, mode: "freeleech_only" as const, autoUseTokens: false }
+  );
+  const policyBlocked = $derived(Boolean(selection) && (
+    policy.mode === "disabled"
+    || (!selection!.torrent.freeleech && policy.mode === "freeleech_only")
+    || (!selection!.torrent.freeleech
+      && policy.mode === "freeleech_or_token"
+      && (selection!.torrent.tokenEligibilityKnown ?? true)
+      && !selection!.torrent.canUseToken)
+    || selection!.torrent.eligibility?.eligible === false
+  ));
+  const requiresToken = $derived(Boolean(selection)
+    && !selection!.torrent.freeleech
+    && policy.mode === "freeleech_or_token");
 
   $effect(() => {
-    if (!selection || initializedTorrent === selection.torrent.torrentId) return;
-    initializedTorrent = selection.torrent.torrentId;
+    if (!selection) return;
+    const initializationKey = `${activeTracker}:${selection.torrent.torrentId}:${policy.mode}:${policy.autoUseTokens}`;
+    if (initializedTorrent === initializationKey) return;
+    initializedTorrent = initializationKey;
     const eligibilityKnown = selection.torrent.tokenEligibilityKnown ?? true;
     useToken = !selection.torrent.freeleech
+      && policy.autoUseTokens
       && (selection.torrent.canUseToken || !eligibilityKnown);
-    selectedProfile = $profiles.data?.[0]?.name ?? "";
+    selectedProfile = $profiles.data?.find((profile) => profile.name === activeTracker)?.name
+      ?? $profiles.data?.[0]?.name
+      ?? "";
   });
 
   $effect(() => {
     if (selection && !selectedProfile && $profiles.data?.length) {
-      selectedProfile = $profiles.data[0].name;
+      selectedProfile = $profiles.data.find((profile) => profile.name === activeTracker)?.name
+        ?? $profiles.data[0].name;
     }
   });
 
@@ -111,7 +141,7 @@
     submittedJob = null;
     monitorError = "";
     $addDownload.mutate({
-      tracker,
+      tracker: activeTracker,
       torrentId: selection.torrent.torrentId,
       profile: selectedProfile,
       useToken
@@ -122,7 +152,7 @@
     monitorGeneration++;
     submittedJob = null;
     monitorError = "";
-    initializedTorrent = null;
+    initializedTorrent = "";
     onclose();
   }
 
@@ -131,7 +161,7 @@
     monitorGeneration++;
     submittedJob = null;
     monitorError = "";
-    initializedTorrent = null;
+    initializedTorrent = "";
     onclose();
   }
 </script>
@@ -161,7 +191,10 @@
           </select>
         </label>
         {@const eligibilityKnown = selection.torrent.tokenEligibilityKnown ?? true}
-        {@const tokenDisabled = selection.torrent.freeleech || (eligibilityKnown && !selection.torrent.canUseToken)}
+        {@const tokenDisabled = selection.torrent.freeleech
+          || (eligibilityKnown && !selection.torrent.canUseToken)
+          || policy.mode === "disabled"
+          || policy.mode === "freeleech_only"}
         <label class:disabled={tokenDisabled} class="token-toggle">
           <input type="checkbox" bind:checked={useToken} disabled={tokenDisabled} />
           <span class="toggle-box">{#if useToken}<Check size={15} />{/if}</span>
@@ -169,17 +202,35 @@
             <strong>Use a freeleech token</strong>
             <small>
               {#if selection.torrent.freeleech}
-                This torrent is already freeleech.
+                This torrent is already free on {activeTracker.toUpperCase()}.
               {:else if !eligibilityKnown}
-                OPS will verify token availability before qBittorrent is contacted.
+                {activeTracker.toUpperCase()} will verify token availability before qBittorrent is contacted.
               {:else if selection.torrent.canUseToken}
-                This action consumes the required tracker token.
+                This action consumes one {activeTracker.toUpperCase()} freeleech token.
               {:else}
                 The tracker reports that this torrent is not token eligible.
               {/if}
             </small>
           </span>
         </label>
+        {#if policyBlocked}
+          <div class="error-panel compact submission-error" role="status">
+            <span>
+              <strong>Blocked by tracker policy</strong>
+              <small>
+                {policy.mode === "disabled"
+                  ? `${activeTracker.toUpperCase()} downloads are disabled.`
+                  : policy.mode === "freeleech_only"
+                    ? `${activeTracker.toUpperCase()} is configured for already-free torrents only.`
+                    : "A required freeleech token is not available for this torrent."}
+              </small>
+            </span>
+          </div>
+        {:else if requiresToken && !useToken}
+          <div class="stale-notice compact" role="status">
+            This tracker policy requires a freeleech token. Enable token use to add the torrent.
+          </div>
+        {/if}
         {#if processing && submittedJob}
           <div class="submission-status" role="status" aria-live="polite">
             <span class="submission-spinner" aria-hidden="true"></span>
@@ -217,7 +268,7 @@
           </button>
           <button
             class="primary-button"
-            disabled={$addDownload.isPending || processing || !selectedProfile}
+            disabled={$addDownload.isPending || processing || !selectedProfile || policyBlocked || (requiresToken && !useToken)}
             onclick={submit}
           >
             {#if $addDownload.isPending || processing}

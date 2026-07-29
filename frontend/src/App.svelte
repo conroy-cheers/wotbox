@@ -2,12 +2,13 @@
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
   import { onMount } from "svelte";
   import page from "page";
-  import { ArrowDownToLine, BookOpen, LayoutDashboard, Search, Settings2 } from "@lucide/svelte";
+  import { ArrowDownToLine, BookOpen, GitMerge, LayoutDashboard, Search, Settings2 } from "@lucide/svelte";
   import { appPath, basePath } from "./lib/api";
   import Dashboard from "./pages/Dashboard.svelte";
   import Downloads from "./pages/Downloads.svelte";
   import Library from "./pages/Library.svelte";
   import LibraryArtist from "./pages/LibraryArtist.svelte";
+  import Matches from "./pages/Matches.svelte";
   import NotFound from "./pages/NotFound.svelte";
   import Preferences from "./pages/Preferences.svelte";
   import Release from "./pages/Release.svelte";
@@ -18,10 +19,11 @@
     | { name: "dashboard"; key: string }
     | { name: "search"; key: string }
     | { name: "library"; key: string }
-    | { name: "libraryArtist"; tracker: string; artistKey: string; key: string }
+    | { name: "libraryArtist"; id: string; key: string }
     | { name: "downloads"; key: string }
     | { name: "preferences"; key: string }
-    | { name: "release"; tracker: string; id: string; source: string; key: string }
+    | { name: "matches"; key: string }
+    | { name: "release"; id: string; source: string; key: string }
     | { name: "notFound"; path: string; key: string };
 
   const client = new QueryClient({
@@ -44,17 +46,16 @@
     page("/", (context) => route = { name: "dashboard", key: routeKey(context) });
     page("/search", (context) => route = { name: "search", key: routeKey(context) });
     page("/library", (context) => route = { name: "library", key: routeKey(context) });
-    page("/library/artists/:tracker/:artistKey", (context) => route = {
+    page("/library/artists/:id", (context) => route = {
       name: "libraryArtist",
-      tracker: context.params.tracker,
-      artistKey: context.params.artistKey,
+      id: context.params.id,
       key: routeKey(context)
     });
     page("/downloads", (context) => route = { name: "downloads", key: routeKey(context) });
     page("/preferences", (context) => route = { name: "preferences", key: routeKey(context) });
-    page("/releases/:tracker/:id", (context) => route = {
+    page("/matches", (context) => route = { name: "matches", key: routeKey(context) });
+    page("/releases/:id", (context) => route = {
       name: "release",
-      tracker: context.params.tracker,
       id: context.params.id,
       source: new URLSearchParams(context.querystring).get("from") ?? "search",
       key: routeKey(context)
@@ -73,6 +74,7 @@
     { name: "search", label: "Search", path: "/search", icon: Search },
     { name: "library", label: "Library", path: "/library", icon: BookOpen },
     { name: "downloads", label: "Downloads", path: "/downloads", icon: ArrowDownToLine },
+    { name: "matches", label: "Match review", path: "/matches", icon: GitMerge },
     { name: "preferences", label: "Preferences", path: "/preferences", icon: Settings2 }
   ];
 
@@ -120,13 +122,15 @@
         {:else if route.name === "library"}
           <Library />
         {:else if route.name === "libraryArtist"}
-          <LibraryArtist tracker={route.tracker} artistKey={route.artistKey} />
+          <LibraryArtist id={route.id} />
         {:else if route.name === "downloads"}
           <Downloads />
         {:else if route.name === "preferences"}
           <Preferences />
+        {:else if route.name === "matches"}
+          <Matches />
         {:else if route.name === "release"}
-          <Release tracker={route.tracker} id={route.id} />
+          <Release id={route.id} />
         {:else if route.name === "notFound"}
           <NotFound path={route.path} />
         {/if}

@@ -1,15 +1,15 @@
 <script lang="ts">
   import { createQuery } from "@tanstack/svelte-query";
   import { ArrowDownToLine, Database, Gauge, HardDrive, RefreshCw } from "@lucide/svelte";
-  import { api, appPath, formatBytes, relativeTime, type Account, type DownloadsPage, type Envelope } from "../lib/api";
+  import { api, appPath, formatBytes, relativeTime, type DownloadsPage, type TrackerAccount } from "../lib/api";
   import StatusPill from "../lib/StatusPill.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import { releaseViewPath } from "../lib/routing";
 
-  const account = createQuery({
-    queryKey: ["account"],
-    queryFn: () => api<Envelope<Account>>("/api/v1/account")
+  const accounts = createQuery({
+    queryKey: ["accounts"],
+    queryFn: () => api<TrackerAccount[]>("/api/v1/accounts")
   });
   const downloads = createQuery({
     queryKey: ["downloads"],
@@ -28,39 +28,43 @@
 <header class="page-heading">
   <div>
     <p class="eyebrow">Overview</p>
-    <h1>Good evening{$account.data ? `, ${$account.data.data.username}` : ""}.</h1>
+    <h1>Good evening{$accounts.data?.[0] ? `, ${$accounts.data[0].account.username}` : ""}.</h1>
     <p>Tracker truth and download state, in one quiet place.</p>
   </div>
   <button class="icon-button" aria-label="Refresh dashboard" onclick={() => {
-    $account.refetch();
+    $accounts.refetch();
     $downloads.refetch();
     $health.refetch();
   }}><RefreshCw size={18} /></button>
 </header>
 
-{#if $account.isError}
-  <div class="error-panel">{$account.error.message}</div>
+{#if $accounts.isError}
+  <div class="error-panel">{$accounts.error.message}</div>
 {:else}
-  <StaleNotice provenance={$account.data?.provenance} />
+  {#each $accounts.data ?? [] as trackerAccount}
+    <StaleNotice provenance={trackerAccount.provenance} />
+  {/each}
   <section class="metric-grid" aria-label="Account statistics">
-    <article class="metric-card">
-      <span class="metric-icon"><Gauge size={19} /></span>
-      <p>Ratio</p>
-      <strong>{$account.data?.data.ratio?.toFixed(2) ?? "—"}</strong>
-      <small>Required {$account.data?.data.requiredRatio?.toFixed(2) ?? "—"}</small>
-    </article>
-    <article class="metric-card">
-      <span class="metric-icon"><Database size={19} /></span>
-      <p>Uploaded</p>
-      <strong>{formatBytes($account.data?.data.uploaded)}</strong>
-      <small>{$account.data?.data.userClass ?? "Tracker class"}</small>
-    </article>
-    <article class="metric-card">
-      <span class="metric-icon"><ArrowDownToLine size={19} /></span>
-      <p>Downloaded</p>
-      <strong>{formatBytes($account.data?.data.downloaded)}</strong>
-      <small>{$account.data?.data.bonusPoints?.toLocaleString() ?? "—"} bonus</small>
-    </article>
+    {#each $accounts.data ?? [] as trackerAccount}
+      <article class="metric-card">
+        <span class="metric-icon"><Gauge size={19} /></span>
+        <p>{trackerAccount.tracker.toUpperCase()} ratio</p>
+        <strong>{trackerAccount.account.ratio?.toFixed(2) ?? "—"}</strong>
+        <small>Required {trackerAccount.account.requiredRatio?.toFixed(2) ?? "—"}</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-icon"><Database size={19} /></span>
+        <p>{trackerAccount.tracker.toUpperCase()} uploaded</p>
+        <strong>{formatBytes(trackerAccount.account.uploaded)}</strong>
+        <small>{trackerAccount.account.userClass ?? "Tracker class"}</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-icon"><ArrowDownToLine size={19} /></span>
+        <p>{trackerAccount.tracker.toUpperCase()} downloaded</p>
+        <strong>{formatBytes(trackerAccount.account.downloaded)}</strong>
+        <small>{trackerAccount.account.bonusPoints?.toLocaleString() ?? "—"} bonus</small>
+      </article>
+    {/each}
     <article class="metric-card">
       <span class="metric-icon"><HardDrive size={19} /></span>
       <p>qBittorrent</p>
@@ -92,8 +96,7 @@
           <div class="activity-copy">
             <strong>
               <a href={releaseViewPath(
-                item.release.tracker,
-                item.release.groupId,
+                item.release.id,
                 item.variant.torrentId,
                 "downloads",
                 { client: download.client, infoHash: download.infoHash }

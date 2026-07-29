@@ -9,12 +9,12 @@ use sha1::{Digest, Sha1};
 use url::Url;
 
 use crate::{
-    config::{TrackerConfig, read_secret},
+    config::{TrackerConfig, TrackerKind, read_secret},
     model::{
         Account, ArtistCatalogArtist, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
-        ArtistCredit, ArtistCreditSource, ArtistRole, CanonicalTorrent, ReleaseDetail,
-        ReleaseSummary, SearchGroup, SearchPage, SearchTorrent, TorrentMetadata, TorrentVariant,
-        sanitized, value_bool, value_f64, value_i64, value_string,
+        ArtistCredit, ArtistCreditSource, ArtistRole, CanonicalTorrent, LeechStatus, ReleaseDetail,
+        ReleaseSource, ReleaseSummary, SearchGroup, SearchPage, SearchTorrent, TorrentMetadata,
+        TorrentVariant, sanitized, value_bool, value_f64, value_i64, value_string,
     },
 };
 
@@ -48,6 +48,7 @@ pub struct GazelleTrackerClient {
     token: String,
     client: Client,
     limiter: Arc<RateLimiter>,
+    kind: TrackerKind,
 }
 
 impl GazelleTrackerClient {
@@ -64,6 +65,7 @@ impl GazelleTrackerClient {
             token: read_secret(&config.token_file)?,
             client,
             limiter: Arc::new(RateLimiter::new(1, Duration::from_secs(2))),
+            kind: config.kind,
         })
     }
 
@@ -73,7 +75,7 @@ impl GazelleTrackerClient {
         let response = self
             .client
             .get(endpoint)
-            .header("Authorization", format!("token {}", self.token))
+            .header("Authorization", &self.token)
             .query(&[("action", action)])
             .query(params)
             .send()
@@ -137,7 +139,12 @@ impl TrackerClient for GazelleTrackerClient {
         let groups = response
             .get("results")
             .and_then(Value::as_array)
-            .map(|groups| groups.iter().filter_map(normalize_group).collect())
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|group| normalize_group(&self.name, self.kind, group))
+                    .collect()
+            })
             .unwrap_or_default();
         let page = SearchPage {
             current_page: value_i64(&response, &["currentPage", "currentpage"]).unwrap_or(1),
@@ -145,6 +152,11 @@ impl TrackerClient for GazelleTrackerClient {
             total_results: value_i64(&response, &["resultsCount", "totalResults"]),
             groups,
             deduplication: Default::default(),
+            source_status: vec![crate::model::SourceLoadStatus {
+                tracker: self.name.clone(),
+                state: "ready".into(),
+                error: None,
+            }],
         };
         Ok((page, sanitized(raw)))
     }
@@ -153,7 +165,7 @@ impl TrackerClient for GazelleTrackerClient {
         let raw = self.request("artist", &[("id", id.to_string())]).await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         Ok((
-            normalize_artist_catalog(&self.name, id, &response)?,
+            normalize_artist_catalog(&self.name, self.kind, id, &response)?,
             sanitized(raw),
         ))
     }
@@ -164,7 +176,7 @@ impl TrackerClient for GazelleTrackerClient {
             .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         Ok((
-            normalize_release_detail(&self.name, id, &response)?,
+            normalize_release_detail(&self.name, self.kind, id, &response)?,
             sanitized(raw),
         ))
     }
@@ -189,7 +201,8 @@ impl TrackerClient for GazelleTrackerClient {
                 || torrent.get("can_use_token").is_some(),
             raw: sanitized(response.clone()),
         };
-        let canonical = normalize_canonical_torrent(&self.name, Some(id), None, &response)?;
+        let canonical =
+            normalize_canonical_torrent(&self.name, self.kind, Some(id), None, &response)?;
         Ok((metadata, canonical, sanitized(raw)))
     }
 
@@ -199,8 +212,13 @@ impl TrackerClient for GazelleTrackerClient {
             .request("torrent", &[("hash", requested_hash.clone())])
             .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
-        let canonical =
-            normalize_canonical_torrent(&self.name, None, Some(&requested_hash), &response)?;
+        let canonical = normalize_canonical_torrent(
+            &self.name,
+            self.kind,
+            None,
+            Some(&requested_hash),
+            &response,
+        )?;
         Ok((canonical, sanitized(raw)))
     }
 
@@ -214,7 +232,7 @@ impl TrackerClient for GazelleTrackerClient {
         let response = self
             .client
             .get(endpoint)
-            .header("Authorization", format!("token {}", self.token))
+            .header("Authorization", &self.token)
             .query(&query)
             .send()
             .await?;
@@ -335,11 +353,16 @@ fn push<'a>(target: &mut Vec<(&'a str, String)>, key: &'a str, value: Option<&St
     }
 }
 
-fn normalize_group(value: &Value) -> Option<SearchGroup> {
+fn normalize_group(tracker: &str, kind: TrackerKind, value: &Value) -> Option<SearchGroup> {
     let torrents = value
         .get("torrents")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(normalize_search_torrent).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| normalize_search_torrent(tracker, item))
+                .collect()
+        })
         .unwrap_or_default();
     let tags = value
         .get("tags")
@@ -355,21 +378,30 @@ fn normalize_group(value: &Value) -> Option<SearchGroup> {
         })
         .unwrap_or_default();
     Some(SearchGroup {
+        id: None,
+        tracker: tracker.to_owned(),
         group_id: value_i64(value, &["groupId", "groupid", "id"])?,
         name: value_string(value, &["groupName", "groupname", "name"])
             .unwrap_or_else(|| "Untitled release".into()),
         artist: value_string(value, &["artist", "artistName"]),
         year: value_i64(value, &["groupYear", "year"]),
-        release_type: value_string(value, &["releaseType", "releaseTypeName"]),
+        release_type: normalize_release_type(kind, value),
         image: value_string(value, &["cover", "image"]),
         tags,
         torrents,
+        sources: vec![ReleaseSource {
+            tracker: tracker.to_owned(),
+            group_id: value_i64(value, &["groupId", "groupid", "id"])?,
+            match_score: 1.0,
+        }],
         album_coverage: None,
     })
 }
 
-fn normalize_search_torrent(value: &Value) -> Option<SearchTorrent> {
+fn normalize_search_torrent(tracker: &str, value: &Value) -> Option<SearchTorrent> {
+    let leech_status = normalize_leech_status(value);
     Some(SearchTorrent {
+        tracker: tracker.to_owned(),
         torrent_id: value_i64(value, &["torrentId", "id"])?,
         edition_id: value_i64(value, &["editionId"]),
         format: value_string(value, &["format"]),
@@ -378,8 +410,9 @@ fn normalize_search_torrent(value: &Value) -> Option<SearchTorrent> {
         size: value_i64(value, &["size"]),
         seeders: value_i64(value, &["seeders"]),
         leechers: value_i64(value, &["leechers"]),
-        snatched: value_i64(value, &["snatched"]),
-        freeleech: value_bool(value, &["isFreeleech", "freeTorrent", "freeleech"]),
+        snatched: value_i64(value, &["snatched", "snatches"]),
+        freeleech: leech_status.has_no_download_debit(),
+        leech_status,
         can_use_token: value_bool(value, &["canUseToken", "can_use_token"]),
         remaster_title: value_string(value, &["remasterTitle"]),
         info_hash: value_string(value, &["infoHash", "info_hash"])
@@ -390,11 +423,13 @@ fn normalize_search_torrent(value: &Value) -> Option<SearchTorrent> {
 
 fn normalize_artist_catalog(
     tracker: &str,
+    kind: TrackerKind,
     requested_id: i64,
     value: &Value,
 ) -> Result<ArtistCatalogPage> {
     let artist_id = value_i64(value, &["id"]).unwrap_or(requested_id);
     let artist = ArtistCatalogArtist {
+        id: None,
         tracker: tracker.to_owned(),
         artist_id,
         name: value_string(value, &["name"]).unwrap_or_else(|| format!("Artist {artist_id}")),
@@ -407,7 +442,7 @@ fn normalize_artist_catalog(
         .map(|items| {
             items
                 .iter()
-                .filter_map(|group| normalize_artist_group(tracker, artist_id, group))
+                .filter_map(|group| normalize_artist_group(tracker, kind, artist_id, group))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -440,13 +475,13 @@ fn normalize_artist_catalog(
 
 fn normalize_artist_group(
     tracker: &str,
+    kind: TrackerKind,
     artist_id: i64,
     value: &Value,
 ) -> Option<ArtistCatalogRelease> {
     let group_id = value_i64(value, &["groupId", "groupid", "id"])?;
-    let mut release = normalize_release_summary(tracker, group_id, value);
-    release.release_type = value_string(value, &["releaseTypeName"])
-        .or_else(|| value_i64(value, &["releaseType"]).and_then(release_type_name));
+    let mut release = normalize_release_summary(tracker, kind, group_id, value);
+    release.release_type = normalize_release_type(kind, value);
     let variants = value
         .get("torrent")
         .or_else(|| value.get("torrents"))
@@ -511,7 +546,7 @@ fn artist_catalog_roles(value: &Value, artist_id: i64) -> Vec<ArtistCatalogRole>
     .collect()
 }
 
-fn release_type_name(id: i64) -> Option<String> {
+fn release_type_name(kind: TrackerKind, id: i64) -> Option<String> {
     Some(
         match id {
             1 => "Album",
@@ -519,15 +554,19 @@ fn release_type_name(id: i64) -> Option<String> {
             5 => "EP",
             6 => "Anthology",
             7 => "Compilation",
-            8 => "Sampler",
+            8 if matches!(kind, TrackerKind::Ops) => "Sampler",
             9 => "Single",
-            10 => "Demo",
+            10 if matches!(kind, TrackerKind::Ops) => "Demo",
             11 => "Live album",
-            12 => "Split",
+            12 if matches!(kind, TrackerKind::Ops) => "Split",
             13 => "Remix",
             14 => "Bootleg",
             15 => "Interview",
             16 => "Mixtape",
+            17 if matches!(kind, TrackerKind::Red) => "Demo",
+            17 => "DJ Mix",
+            18 => "Concert Recording",
+            19 if matches!(kind, TrackerKind::Red) => "DJ Mix",
             21 => "Unknown",
             _ => return None,
         }
@@ -535,14 +574,20 @@ fn release_type_name(id: i64) -> Option<String> {
     )
 }
 
+fn normalize_release_type(kind: TrackerKind, value: &Value) -> Option<String> {
+    value_string(value, &["releaseTypeName", "releaseType"])
+        .or_else(|| value_i64(value, &["releaseType"]).and_then(|id| release_type_name(kind, id)))
+}
+
 fn normalize_release_detail(
     tracker: &str,
+    kind: TrackerKind,
     requested_id: i64,
     value: &Value,
 ) -> Result<ReleaseDetail> {
     let group = value.get("group").unwrap_or(value);
     let group_id = value_i64(group, &["id", "groupId"]).unwrap_or(requested_id);
-    let release = normalize_release_summary(tracker, group_id, group);
+    let release = normalize_release_summary(tracker, kind, group_id, group);
     let torrents = value
         .get("torrents")
         .or_else(|| group.get("torrents"))
@@ -556,8 +601,9 @@ fn normalize_release_detail(
         .unwrap_or_default();
     Ok(ReleaseDetail {
         release,
+        field_provenance: serde_json::json!({}),
         tags: normalize_tags(group),
-        description: value_string(group, &["wikiBody", "description"]),
+        description: value_string(group, &["wikiBody", "bbBody", "description"]),
         record_label: value_string(group, &["recordLabel", "label"]),
         variants: torrents,
     })
@@ -565,6 +611,7 @@ fn normalize_release_detail(
 
 fn normalize_canonical_torrent(
     tracker: &str,
+    kind: TrackerKind,
     requested_id: Option<i64>,
     requested_hash: Option<&str>,
     value: &Value,
@@ -577,19 +624,24 @@ fn normalize_canonical_torrent(
     let group_id = value_i64(group, &["id", "groupId"])
         .or_else(|| value_i64(torrent, &["groupId", "group_id"]))
         .ok_or_else(|| anyhow!("tracker response omitted group id"))?;
-    let release = normalize_release_summary(tracker, group_id, group);
+    let release = normalize_release_summary(tracker, kind, group_id, group);
     let variant = normalize_variant(tracker, group_id, torrent, Some(torrent_id), requested_hash)
         .ok_or_else(|| anyhow!("tracker response could not be normalized"))?;
     Ok(CanonicalTorrent {
         release,
         variant,
         tags: normalize_tags(group),
-        description: value_string(group, &["wikiBody", "description"]),
+        description: value_string(group, &["wikiBody", "bbBody", "description"]),
         record_label: value_string(group, &["recordLabel", "label"]),
     })
 }
 
-fn normalize_release_summary(tracker: &str, group_id: i64, group: &Value) -> ReleaseSummary {
+fn normalize_release_summary(
+    tracker: &str,
+    kind: TrackerKind,
+    group_id: i64,
+    group: &Value,
+) -> ReleaseSummary {
     let artists = normalize_artist_credits(tracker, group);
     let display_artist = value_string(group, &["artist", "artistName"]).or_else(|| {
         let primary = artists
@@ -600,6 +652,7 @@ fn normalize_release_summary(tracker: &str, group_id: i64, group: &Value) -> Rel
         (!primary.is_empty()).then(|| primary.join(", "))
     });
     ReleaseSummary {
+        id: None,
         tracker: tracker.to_owned(),
         group_id,
         title: value_string(group, &["name", "groupName", "groupname"])
@@ -608,7 +661,12 @@ fn normalize_release_summary(tracker: &str, group_id: i64, group: &Value) -> Rel
         artists,
         year: value_i64(group, &["year", "groupYear"]),
         artwork: value_string(group, &["wikiImage", "cover", "image"]),
-        release_type: value_string(group, &["releaseTypeName", "releaseType"]),
+        release_type: normalize_release_type(kind, group),
+        sources: vec![ReleaseSource {
+            tracker: tracker.to_owned(),
+            group_id,
+            match_score: 1.0,
+        }],
         album_coverage: None,
     }
 }
@@ -642,6 +700,7 @@ fn normalize_artist_credits(tracker: &str, group: &Value) -> Vec<ArtistCredit> {
                 .any(|credit: &ArtistCredit| credit.key == key && credit.role == role)
             {
                 credits.push(ArtistCredit {
+                    canonical_id: None,
                     key,
                     tracker: tracker.to_owned(),
                     artist_id,
@@ -674,6 +733,7 @@ fn normalize_artist_credits(tracker: &str, group: &Value) -> Vec<ArtistCredit> {
                     .any(|credit: &ArtistCredit| credit.key == key && credit.role == role)
                 {
                     credits.push(ArtistCredit {
+                        canonical_id: None,
                         key,
                         tracker: tracker.to_owned(),
                         artist_id,
@@ -689,6 +749,7 @@ fn normalize_artist_credits(tracker: &str, group: &Value) -> Vec<ArtistCredit> {
         && let Some(name) = value_string(group, &["artist", "artistName"])
     {
         credits.push(ArtistCredit {
+            canonical_id: None,
             key: fallback_artist_key(&name),
             tracker: tracker.to_owned(),
             artist_id: None,
@@ -702,6 +763,7 @@ fn normalize_artist_credits(tracker: &str, group: &Value) -> Vec<ArtistCredit> {
 
 pub fn fallback_artist_credit(tracker: &str, name: &str) -> ArtistCredit {
     ArtistCredit {
+        canonical_id: None,
         key: fallback_artist_key(name),
         tracker: tracker.to_owned(),
         artist_id: None,
@@ -745,6 +807,7 @@ fn normalize_variant(
     requested_id: Option<i64>,
     requested_hash: Option<&str>,
 ) -> Option<TorrentVariant> {
+    let leech_status = normalize_leech_status(value);
     Some(TorrentVariant {
         tracker: tracker.to_owned(),
         torrent_id: value_i64(value, &["id", "torrentId"]).or(requested_id)?,
@@ -758,15 +821,31 @@ fn normalize_variant(
         size: value_i64(value, &["size"]),
         seeders: value_i64(value, &["seeders"]),
         leechers: value_i64(value, &["leechers"]),
-        snatched: value_i64(value, &["snatched"]),
-        freeleech: value_bool(value, &["isFreeleech", "freeTorrent", "freeleech"]),
+        snatched: value_i64(value, &["snatched", "snatches"]),
+        freeleech: leech_status.has_no_download_debit(),
+        leech_status,
         can_use_token: value_bool(value, &["canUseToken", "can_use_token"]),
         token_eligibility_known: value.get("canUseToken").is_some()
             || value.get("can_use_token").is_some(),
+        eligibility: None,
         remaster_title: value_string(value, &["remasterTitle"]),
         downloads: Vec::new(),
         library: None,
     })
+}
+
+fn normalize_leech_status(value: &Value) -> LeechStatus {
+    if value_bool(value, &["isPersonalFreeleech", "personalFreeleech"]) {
+        LeechStatus::PersonalFreeleech
+    } else if value_bool(value, &["isNeutralLeech", "isNeutralleech", "neutralLeech"]) {
+        LeechStatus::Neutral
+    } else if value_bool(value, &["isFreeload", "freeload"]) {
+        LeechStatus::Freeload
+    } else if value_bool(value, &["isFreeleech", "freeTorrent", "freeleech"]) {
+        LeechStatus::Freeleech
+    } else {
+        LeechStatus::Regular
+    }
 }
 
 fn tracker_error(body: &Value) -> String {
@@ -839,21 +918,25 @@ mod tests {
 
     #[test]
     fn normalizes_browse_groups() {
-        let group = normalize_group(&serde_json::json!({
-            "groupId": 42,
-            "groupName": "Kind of Blue",
-            "artist": "Miles Davis",
-            "groupYear": 1959,
-            "tags": ["jazz"],
-            "torrents": [{
-                "torrentId": 99,
-                "format": "FLAC",
-                "encoding": "Lossless",
-                "size": 1000,
-                "seeders": 3,
-                "canUseToken": true
-            }]
-        }))
+        let group = normalize_group(
+            "ops",
+            TrackerKind::Ops,
+            &serde_json::json!({
+                "groupId": 42,
+                "groupName": "Kind of Blue",
+                "artist": "Miles Davis",
+                "groupYear": 1959,
+                "tags": ["jazz"],
+                "torrents": [{
+                    "torrentId": 99,
+                    "format": "FLAC",
+                    "encoding": "Lossless",
+                    "size": 1000,
+                    "seeders": 3,
+                    "canUseToken": true
+                }]
+            }),
+        )
         .unwrap();
         assert_eq!(group.group_id, 42);
         assert_eq!(group.torrents[0].torrent_id, 99);
@@ -864,6 +947,7 @@ mod tests {
     fn uses_requested_hash_when_tracker_omits_it() {
         let canonical = normalize_canonical_torrent(
             "ops",
+            TrackerKind::Ops,
             None,
             Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01"),
             &serde_json::json!({
@@ -891,6 +975,7 @@ mod tests {
     fn normalizes_primary_and_guest_artist_credits_without_other_roles() {
         let detail = normalize_release_detail(
             "ops",
+            TrackerKind::Ops,
             42,
             &serde_json::json!({
                 "group": {
@@ -938,6 +1023,7 @@ mod tests {
     fn keeps_tracker_display_artist_as_an_unparsed_fallback() {
         let summary = normalize_release_summary(
             "ops",
+            TrackerKind::Ops,
             42,
             &serde_json::json!({
                 "name": "Compilation",
@@ -956,6 +1042,7 @@ mod tests {
     fn normalizes_artist_catalog_roles_and_variants() {
         let catalog = normalize_artist_catalog(
             "ops",
+            TrackerKind::Ops,
             10,
             &serde_json::json!({
                 "id": 10,
@@ -1029,7 +1116,7 @@ mod tests {
             .and(path("/ajax.php"))
             .and(query_param("action", "artist"))
             .and(query_param("id", "10"))
-            .and(header("authorization", "token tracker-token"))
+            .and(header("authorization", "tracker-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",
                 "response": {
@@ -1066,7 +1153,7 @@ mod tests {
             .and(path("/ajax.php"))
             .and(query_param("action", "torrent"))
             .and(query_param("hash", lowercase.to_ascii_uppercase()))
-            .and(header("authorization", "token tracker-token"))
+            .and(header("authorization", "tracker-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success",
                 "response": {
@@ -1105,7 +1192,7 @@ mod tests {
             .and(query_param("action", "download"))
             .and(query_param("id", "99"))
             .and(query_param_is_missing("usetoken"))
-            .and(header("authorization", "token tracker-token"))
+            .and(header("authorization", "tracker-token"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"d4:infode".to_vec()))
             .expect(1)
             .mount(&server)
@@ -1127,7 +1214,7 @@ mod tests {
             .and(query_param("action", "download"))
             .and(query_param("id", "99"))
             .and(query_param("usetoken", "1"))
-            .and(header("authorization", "token tracker-token"))
+            .and(header("authorization", "tracker-token"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"d4:infode".to_vec()))
             .expect(1)
             .mount(&server)

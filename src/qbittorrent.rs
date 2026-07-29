@@ -9,7 +9,7 @@ use url::Url;
 use crate::{
     config::{DownloadClientConfig, read_secret},
     model::{
-        ClientDownloadState, DownloadDiagnostic, DownloadProfile, LiveDownloadStatus,
+        ClientDownloadState, DownloadDiagnostic, DownloadFile, DownloadProfile, LiveDownloadStatus,
         ObservedDownload,
     },
 };
@@ -20,6 +20,7 @@ pub trait DownloadClient: Send + Sync {
     async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>>;
     async fn download(&self, info_hash: &str) -> Result<Option<ObservedDownload>>;
     async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>>;
+    async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>>;
     async fn add_torrent(
         &self,
         bytes: Vec<u8>,
@@ -123,6 +124,16 @@ struct AddTorrentResult {
     success_count: u64,
     #[serde(default)]
     failure_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QbitFile {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: i64,
+    #[serde(default)]
+    progress: f64,
 }
 
 impl QbitTorrent {
@@ -229,6 +240,27 @@ impl DownloadClient for QbittorrentClient {
         }
         self.fetch_downloads(Some(&info_hashes.join("|")), None, None)
             .await
+    }
+
+    async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v2/torrents/files")
+            .query(&[("hash", info_hash)])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!("qBittorrent file list returned HTTP {}", response.status());
+        }
+        Ok(response
+            .json::<Vec<QbitFile>>()
+            .await?
+            .into_iter()
+            .map(|file| DownloadFile {
+                name: file.name,
+                size: file.size,
+                progress: file.progress,
+            })
+            .collect())
     }
 
     async fn add_torrent(
@@ -396,6 +428,38 @@ mod tests {
         assert!(!public_json.contains("tracker.invalid"));
         assert!(!public_json.contains("A tracker download"));
         assert!(!public_json.contains("\"tags\""));
+    }
+
+    #[tokio::test]
+    async fn reads_torrent_files_without_mutating_the_client() {
+        let server = MockServer::start().await;
+        let info_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/files"))
+            .and(query_param("hash", info_hash))
+            .and(header(
+                "authorization",
+                "Bearer qbt_0123456789012345678901234567",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "name": "Album/01 Track.flac",
+                    "size": 2048,
+                    "progress": 1.0
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let files = test_client(&server)
+            .files(info_hash)
+            .await
+            .expect("qBittorrent file response");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "Album/01 Track.flac");
+        assert_eq!(files[0].size, 2048);
+        assert_eq!(files[0].progress, 1.0);
     }
 
     #[tokio::test]

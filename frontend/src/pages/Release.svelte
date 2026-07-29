@@ -8,24 +8,34 @@
     formatBytes,
     formatSpeed,
     relativeTime,
+    type CrossSeedPlan,
     type Envelope,
-    type ReleaseDetail
+    type ReleaseDetail,
+    type TorrentVariant
   } from "../lib/api";
+  import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
   import DownloadDiagnostic from "../lib/DownloadDiagnostic.svelte";
   import { sanitizeReleaseDescription } from "../lib/releaseDescription";
-  import { integerSet, oneOf, replaceView, selectReleaseAttachment } from "../lib/routing";
+  import {
+    closeOverlay,
+    navigateView,
+    oneOf,
+    optionalPositiveInteger,
+    replaceView,
+    selectReleaseAttachment
+  } from "../lib/routing";
 
-  let { tracker, id }: { tracker: string; id: string } = $props();
-  const initialTracker = untrack(() => tracker);
+  let { id }: { id: string } = $props();
   const initialId = untrack(() => id);
-  const routePath = `/releases/${encodeURIComponent(initialTracker)}/${encodeURIComponent(initialId)}`;
+  const routePath = `/releases/${encodeURIComponent(initialId)}`;
   const pageParams = new URLSearchParams(location.search);
   const requestedTorrent = Number(pageParams.get("torrent")) || undefined;
   const requestedClient = pageParams.get("client") || undefined;
   const requestedHash = pageParams.get("hash") || undefined;
+  const requestedAddTorrent = optionalPositiveInteger(pageParams, "add");
   const attachmentRequested = requestedClient != null || requestedHash != null;
   const source = oneOf(
     pageParams,
@@ -33,16 +43,24 @@
     ["search", "library", "downloads"] as const,
     "search"
   );
-  const expandedGroups = integerSet(pageParams, "expanded");
-  let variantsExpanded = $state(expandedGroups.has(Number(initialId)));
+  let variantsExpanded = $state(pageParams.get("expanded") === "1");
   let identifiersOpen = $state(pageParams.get("details") === "client");
+  let selected = $state<TorrentVariant | null>(null);
   const release = createQuery({
-    queryKey: ["release", initialTracker, initialId, requestedTorrent],
+    queryKey: ["release", initialId, requestedTorrent],
     queryFn: () => api<Envelope<ReleaseDetail>>(
-      `/api/v1/groups/${encodeURIComponent(initialTracker)}/${encodeURIComponent(initialId)}`
+      `/api/v1/releases/${encodeURIComponent(initialId)}`
       + (requestedTorrent ? `?torrent=${requestedTorrent}` : "")
     ),
     refetchInterval: 15_000
+  });
+  const crossSeedPlans = createQuery({
+    queryKey: ["cross-seed-plans", initialId],
+    queryFn: () => api<CrossSeedPlan[]>(
+      `/api/v1/releases/${encodeURIComponent(initialId)}/cross-seed-plans`
+    ),
+    staleTime: 300_000,
+    retry: 0
   });
 
   const selectedVariant = $derived(
@@ -70,8 +88,9 @@
       client: requestedClient,
       hash: requestedHash,
       from: source,
-      expanded: expanded ? Number(initialId) : undefined,
-      details: details ? "client" : undefined
+      expanded: expanded ? 1 : undefined,
+      details: details ? "client" : undefined,
+      add: requestedAddTorrent
     });
   }
 
@@ -84,6 +103,36 @@
     identifiersOpen = (event.currentTarget as HTMLDetailsElement).open;
     updateRoute();
   }
+
+  function choose(variant: TorrentVariant) {
+    navigateView(routePath, {
+      torrent: requestedTorrent,
+      client: requestedClient,
+      hash: requestedHash,
+      from: source,
+      expanded: variantsExpanded ? Number(initialId) : undefined,
+      details: identifiersOpen ? "client" : undefined,
+      add: variant.torrentId
+    });
+  }
+
+  function closeAddDialog() {
+    closeOverlay(routePath, {
+      torrent: requestedTorrent,
+      client: requestedClient,
+      hash: requestedHash,
+      from: source,
+      expanded: variantsExpanded ? Number(initialId) : undefined,
+      details: identifiersOpen ? "client" : undefined
+    });
+  }
+
+  $effect(() => {
+    if (!requestedAddTorrent || selected || !$release.data) return;
+    selected = $release.data.data.variants.find(
+      (variant) => variant.torrentId === requestedAddTorrent
+    ) ?? null;
+  });
 </script>
 
 <svelte:head><title>{$release.data?.data.release.title ?? "Release"} · Wotbox</title></svelte:head>
@@ -112,7 +161,9 @@
       {/if}
     </div>
     <div>
-      <p class="eyebrow">{detail.release.tracker.toUpperCase()} release</p>
+      <p class="eyebrow">
+        {detail.release.sources.map((source) => source.tracker.toUpperCase()).join(" + ")} release
+      </p>
       <h1>{detail.release.title}</h1>
       <p class="release-byline">
         {[detail.release.artist, detail.release.year, detail.release.releaseType, detail.recordLabel].filter(Boolean).join(" · ")}
@@ -129,6 +180,7 @@
     </div>
     <PreferredVariants
       variants={detail.variants}
+      releaseId={detail.release.id}
       tracker={detail.release.tracker}
       groupId={detail.release.groupId}
       title={detail.release.title}
@@ -136,6 +188,7 @@
       source={source}
       expanded={variantsExpanded}
       onexpandedchange={toggleExpanded}
+      onadd={(variant) => choose(variant as TorrentVariant)}
     />
   </section>
 
@@ -184,4 +237,38 @@
       </div>
     </section>
   {/if}
+
+  {#if $crossSeedPlans.data?.length}
+    <section class="section">
+      <div class="section-heading">
+        <div><p class="eyebrow">Read-only analysis</p><h2>Cross-seed plans</h2></div>
+      </div>
+      <div class="panel-list">
+        {#each $crossSeedPlans.data as plan}
+          <article class="activity-row">
+            <div class="release-mark">{plan.targetTracker.slice(0, 1).toUpperCase()}</div>
+            <div class="activity-copy">
+              <strong>{plan.sourceTracker.toUpperCase()} → {plan.targetTracker.toUpperCase()}</strong>
+              <span>
+                {plan.matchedFiles}/{plan.targetFiles} files match ·
+                {plan.compatible ? "100% compatible" : "incomplete match"} ·
+                {plan.policyEligible ? "policy eligible" : "blocked by current policy"}
+              </span>
+              <small>{plan.summary} Nothing has been added to or changed in qBittorrent.</small>
+            </div>
+          </article>
+        {/each}
+      </div>
+    </section>
+  {/if}
 {/if}
+
+<AddDownloadDialog
+  selection={selected && $release.data ? {
+    name: $release.data.data.release.title,
+    artist: $release.data.data.release.artist,
+    torrent: selected
+  } : null}
+  tracker={selected?.tracker ?? $release.data?.data.release.tracker ?? ""}
+  onclose={closeAddDialog}
+/>

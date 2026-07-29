@@ -36,8 +36,7 @@
 
   function releasePath(item: DownloadsPage["items"][number], showClientDetails = false): string {
     return releaseViewPath(
-      item.release.tracker,
-      item.release.groupId,
+      item.release.id,
       item.variant.torrentId,
       "downloads",
       { client: item.download.client, infoHash: item.download.infoHash },
@@ -53,7 +52,7 @@
   <div>
     <p class="eyebrow">Tracker releases</p>
     <h1>Downloads</h1>
-    <p>Canonical tracker releases with live transfer state attached.</p>
+    <p>Canonical releases with source provenance and live transfer state attached.</p>
   </div>
   <button class="icon-button" aria-label="Refresh downloads" onclick={() => $downloads.refetch()}>
     <span class:spin={$downloads.isFetching}><RefreshCw size={18} /></span>

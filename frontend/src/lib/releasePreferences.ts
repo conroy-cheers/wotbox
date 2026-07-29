@@ -10,7 +10,12 @@ export type DisplayVariant = SearchTorrent | TorrentVariant;
 export const defaultReleasePreferences: ReleasePreferences = {
   qualityOrder: ["hi_res", "lossless", "320", "v0", "other"],
   minimumQuality: "lossless",
-  mediaTiers: [["WEB", "CD"], ["Vinyl"], ["SACD", "DVD", "Blu-ray"], ["Cassette"], ["Other"]]
+  mediaTiers: [["WEB", "CD"], ["Vinyl"], ["SACD", "DVD", "Blu-ray"], ["Cassette"], ["Other"]],
+  trackerOrder: ["ops", "red"],
+  trackerPolicies: [
+    { tracker: "ops", mode: "freeleech_or_token", autoUseTokens: true },
+    { tracker: "red", mode: "freeleech_only", autoUseTokens: false }
+  ]
 };
 
 export const qualityLabels: Record<QualityPreference, string> = {
@@ -55,10 +60,19 @@ export function rankVariants<T extends DisplayVariant>(
   preferences: ReleasePreferences
 ): T[] {
   return [...variants].sort((left, right) =>
-    preferences.qualityOrder.indexOf(qualityClass(left))
+    trackerRank(left.tracker, preferences) - trackerRank(right.tracker, preferences)
+    || preferences.qualityOrder.indexOf(qualityClass(left))
       - preferences.qualityOrder.indexOf(qualityClass(right))
     || mediaRank(left.media, preferences) - mediaRank(right.media, preferences)
     || (right.seeders ?? 0) - (left.seeders ?? 0)
     || left.torrentId - right.torrentId
   );
+}
+
+function trackerRank(tracker: string | undefined, preferences: ReleasePreferences): number {
+  if (!tracker) return preferences.trackerOrder.length;
+  const rank = preferences.trackerOrder.findIndex((known) =>
+    known.toLowerCase() === tracker.toLowerCase()
+  );
+  return rank >= 0 ? rank : preferences.trackerOrder.length;
 }

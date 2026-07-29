@@ -116,6 +116,7 @@ pub mod canonical_torrent {
         #[sea_orm(primary_key, auto_increment = false)]
         pub torrent_id: i64,
         pub group_id: i64,
+        pub release_id: Option<String>,
         pub info_hash: Option<String>,
         #[sea_orm(column_type = "Json")]
         pub canonical_json: Json,
@@ -143,6 +144,7 @@ pub mod download_release_link {
         pub tracker: Option<String>,
         pub group_id: Option<i64>,
         pub torrent_id: Option<i64>,
+        pub release_id: Option<String>,
         pub resolution_state: String,
         #[sea_orm(default_value = 0)]
         pub attempts: i64,
@@ -157,6 +159,205 @@ pub mod download_release_link {
         pub missing_since: Option<String>,
         pub library_added_at: Option<String>,
         pub completed_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod canonical_release {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "canonical_releases")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub title: String,
+        pub normalized_title: String,
+        pub artist: Option<String>,
+        pub year: Option<i64>,
+        pub release_type: Option<String>,
+        pub artwork: Option<String>,
+        #[sea_orm(column_type = "Json")]
+        pub metadata_json: Json,
+        #[sea_orm(column_type = "Json")]
+        pub provenance_json: Json,
+        #[sea_orm(column_type = "Json")]
+        pub overrides_json: Json,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod release_source {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "release_sources")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tracker: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub group_id: i64,
+        pub release_id: String,
+        pub normalized_title: String,
+        pub normalized_artist: String,
+        pub year: Option<i64>,
+        pub release_type: Option<String>,
+        #[sea_orm(column_type = "Json")]
+        pub source_json: Json,
+        pub fetched_at: String,
+        pub expires_at: String,
+        pub last_error: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod canonical_artist {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "canonical_artists")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub name: String,
+        pub normalized_name: String,
+        pub artwork: Option<String>,
+        #[sea_orm(column_type = "Json")]
+        pub metadata_json: Json,
+        #[sea_orm(column_type = "Json")]
+        pub provenance_json: Json,
+        #[sea_orm(column_type = "Json")]
+        pub overrides_json: Json,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod artist_source {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "artist_sources")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tracker: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_key: String,
+        pub artist_id: Option<i64>,
+        pub canonical_artist_id: String,
+        pub name: String,
+        pub normalized_name: String,
+        #[sea_orm(column_type = "Json")]
+        pub source_json: Json,
+        pub fetched_at: String,
+        pub expires_at: String,
+        pub last_error: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod canonical_release_credit {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "canonical_release_credits")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub release_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub artist_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub role: String,
+        pub source_count: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod canonical_alias {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "canonical_aliases")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub kind: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub alias_id: String,
+        pub target_id: String,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod match_candidate {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "match_candidates")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub kind: String,
+        pub left_id: String,
+        pub right_id: String,
+        pub score: f64,
+        pub status: String,
+        #[sea_orm(column_type = "Json")]
+        pub evidence_json: Json,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod canonical_backfill_state {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "canonical_backfill_state")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub key: String,
+        pub state: String,
+        pub processed: i64,
+        pub total: i64,
+        pub last_error: Option<String>,
+        pub updated_at: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

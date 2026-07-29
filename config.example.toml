@@ -9,6 +9,12 @@ base_url = "https://orpheus.network"
 token_file = "./ops-token"
 announce_hosts = ["home.opsfet.ch"]
 
+[trackers.red]
+kind = "red"
+base_url = "https://redacted.sh"
+token_file = "./red-token"
+announce_hosts = ["flacsfor.me"]
+
 [download_clients.music]
 kind = "qbittorrent"
 base_url = "http://127.0.0.1:8001"
@@ -18,4 +24,10 @@ api_key_file = "./qbit-api-key"
 client = "music"
 save_path = "/mnt/media/Downloads/torrent/complete/ops"
 tag = "ops"
+start_paused = false
+
+[download_profiles.red]
+client = "music"
+save_path = "/mnt/media/Downloads/torrent/complete/red"
+tag = "red"
 start_paused = false

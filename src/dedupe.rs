@@ -578,11 +578,13 @@ mod tests {
     fn album(group_id: i64, title: &str, encoding: &str) -> ArtistCatalogRelease {
         ArtistCatalogRelease {
             release: ReleaseSummary {
+                id: None,
                 tracker: "ops".into(),
                 group_id,
                 title: title.into(),
                 artist: Some("Artist".into()),
                 artists: vec![ArtistCredit {
+                    canonical_id: None,
                     key: "id:1".into(),
                     tracker: "ops".into(),
                     artist_id: Some(1),
@@ -593,6 +595,11 @@ mod tests {
                 year: Some(2020),
                 artwork: None,
                 release_type: Some("Album".into()),
+                sources: vec![crate::model::ReleaseSource {
+                    tracker: "ops".into(),
+                    group_id,
+                    match_score: 1.0,
+                }],
                 album_coverage: None,
             },
             tags: Vec::new(),
@@ -616,8 +623,10 @@ mod tests {
                 leechers: Some(0),
                 snatched: None,
                 freeleech: false,
+                leech_status: crate::model::LeechStatus::Regular,
                 can_use_token: false,
                 token_eligibility_known: true,
+                eligibility: None,
                 remaster_title: None,
                 downloads: Vec::new(),
                 library: None::<LibraryVariantState>,
@@ -801,6 +810,7 @@ mod tests {
 
     fn validation_index(release: &ValidationRelease, kind: &str) -> ReleaseTrackIndex {
         let artist = ArtistCredit {
+            canonical_id: None,
             key: format!("name:{}", release.artist.to_lowercase()),
             tracker: "ops".into(),
             artist_id: Some(1),
@@ -854,8 +864,10 @@ mod tests {
                 leechers: Some(0),
                 snatched: None,
                 freeleech: false,
+                leech_status: crate::model::LeechStatus::Regular,
                 can_use_token: false,
                 token_eligibility_known: true,
+                eligibility: None,
                 remaster_title: None,
                 downloads: Vec::new(),
                 library: None,

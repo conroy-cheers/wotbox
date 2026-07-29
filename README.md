@@ -1,8 +1,9 @@
 # Wotbox
 
 Wotbox is a single-user web manager for Gazelle music trackers and
-qBittorrent. Tracker metadata remains authoritative; Wotbox stores only
-sanitized snapshots and local download state.
+qBittorrent. Tracker metadata remains authoritative at the source; Wotbox
+normalizes it into stable local release and artist identities with explicit
+field provenance, sanitized snapshots, and local download state.
 
 ## MVP architecture
 
@@ -22,10 +23,15 @@ sanitized snapshots and local download state.
   transfer state to releases resolved from the tracker by info hash.
 
 The `gazelle_api` crate is used for its tracker rate limiter. Its higher-level
-models are not used as the public Wotbox contract because OPS and RED expose
-small response differences; the adapter normalizes those responses while
-retaining a sanitized source payload. The tracker and download client traits
-are the intended seams for RED and future Flood support.
+models are not used as the public Wotbox contract because Gazelle trackers
+expose small response differences. Each adapter normalizes its source while
+retaining a sanitized payload. Releases and artists have local UUIDs;
+high-confidence matches merge automatically, borderline matches enter Match
+Review, and rejected pairs stay separate. Metadata fields are selected by
+source-neutral completeness scoring and retain field-level provenance.
+Tracker preference remains deliberately limited to download economics and
+variant ranking: OPS tokens are plentiful, while RED defaults to
+already-free torrents only.
 
 The download API exposes `GET /api/v1/downloads` as `{ items, index }`, where
 each visible item combines a canonical release, its matched torrent variant,
@@ -33,14 +39,14 @@ and live client state. Pending, failed, and unconfigured torrents remain
 hidden while the background index progressively resolves configured announce
 hosts. `POST /api/v1/downloads` remains the tracker-to-client submission
 endpoint; canonical release detail is served by
-`GET /api/v1/groups/{tracker}/{groupId}`.
+`GET /api/v1/releases/{releaseId}`.
 
 Completed, linked torrents also form a durable Library. Once a torrent reaches
 100%, its canonical release remains in the Library even if its client copy
 later disappears; successful client scans mark that copy missing instead of
 deleting the catalog record. `GET /api/v1/library/artists` provides the
 artist-sorted index and mixed artist/release search, while
-`GET /api/v1/library/artists/{tracker}/{artistKey}` returns one artist's
+`GET /api/v1/library/artists/{artistId}` returns one canonical artist's
 completed releases. Artist membership comes only from structured Gazelle
 primary and guest credits, with the tracker's exact display artist used as a
 temporary fallback while group metadata is enriched.
@@ -63,32 +69,34 @@ query-backed state:
   variants, and the add confirmation are represented in the query string
 - `/library` — artist index and Library search with filter and result-limit
   state
-- `/library/artists/{tracker}/{artistKey}` — one artist's tracker catalog with
-  filters, sorting, covered Singles, expanded variants, and add confirmation
+- `/library/artists/{artistId}` — one artist's combined catalog with filters,
+  sorting, covered Singles, expanded variants, and add confirmation
 - `/downloads` — canonical downloads with links to their releases
-- `/releases/{tracker}/{groupId}` — canonical release detail, selected torrent,
+- `/releases/{releaseId}` — canonical release detail, selected torrent,
   exact live client attachment, expanded variants, and source context
+- `/matches` — review ambiguous artist and release matches
 - `/preferences` — runtime release preferences
 
 The embedded server returns the SPA shell for these routes so they can be
 loaded directly. Unknown paths render the Wotbox 404 view and carry an HTTP
-404 status in packaged builds.
+404 status in packaged builds. Legacy tracker/group and tracker/artist URLs
+are intentionally not redirected.
 
 ## Development
 
 For ordinary local development against the music qBittorrent instance on
-`sleet`, put `OPS_TOKEN` and `QBITTORRENT_API_KEY` in the ignored `.env` file,
-then run:
+`sleet`, put `OPS_TOKEN` and (optionally) `RED_TOKEN` in the ignored `.env`
+file, then run:
 
 ```console
 nix run .#dev-sleet
 ```
 
-This opens an SSH local-forward from `127.0.0.1:18001` to qBittorrent on
+This opens an SSH local-forward from `127.0.0.1:8001` to qBittorrent on
 `sleet`, starts the Rust API on port 8780, and starts the Vite UI on
 <http://127.0.0.1:5173>. The tunnel and both development processes are stopped
 together. Local SQLite state lives under the ignored `.state/` directory;
-the OPS credential remains in `.env`. Unless `QBITTORRENT_API_KEY` is already
+tracker credentials remain in `.env`. Unless `QBITTORRENT_API_KEY` is already
 provided, the workflow reads qBittorrent's key from
 `/run/agenix/wotbox.qbittorrent-api-key` over SSH and keeps it only in the
 backend process environment.
@@ -152,6 +160,19 @@ scenarios, 99.5% precision and specificity, 98% recall, and 97% match-kind
 accuracy. End-to-end release decisions must all agree with their labels.
 False-positive resistance is deliberately weighted most heavily because an
 incorrect positive hides a release.
+
+Cross-tracker release matching has a separate labeled corpus at
+`tests/fixtures/release_match_validation.json`. Run its precision and recall
+gate with:
+
+```console
+cargo test cross_tracker_validation_corpus_meets_accuracy_gate -- --nocapture
+```
+
+Release pages also expose read-only cross-seed compatibility plans. They
+compare the target tracker file list with completed qBittorrent files by name
+and size; generating a plan never adds, resumes, relocates, or otherwise
+changes a torrent.
 
 `flake.nix` exports the packaged service, the separately buildable frontend,
 the development shell, and `nixosModules.default`. See

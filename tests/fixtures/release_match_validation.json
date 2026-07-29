@@ -1,0 +1,22 @@
+[
+  {"match":true,"leftArtist":"Beyoncé & Jay-Z","leftTitle":"Everything Is Love","leftYear":2018,"leftType":"Album","rightArtist":"Beyonce and Jay Z","rightTitle":"Everything Is Love","rightYear":2018,"rightType":"Album"},
+  {"match":true,"leftArtist":"Sigur Rós","leftTitle":"Ágætis byrjun","leftYear":1999,"leftType":"Album","rightArtist":"Sigur Ros","rightTitle":"Agaetis Byrjun","rightYear":1999,"rightType":"Album"},
+  {"match":true,"leftArtist":"The Beatles","leftTitle":"The Beatles","leftYear":1968,"leftType":"Album","rightArtist":"Beatles, The","rightTitle":"The Beatles (White Album)","rightYear":1968,"rightType":"Album"},
+  {"match":true,"leftArtist":"Aphex Twin","leftTitle":"Selected Ambient Works 85–92","leftYear":1992,"leftType":"Album","rightArtist":"Aphex Twin","rightTitle":"Selected Ambient Works 85-92","rightYear":1992,"rightType":"Album"},
+  {"match":true,"leftArtist":"R.E.M.","leftTitle":"Murmur","leftYear":1983,"leftType":"Album","rightArtist":"REM","rightTitle":"Murmur","rightYear":1983,"rightType":"Album"},
+  {"match":true,"leftArtist":"A Tribe Called Quest","leftTitle":"The Low End Theory","leftYear":1991,"leftType":"Album","rightArtist":"A Tribe Called Quest","rightTitle":"Low End Theory, The","rightYear":1991,"rightType":"Album"},
+  {"match":true,"leftArtist":"Charli XCX","leftTitle":"Brat","leftYear":2024,"leftType":"Album","rightArtist":"Charli xcx","rightTitle":"BRAT","rightYear":2024,"rightType":"Album"},
+  {"match":true,"leftArtist":"Miles Davis","leftTitle":"Kind of Blue","leftYear":1959,"leftType":"Album","rightArtist":"Miles Davis","rightTitle":"Kind of Blue","rightYear":1960,"rightType":"Album"},
+  {"match":true,"leftArtist":"Burial","leftTitle":"Untrue","leftYear":2007,"leftType":"Album","rightArtist":"Burial","rightTitle":"Untrue (Deluxe Edition)","rightYear":2007,"rightType":"Album"},
+  {"match":true,"leftArtist":"Boards of Canada","leftTitle":"Music Has the Right to Children","leftYear":1998,"leftType":"Album","rightArtist":"Boards Of Canada","rightTitle":"Music Has The Right To Children","rightYear":1998,"rightType":"Album"},
+  {"match":false,"leftArtist":"Taylor Swift","leftTitle":"Red","leftYear":2012,"leftType":"Album","rightArtist":"Taylor Swift","rightTitle":"Red (Taylor's Version)","rightYear":2021,"rightType":"Album"},
+  {"match":false,"leftArtist":"Massive Attack","leftTitle":"Protection","leftYear":1994,"leftType":"Album","rightArtist":"Massive Attack","rightTitle":"Protection: The Remixes","rightYear":1995,"rightType":"Remix"},
+  {"match":false,"leftArtist":"Various Artists","leftTitle":"Greatest Hits","leftYear":1999,"leftType":"Compilation","rightArtist":"Various Artists","rightTitle":"Greatest Hits","rightYear":2000,"rightType":"Compilation"},
+  {"match":false,"leftArtist":"Nirvana","leftTitle":"Nirvana","leftYear":2002,"leftType":"Compilation","rightArtist":"Nirvana","rightTitle":"Nirvana","rightYear":1989,"rightType":"Album"},
+  {"match":false,"leftArtist":"John Williams","leftTitle":"Star Wars","leftYear":1977,"leftType":"Soundtrack","rightArtist":"John Williams","rightTitle":"Star Wars: The Force Awakens","rightYear":2015,"rightType":"Soundtrack"},
+  {"match":false,"leftArtist":"The Cure","leftTitle":"Three Imaginary Boys","leftYear":1979,"leftType":"Album","rightArtist":"The Cure","rightTitle":"Boys Don't Cry","rightYear":1980,"rightType":"Album"},
+  {"match":false,"leftArtist":"Radiohead","leftTitle":"I Might Be Wrong","leftYear":2001,"leftType":"Live album","rightArtist":"Radiohead","rightTitle":"I Might Be Wrong","rightYear":2001,"rightType":"Single"},
+  {"match":false,"leftArtist":"David Bowie","leftTitle":"Changes","leftYear":1971,"leftType":"Single","rightArtist":"David Bowie","rightTitle":"ChangesTwoBowie","rightYear":1981,"rightType":"Compilation"},
+  {"match":false,"leftArtist":"Sleep","leftTitle":"Dopesmoker","leftYear":2003,"leftType":"Album","rightArtist":"Sleep","rightTitle":"Dopesmoker Live","rightYear":2007,"rightType":"Live album"},
+  {"match":false,"leftArtist":"Unknown Artist","leftTitle":"Untitled","leftYear":2020,"leftType":"Album","rightArtist":"Unknown Artist","rightTitle":"Untitled","rightYear":2021,"rightType":"Album"}
+]

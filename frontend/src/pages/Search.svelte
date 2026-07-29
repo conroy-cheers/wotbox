@@ -138,7 +138,7 @@
   <div>
     <p class="eyebrow">Tracker search</p>
     <h1>Find a release</h1>
-    <p>Results come directly from the tracker and retain their source metadata.</p>
+    <p>Results combine every configured catalog while retaining source provenance.</p>
   </div>
 </header>
 
@@ -153,6 +153,7 @@
     <label>
       <span>Tracker</span>
       <select bind:value={tracker}>
+        <option value="">All trackers</option>
         {#each $config.data?.trackers ?? [] as trackerName}
           <option value={trackerName}>{trackerName.toUpperCase()}</option>
         {/each}
@@ -182,6 +183,17 @@
 </form>
 
 <StaleNotice provenance={$results.data?.provenance} />
+
+{#if $results.data?.data.sourceStatus.some((source) => source.state !== "ready")}
+  <div class="notice-banner">
+    <strong>Some tracker results are unavailable.</strong>
+    {$results.data.data.sourceStatus
+      .filter((source) => source.state !== "ready")
+      .map((source) => source.tracker.toUpperCase())
+      .join(", ")}
+    can be retried without affecting the results already shown.
+  </div>
+{/if}
 
 {#if $results.data?.data.deduplication}
   <DeduplicationProgress
@@ -233,16 +245,21 @@
           <div class="release-heading">
             <div>
               <p>{group.artist ?? "Various artists"}</p>
-              <h2><a href={appPath(`/releases/${$results.data.provenance.tracker}/${group.groupId}?from=search`)}>{group.name}</a></h2>
+              <h2><a href={group.id ? appPath(`/releases/${group.id}?from=search`) : undefined}>{group.name}</a></h2>
               <span>
                 {[group.year, group.releaseType].filter(Boolean).join(" · ")}
+                {#if group.sources.length > 1}
+                  <span class="source-badges">
+                    {#each group.sources as source}<span>{source.tracker.toUpperCase()}</span>{/each}
+                  </span>
+                {/if}
                 {#if group.albumCoverage}
                   <span class="album-coverage-badge" title={`Covered by ${coverageTitle(group)}`}>
                     {group.albumCoverage.confidence === "fuzzy" ? "Likely included on albums" : "Included on albums"}
                   </span>
                   <span class="album-coverage-links">
                     {#each group.albumCoverage.albums as album, index}
-                      {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}?from=search`)}>{album.title}</a>
+                      {#if index}, {/if}<span>{album.title}</span>
                     {/each}
                   </span>
                 {/if}
@@ -254,7 +271,8 @@
           </div>
           <PreferredVariants
             variants={group.torrents}
-            tracker={$results.data.provenance.tracker}
+            releaseId={group.id}
+            tracker={group.tracker}
             groupId={group.groupId}
             title={group.name}
             expanded={expandedGroups.has(group.groupId)}
@@ -305,6 +323,6 @@
     artist: selected.group.artist,
     torrent: selected.torrent
   } : null}
-  tracker={$results.data?.provenance.tracker ?? tracker}
+  tracker={selected?.torrent.tracker ?? selected?.group.tracker ?? tracker}
   onclose={closeAddDialog}
 />

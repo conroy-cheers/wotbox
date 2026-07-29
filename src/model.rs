@@ -4,6 +4,59 @@ use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerDownloadMode {
+    Disabled,
+    FreeleechOnly,
+    FreeleechOrToken,
+    Any,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackerPreference {
+    pub tracker: String,
+    pub mode: TrackerDownloadMode,
+    pub auto_use_tokens: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LeechStatus {
+    #[default]
+    Regular,
+    Freeleech,
+    PersonalFreeleech,
+    Neutral,
+    Freeload,
+}
+
+impl LeechStatus {
+    pub fn has_no_download_debit(self) -> bool {
+        self != Self::Regular
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadEligibilityReason {
+    Eligible,
+    TrackerDisabled,
+    FreeleechRequired,
+    TokenUnavailable,
+    BelowQualityCutoff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadEligibility {
+    pub eligible: bool,
+    pub reason: DownloadEligibilityReason,
+    pub requires_token: bool,
+    pub token_available: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Provenance {
@@ -36,6 +89,16 @@ pub struct Account {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct TrackerAccount {
+    pub tracker: String,
+    pub account: Account,
+    pub provenance: Provenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchPage {
     pub current_page: i64,
     pub total_pages: i64,
@@ -43,11 +106,25 @@ pub struct SearchPage {
     pub groups: Vec<SearchGroup>,
     #[serde(default)]
     pub deduplication: DeduplicationIndexStatus,
+    #[serde(default)]
+    pub source_status: Vec<SourceLoadStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceLoadStatus {
+    pub tracker: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchGroup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    pub tracker: String,
     pub group_id: i64,
     pub name: String,
     pub artist: Option<String>,
@@ -56,6 +133,8 @@ pub struct SearchGroup {
     pub image: Option<String>,
     pub tags: Vec<String>,
     pub torrents: Vec<SearchTorrent>,
+    #[serde(default)]
+    pub sources: Vec<ReleaseSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub album_coverage: Option<AlbumCoverage>,
 }
@@ -102,6 +181,8 @@ pub struct DeduplicationIndexStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchTorrent {
+    #[serde(default)]
+    pub tracker: String,
     pub torrent_id: i64,
     pub edition_id: Option<i64>,
     pub format: Option<String>,
@@ -112,6 +193,8 @@ pub struct SearchTorrent {
     pub leechers: Option<i64>,
     pub snatched: Option<i64>,
     pub freeleech: bool,
+    #[serde(default)]
+    pub leech_status: LeechStatus,
     pub can_use_token: bool,
     pub remaster_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +242,29 @@ pub struct ReleasePreferences {
     pub quality_order: Vec<String>,
     pub minimum_quality: String,
     pub media_tiers: Vec<Vec<String>>,
+    #[serde(default = "default_tracker_order")]
+    pub tracker_order: Vec<String>,
+    #[serde(default = "default_tracker_preferences")]
+    pub tracker_policies: Vec<TrackerPreference>,
+}
+
+fn default_tracker_order() -> Vec<String> {
+    vec!["ops".into(), "red".into()]
+}
+
+fn default_tracker_preferences() -> Vec<TrackerPreference> {
+    vec![
+        TrackerPreference {
+            tracker: "ops".into(),
+            mode: TrackerDownloadMode::FreeleechOrToken,
+            auto_use_tokens: true,
+        },
+        TrackerPreference {
+            tracker: "red".into(),
+            mode: TrackerDownloadMode::FreeleechOnly,
+            auto_use_tokens: false,
+        },
+    ]
 }
 
 impl Default for ReleasePreferences {
@@ -179,6 +285,8 @@ impl Default for ReleasePreferences {
                 vec!["Cassette".into()],
                 vec!["Other".into()],
             ],
+            tracker_order: default_tracker_order(),
+            tracker_policies: default_tracker_preferences(),
         }
     }
 }
@@ -219,6 +327,30 @@ impl ReleasePreferences {
                 return Err("media values must be non-empty and unique across tiers".into());
             }
         }
+        let normalized_order = self
+            .tracker_order
+            .iter()
+            .map(|tracker| tracker.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if normalized_order.iter().any(String::is_empty)
+            || normalized_order
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != normalized_order.len()
+        {
+            return Err("trackerOrder must contain unique, non-empty tracker names".into());
+        }
+        let mut policies = std::collections::HashSet::new();
+        for policy in &self.tracker_policies {
+            let tracker = policy.tracker.trim().to_ascii_lowercase();
+            if tracker.is_empty() || !policies.insert(tracker.clone()) {
+                return Err("trackerPolicies must contain unique, non-empty tracker names".into());
+            }
+            if !normalized_order.contains(&tracker) {
+                return Err("every tracker policy must be present in trackerOrder".into());
+            }
+        }
         Ok(())
     }
 
@@ -255,6 +387,59 @@ impl ReleasePreferences {
             return false;
         };
         quality <= cutoff
+    }
+
+    pub fn tracker_policy(&self, tracker: &str) -> TrackerPreference {
+        self.tracker_policies
+            .iter()
+            .find(|policy| policy.tracker.eq_ignore_ascii_case(tracker))
+            .cloned()
+            .unwrap_or_else(|| TrackerPreference {
+                tracker: tracker.to_ascii_lowercase(),
+                mode: TrackerDownloadMode::FreeleechOnly,
+                auto_use_tokens: false,
+            })
+    }
+
+    pub fn eligibility(
+        &self,
+        tracker: &str,
+        format: Option<&str>,
+        encoding: Option<&str>,
+        leech_status: LeechStatus,
+        can_use_token: bool,
+    ) -> DownloadEligibility {
+        if !self.allows(format, encoding) {
+            return DownloadEligibility {
+                eligible: false,
+                reason: DownloadEligibilityReason::BelowQualityCutoff,
+                requires_token: false,
+                token_available: can_use_token,
+            };
+        }
+        let policy = self.tracker_policy(tracker);
+        let free = leech_status.has_no_download_debit();
+        let (eligible, reason, requires_token) = match policy.mode {
+            TrackerDownloadMode::Disabled => {
+                (false, DownloadEligibilityReason::TrackerDisabled, false)
+            }
+            TrackerDownloadMode::FreeleechOnly if !free => {
+                (false, DownloadEligibilityReason::FreeleechRequired, false)
+            }
+            TrackerDownloadMode::FreeleechOrToken if !free && !can_use_token => {
+                (false, DownloadEligibilityReason::TokenUnavailable, true)
+            }
+            TrackerDownloadMode::FreeleechOrToken if !free => {
+                (true, DownloadEligibilityReason::Eligible, true)
+            }
+            _ => (true, DownloadEligibilityReason::Eligible, false),
+        };
+        DownloadEligibility {
+            eligible,
+            reason,
+            requires_token,
+            token_available: can_use_token,
+        }
     }
 }
 
@@ -311,7 +496,36 @@ pub struct ObservedDownload {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct DownloadFile {
+    pub name: String,
+    pub size: i64,
+    pub progress: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossSeedPlan {
+    pub source_tracker: String,
+    pub source_torrent_id: i64,
+    pub source_client: String,
+    pub source_info_hash: String,
+    pub source_path: String,
+    pub target_tracker: String,
+    pub target_torrent_id: i64,
+    pub compatible: bool,
+    pub matched_files: usize,
+    pub target_files: usize,
+    pub missing_files: Vec<String>,
+    pub policy_eligible: bool,
+    pub summary: String,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ReleaseSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
     pub tracker: String,
     pub group_id: i64,
     pub title: String,
@@ -321,8 +535,42 @@ pub struct ReleaseSummary {
     pub year: Option<i64>,
     pub artwork: Option<String>,
     pub release_type: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<ReleaseSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub album_coverage: Option<AlbumCoverage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseSource {
+    pub tracker: String,
+    pub group_id: i64,
+    #[serde(default)]
+    pub match_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseMatchRecord {
+    pub matcher_version: i32,
+    pub sources: Vec<ReleaseSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ArtistMatchRecord {
+    pub matcher_version: i32,
+    pub sources: Vec<ArtistSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ArtistSource {
+    pub tracker: String,
+    pub artist_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
@@ -342,6 +590,8 @@ pub enum ArtistCreditSource {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtistCredit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<Uuid>,
     pub key: String,
     pub tracker: String,
     pub artist_id: Option<i64>,
@@ -365,9 +615,13 @@ pub struct TorrentVariant {
     pub leechers: Option<i64>,
     pub snatched: Option<i64>,
     pub freeleech: bool,
+    #[serde(default)]
+    pub leech_status: LeechStatus,
     pub can_use_token: bool,
     #[serde(default)]
     pub token_eligibility_known: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility: Option<DownloadEligibility>,
     pub remaster_title: Option<String>,
     #[serde(default)]
     pub downloads: Vec<LiveDownloadStatus>,
@@ -379,6 +633,8 @@ pub struct TorrentVariant {
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseDetail {
     pub release: ReleaseSummary,
+    #[serde(default)]
+    pub field_provenance: Value,
     pub tags: Vec<String>,
     pub description: Option<String>,
     pub record_label: Option<String>,
@@ -459,6 +715,8 @@ pub struct LibraryRelease {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryArtistSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
     pub key: String,
     pub tracker: String,
     pub artist_id: Option<i64>,
@@ -513,6 +771,8 @@ pub enum ArtistCatalogRole {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtistCatalogArtist {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
     pub tracker: String,
     pub artist_id: i64,
     pub name: String,
@@ -669,7 +929,9 @@ pub fn value_bool(value: &Value, keys: &[&str]) -> bool {
 
 #[cfg(test)]
 mod preference_tests {
-    use super::{DeduplicationIndexStatus, ReleasePreferences};
+    use super::{
+        DeduplicationIndexStatus, DownloadEligibilityReason, LeechStatus, ReleasePreferences,
+    };
 
     #[test]
     fn default_cutoff_accepts_lossless_and_hi_res_only() {
@@ -689,6 +951,40 @@ mod preference_tests {
         let mut preferences = ReleasePreferences::default();
         preferences.media_tiers[1].push("web".into());
         assert!(preferences.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_to_no_debit_downloads_on_both_trackers() {
+        let preferences = ReleasePreferences::default();
+        let ops = preferences.eligibility(
+            "ops",
+            Some("FLAC"),
+            Some("Lossless"),
+            LeechStatus::Regular,
+            true,
+        );
+        assert!(ops.eligible);
+        assert!(ops.requires_token);
+
+        let red = preferences.eligibility(
+            "red",
+            Some("FLAC"),
+            Some("Lossless"),
+            LeechStatus::Regular,
+            true,
+        );
+        assert!(!red.eligible);
+        assert_eq!(red.reason, DownloadEligibilityReason::FreeleechRequired);
+
+        let red_free = preferences.eligibility(
+            "red",
+            Some("FLAC"),
+            Some("Lossless"),
+            LeechStatus::PersonalFreeleech,
+            false,
+        );
+        assert!(red_free.eligible);
+        assert!(!red_free.requires_token);
     }
 
     #[test]

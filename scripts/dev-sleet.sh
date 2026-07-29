@@ -6,7 +6,7 @@ if [[ ! -f Cargo.toml || ! -f frontend/package.json ]]; then
 fi
 
 if [[ ! -f .env ]]; then
-  echo "Missing .env. It must provide OPS_TOKEN and QBITTORRENT_API_KEY." >&2
+  echo "Missing .env. It must provide OPS_TOKEN; RED_TOKEN and QBITTORRENT_API_KEY are optional." >&2
   exit 1
 fi
 

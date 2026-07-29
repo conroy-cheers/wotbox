@@ -6,6 +6,7 @@
     api,
     appPath,
     relativeTime,
+    type CanonicalBackfillProgress,
     type LibraryArtistSummary,
     type LibraryArtistsPage,
     type LibraryAvailability,
@@ -50,6 +51,11 @@
     }
   );
   const library = createQuery(options);
+  const canonicalIndex = createQuery({
+    queryKey: ["canonical-index"],
+    queryFn: () => api<CanonicalBackfillProgress>("/api/v1/index/canonical"),
+    refetchInterval: 2_000
+  });
 
   $effect(() => {
     const query = {
@@ -104,10 +110,19 @@
   <div>
     <p class="eyebrow">Completed releases</p>
     <h1>Library</h1>
-    <p>Your permanent collection, arranged by tracker artist credits.</p>
+    <p>Your permanent collection, arranged by canonical artists across all sources.</p>
   </div>
   <BookOpen size={28} />
 </header>
+
+{#if $canonicalIndex.data?.state !== "complete"}
+  <div class="notice-banner">
+    <strong>Building canonical library identities.</strong>
+    {$canonicalIndex.data?.processed.toLocaleString() ?? 0} of
+    {$canonicalIndex.data?.total.toLocaleString() ?? "—"} cached variants indexed.
+    Artist links appear progressively, with Library items processed first.
+  </div>
+{/if}
 
 <section class="library-controls" aria-label="Library filters">
   <label class="library-search">
@@ -192,7 +207,10 @@
           {#each group.items as artist}
             <a
               class="artist-card"
-              href={appPath(`/library/artists/${encodeURIComponent(artist.tracker)}/${encodeURIComponent(artist.key)}`)}
+              href={artist.id
+                ? appPath(`/library/artists/${encodeURIComponent(artist.id)}`)
+                : undefined}
+              aria-disabled={!artist.id}
             >
               <div class="artist-mosaic" class:single={artist.artworks.length < 2}>
                 {#if artist.artworks.length}
@@ -206,7 +224,7 @@
               <div class="artist-card-copy">
                 <div>
                   <h3>{artist.name}</h3>
-                  <span>{artist.tracker.toUpperCase()}</span>
+                  <span>{artist.tracker.toUpperCase()} source</span>
                 </div>
                 <p>{artist.releaseCount} {artist.releaseCount === 1 ? "release" : "releases"}</p>
                 {#if artist.missingCount}
@@ -240,14 +258,14 @@
         <div class="library-release-grid">
           {#each visibleReleases($library.data.releases) as item}
             <article class="library-release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
-              <a class="cover" href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?from=library`)}>
+              <a class="cover" href={item.release.id ? appPath(`/releases/${item.release.id}?from=library`) : undefined}>
                 <Disc3 size={28} />
                 {#if item.release.artwork}
                   <img src={item.release.artwork} alt="" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
                 {/if}
               </a>
               <div>
-                <h3><a href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?from=library`)}>{item.release.title}</a></h3>
+                <h3><a href={item.release.id ? appPath(`/releases/${item.release.id}?from=library`) : undefined}>{item.release.title}</a></h3>
                 <p>
                   {item.release.artist ?? "Unknown artist"} · {[item.release.year, item.release.releaseType].filter(Boolean).join(" · ")}
                   {#if item.release.albumCoverage}
@@ -256,14 +274,14 @@
                     </span>
                     <span class="album-coverage-links">
                       {#each item.release.albumCoverage.albums as album, index}
-                        {#if index}, {/if}<a href={appPath(`/releases/${album.tracker}/${album.groupId}?from=library`)}>{album.title}</a>
+                        {#if index}, {/if}<span>{album.title}</span>
                       {/each}
                     </span>
                   {/if}
                 </p>
                 <div class="variant-chips">
                   {#each item.variants as variant}
-                    <a href={appPath(`/releases/${item.release.tracker}/${item.release.groupId}?torrent=${variant.torrentId}&from=library`)}>
+                    <a href={item.release.id ? appPath(`/releases/${item.release.id}?torrent=${variant.torrentId}&from=library`) : undefined}>
                       {[variant.format, variant.encoding].filter(Boolean).join(" · ") || "Unknown format"}
                     </a>
                   {/each}
