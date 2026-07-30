@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
     io::Write,
+    path::Path as StdPath,
     sync::Arc,
     time::Duration,
 };
@@ -18,7 +20,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::time::MissedTickBehavior;
+use tokio::{sync::Semaphore, time::MissedTickBehavior};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -29,15 +31,19 @@ use crate::{
     dedupe::{compute_raw_coverage, track_index_from_group},
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
-        ArtistCredit, ArtistCreditSource, ArtistRole, CanonicalDownload, CanonicalTorrent,
-        ChannelBatchResult, ChannelConfig, ChannelKind, ChannelOverview, ChannelPack,
-        ChannelPackDecision, ChannelPackSummary, ChannelRun, ChannelRunStatus, ChannelRunTrigger,
-        ClientDownloadState, CreateDownload, DecideChannelPack, DeduplicationIndexStatus,
-        DownloadJob, DownloadProfile, DownloadState, DownloadsPage, LibraryArtistPage,
-        LibraryArtistSummary, LibraryArtistsPage, LibraryAvailability, LibraryCopy,
-        LibraryIndexStatus, LibraryRelease, LibraryVariantState, LiveDownloadStatus, Provenance,
-        PublicConfig, ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage,
-        TorrentMetadata, TorrentVariant, value_i64,
+        ArtistCredit, ArtistCreditSource, ArtistRole, AttachChannelPackItem, CanonicalDownload,
+        CanonicalTorrent, ChannelBatchResult, ChannelConfig, ChannelKind, ChannelOverview,
+        ChannelPack, ChannelPackDecision, ChannelPackSummary, ChannelRun, ChannelRunStatus,
+        ChannelRunTrigger, ClientDownloadState, CreateDownload, DecideChannelPack,
+        DeduplicationIndexStatus, DownloadJob, DownloadProfile, DownloadState, DownloadsPage,
+        LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage, LibraryAvailability,
+        LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState, LiveDownloadStatus,
+        Provenance, ProviderStatus, PublicConfig, ReleaseDetail, ReleaseSummary,
+        RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant, value_i64,
+    },
+    provider::{
+        ProviderDefinition, ProviderGovernor, ProviderRequestError, RequestClass,
+        is_provider_unavailable,
     },
     qbittorrent::{DownloadClient, QbittorrentClient},
     tracker::{
@@ -57,18 +63,41 @@ pub struct AppState {
     pub profiles: HashMap<String, DownloadProfile>,
     pub announce_hosts: HashMap<String, String>,
     pub source_client: reqwest::Client,
+    pub providers: ProviderGovernor,
     pub lastfm_api_key: Option<String>,
+    download_slots: Arc<Semaphore>,
+    _instance_lock: Arc<File>,
 }
 
 impl AppState {
     pub async fn new(config: &Config) -> Result<Arc<Self>> {
+        let instance_lock = acquire_database_lock(&config.database_path)?;
         let db = Database::open(&config.database_path).await?;
+        let preferences = db.get_runtime_preferences().await?;
+        let mut definitions = config
+            .trackers
+            .keys()
+            .map(|name| ProviderDefinition::tracker(name))
+            .collect::<Vec<_>>();
+        definitions.extend(
+            config
+                .download_clients
+                .keys()
+                .map(|name| ProviderDefinition::qbittorrent(name)),
+        );
+        definitions.push(ProviderDefinition::lastfm());
+        definitions.push(ProviderDefinition::apple());
+        let providers = ProviderGovernor::new(db.clone(), definitions, &preferences.api).await?;
         let mut trackers: HashMap<String, Arc<dyn TrackerClient>> = HashMap::new();
         let mut announce_hosts = HashMap::new();
         for (name, tracker) in &config.trackers {
             trackers.insert(
                 name.clone(),
-                Arc::new(GazelleTrackerClient::new(name.clone(), tracker)?),
+                Arc::new(GazelleTrackerClient::governed(
+                    name.clone(),
+                    tracker,
+                    providers.clone(),
+                )?),
             );
             let hosts =
                 if tracker.announce_hosts.is_empty() && matches!(tracker.kind, TrackerKind::Ops) {
@@ -86,9 +115,11 @@ impl AppState {
         let mut download_clients: HashMap<String, Arc<dyn DownloadClient>> = HashMap::new();
         for (name, client) in &config.download_clients {
             let client: Arc<dyn DownloadClient> = match client.kind {
-                DownloadClientKind::Qbittorrent => {
-                    Arc::new(QbittorrentClient::new(name.clone(), client)?)
-                }
+                DownloadClientKind::Qbittorrent => Arc::new(QbittorrentClient::governed(
+                    name.clone(),
+                    client,
+                    providers.clone(),
+                )?),
             };
             download_clients.insert(name.clone(), client);
         }
@@ -117,12 +148,17 @@ impl AppState {
             announce_hosts,
             source_client: reqwest::Client::builder()
                 .user_agent(format!("wotbox/{}", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
                 .build()?,
+            providers,
             lastfm_api_key: config
                 .lastfm_api_key_file
                 .as_deref()
                 .map(read_secret)
                 .transpose()?,
+            download_slots: Arc::new(Semaphore::new(2)),
+            _instance_lock: Arc::new(instance_lock),
         });
         state.db.ensure_default_channels().await?;
         state.db.recover_channel_runs().await?;
@@ -146,6 +182,29 @@ impl AppState {
     }
 }
 
+fn acquire_database_lock(path: &StdPath) -> Result<File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create database directory {}", parent.display()))?;
+    }
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = std::path::PathBuf::from(lock_name);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open instance lock {}", lock_path.display()))?;
+    file.try_lock()
+        .with_context(|| format!("another Wotbox process is already using {}", path.display()))?;
+    Ok(file)
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health/live", get(live))
@@ -155,6 +214,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/preferences",
             get(preferences).put(update_preferences),
+        )
+        .route("/api/v1/providers", get(providers))
+        .route(
+            "/api/v1/providers/{id}/pause",
+            axum::routing::post(pause_provider),
+        )
+        .route(
+            "/api/v1/providers/{id}/resume",
+            axum::routing::post(resume_provider),
         )
         .route("/api/v1/account", get(account))
         .route("/api/v1/accounts", get(accounts))
@@ -209,6 +277,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::post(replan_channel_pack),
         )
         .route(
+            "/api/v1/channel-packs/{id}/items/{ordinal}/attach",
+            axum::routing::post(attach_channel_pack_item),
+        )
+        .route(
             "/api/v1/channel-packs/{id}/accept",
             axum::routing::post(accept_channel_pack),
         )
@@ -249,14 +321,58 @@ async fn preferences(
 #[utoipa::path(put, path = "/api/v1/preferences", request_body = RuntimePreferences, responses((status = 200, body = RuntimePreferences)))]
 async fn update_preferences(
     State(state): State<Arc<AppState>>,
-    Json(preferences): Json<RuntimePreferences>,
+    Json(mut preferences): Json<RuntimePreferences>,
 ) -> Result<Json<RuntimePreferences>, AppError> {
+    preferences.release = preferences.release.migrate_legacy();
     preferences
         .release
         .validate()
         .map_err(|message| AppError::bad_request("invalid_preferences", message))?;
+    for policy in &preferences.release.tracker_policies {
+        if let Some(profile) = policy.download_profile.as_deref()
+            && !state.profiles.contains_key(profile)
+        {
+            return Err(AppError::bad_request(
+                "invalid_download_profile",
+                format!(
+                    "Download profile {profile} configured for {} does not exist",
+                    policy.tracker
+                ),
+            ));
+        }
+    }
+    state
+        .providers
+        .validate_preferences(&preferences.api)
+        .map_err(|error| AppError::bad_request("invalid_provider_policy", error))?;
     state.db.put_runtime_preferences(&preferences).await?;
+    state.providers.apply_preferences(&preferences.api).await?;
     Ok(Json(preferences))
+}
+
+#[utoipa::path(get, path = "/api/v1/providers", responses((status = 200, body = [ProviderStatus])))]
+async fn providers(State(state): State<Arc<AppState>>) -> Json<Vec<ProviderStatus>> {
+    Json(state.providers.statuses().await)
+}
+
+#[utoipa::path(post, path = "/api/v1/providers/{id}/pause", params(("id" = String, Path)), responses((status = 200, body = ProviderStatus)))]
+async fn pause_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ProviderStatus>, AppError> {
+    Ok(Json(state.providers.pause(&id).await.map_err(|error| {
+        AppError::not_found("provider_not_found", error)
+    })?))
+}
+
+#[utoipa::path(post, path = "/api/v1/providers/{id}/resume", params(("id" = String, Path)), responses((status = 200, body = ProviderStatus)))]
+async fn resume_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ProviderStatus>, AppError> {
+    Ok(Json(state.providers.resume(&id).await.map_err(
+        |error| AppError::not_found("provider_not_found", error),
+    )?))
 }
 
 #[utoipa::path(get, path = "/health/ready", responses((status = 200, body = Health)))]
@@ -345,6 +461,7 @@ async fn update_channel(
     requested.last_successful_at = existing.last_successful_at;
     requested.last_attempt_at = existing.last_attempt_at;
     requested.last_error = existing.last_error;
+    requested.failure_count = existing.failure_count;
     requested.next_refresh_at = None;
     requested.updated_at = Utc::now();
     channel::validate_channel(&requested, state.lastfm_api_key.is_some())
@@ -364,7 +481,7 @@ async fn refresh_channel(
         .get_channel(&id)
         .await?
         .ok_or_else(|| AppError::not_found("channel_not_found", "Channel was not found"))?;
-    channel::validate_channel(&config, state.lastfm_api_key.is_some())
+    channel::validate_channel_refresh(&config, state.lastfm_api_key.is_some())
         .map_err(|error| AppError::bad_request("invalid_channel", error))?;
     let run = start_channel_run(state, config, ChannelRunTrigger::Manual).await?;
     Ok((StatusCode::ACCEPTED, Json(run)))
@@ -466,6 +583,39 @@ async fn replan_channel_pack(
     Ok(Json(pack))
 }
 
+#[utoipa::path(post, path = "/api/v1/channel-packs/{id}/items/{ordinal}/attach", request_body = AttachChannelPackItem, responses((status = 200, body = ChannelPack)))]
+async fn attach_channel_pack_item(
+    State(state): State<Arc<AppState>>,
+    Path((id, ordinal)): Path<(Uuid, u32)>,
+    Json(request): Json<AttachChannelPackItem>,
+) -> Result<Json<ChannelPack>, AppError> {
+    let preferences = state.db.get_runtime_preferences().await?;
+    let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
+    let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
+    let index = pack
+        .items
+        .iter()
+        .position(|item| item.ordinal == ordinal)
+        .ok_or_else(|| {
+            AppError::not_found("channel_pack_item_not_found", "Pack item was not found")
+        })?;
+    let source = pack.items[index].source.clone();
+    pack.items[index] = channel::resolve_release(&state, source, request.release_id, &preferences)
+        .await
+        .map_err(|error| AppError::bad_request("invalid_channel_match", error))?;
+    channel::coordinate_pack_plan(&state, &mut pack.items, &preferences).await;
+    state
+        .db
+        .replace_channel_plan(id, &fingerprint, &pack.items)
+        .await?;
+    let pack = state
+        .db
+        .get_channel_pack(id, &fingerprint)
+        .await?
+        .context("channel pack disappeared")?;
+    Ok(Json(pack))
+}
+
 #[utoipa::path(post, path = "/api/v1/channel-packs/{id}/reject", request_body = DecideChannelPack, responses((status = 200, body = ChannelPack)))]
 async fn reject_channel_pack(
     State(state): State<Arc<AppState>>,
@@ -497,10 +647,45 @@ async fn accept_channel_pack(
     let fingerprint =
         channel::preference_fingerprint(&state, &state.db.get_runtime_preferences().await?)?;
     let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
+    let selected = request
+        .ordinals
+        .map(|ordinals| ordinals.into_iter().collect::<HashSet<_>>());
+    if selected.as_ref().is_some_and(HashSet::is_empty) {
+        return Err(AppError::bad_request(
+            "empty_channel_selection",
+            "Select at least one planned release to accept",
+        ));
+    }
+    if let Some(selected) = &selected {
+        let executable = pack
+            .items
+            .iter()
+            .filter(|item| {
+                item.plan_state == crate::model::PackItemPlanState::Executable
+                    && selected.contains(&item.ordinal)
+            })
+            .count();
+        if executable != selected.len() {
+            return Err(AppError::bad_request(
+                "invalid_channel_selection",
+                "The selection contains an item that is not executable",
+            ));
+        }
+    }
     let mut jobs = Vec::new();
     let mut submitted = 0;
     for item in &mut pack.items {
         if item.plan_state != crate::model::PackItemPlanState::Executable {
+            continue;
+        }
+        if selected
+            .as_ref()
+            .is_some_and(|ordinals| !ordinals.contains(&item.ordinal))
+        {
+            item.plan_state = crate::model::PackItemPlanState::Excluded;
+            item.plan = None;
+            item.reason = Some("Excluded from the accepted pack by the user".into());
+            state.db.update_channel_pack_item(pack.id, item).await?;
             continue;
         }
         let Some(plan) = &item.plan else {
@@ -579,7 +764,7 @@ async fn load_open_pack(
 fn hydrate_channel_config(state: &AppState, channel: &mut ChannelConfig) -> Result<(), AppError> {
     channel.credential_configured =
         !matches!(channel.kind, ChannelKind::Lastfm) || state.lastfm_api_key.is_some();
-    channel.next_refresh_at = channel::next_occurrence(channel, Utc::now()).ok();
+    channel.next_refresh_at = channel::next_refresh_at(channel, Utc::now()).ok();
     Ok(())
 }
 
@@ -588,7 +773,7 @@ async fn start_channel_run(
     config: ChannelConfig,
     trigger: ChannelRunTrigger,
 ) -> Result<ChannelRun, AppError> {
-    channel::validate_channel(&config, state.lastfm_api_key.is_some())
+    channel::validate_channel_refresh(&config, state.lastfm_api_key.is_some())
         .map_err(|error| AppError::bad_request("invalid_channel", error))?;
     let run = state
         .db
@@ -609,7 +794,8 @@ async fn start_channel_run(
     let task_state = state.clone();
     let task_run = run.clone();
     tokio::spawn(async move {
-        let outcome = channel::refresh_channel(task_state.clone(), config.clone()).await;
+        let outcome =
+            channel::refresh_channel(task_state.clone(), config.clone(), task_run.id).await;
         match outcome {
             Ok((pack_id, status)) => {
                 let _ = task_state
@@ -619,6 +805,7 @@ async fn start_channel_run(
                 if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
                     current.last_successful_at = Some(Utc::now());
                     current.last_error = None;
+                    current.failure_count = 0;
                     current.updated_at = Utc::now();
                     let _ = task_state.db.put_channel(&current).await;
                 }
@@ -632,6 +819,7 @@ async fn start_channel_run(
                     .await;
                 if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
                     current.last_error = Some(message);
+                    current.failure_count = current.failure_count.saturating_add(1);
                     current.updated_at = Utc::now();
                     let _ = task_state.db.put_channel(&current).await;
                 }
@@ -793,6 +981,7 @@ async fn search(
         let mut response = envelope(tracker_name, cached, false);
         assign_search_ids(&state.db, &mut response.data).await?;
         enrich_search_downloads(&state, &mut response.data).await?;
+        apply_search_eligibility(&state, &mut response.data).await?;
         enrich_search_deduplication(&state, tracker_name, &mut response.data).await?;
         return Ok(Json(response));
     }
@@ -811,6 +1000,7 @@ async fn search(
             .await?;
             assign_search_ids(&state.db, &mut value).await?;
             enrich_search_downloads(&state, &mut value).await?;
+            apply_search_eligibility(&state, &mut value).await?;
             enrich_search_deduplication(&state, tracker_name, &mut value).await?;
             Ok(Json(ApiEnvelope {
                 data: value,
@@ -823,6 +1013,7 @@ async fn search(
                 .0;
             assign_search_ids(&state.db, &mut response.data).await?;
             enrich_search_downloads(&state, &mut response.data).await?;
+            apply_search_eligibility(&state, &mut response.data).await?;
             enrich_search_deduplication(&state, tracker_name, &mut response.data).await?;
             Ok(Json(response))
         }
@@ -843,8 +1034,32 @@ async fn federated_search(
         media: query.media,
         page: query.page,
     };
+    let key = search_cache_key(&request);
+    let preferences = state.db.get_runtime_preferences().await?;
     let mut tasks = tokio::task::JoinSet::new();
+    let mut pages = std::collections::HashMap::new();
+    let mut source_status = Vec::new();
     for (name, tracker) in &state.trackers {
+        if !query.refresh
+            && let Some(cached) = state
+                .db
+                .get_snapshot::<SearchPage>(name, "search", &key)
+                .await?
+            && cached.expires_at > Utc::now()
+        {
+            let mut page = cached.value;
+            assign_search_ids(&state.db, &mut page).await?;
+            enrich_search_downloads(state, &mut page).await?;
+            apply_search_eligibility(state, &mut page).await?;
+            enrich_search_deduplication(state, name, &mut page).await?;
+            source_status.push(crate::model::SourceLoadStatus {
+                tracker: name.clone(),
+                state: "ready".into(),
+                error: None,
+            });
+            pages.insert(name.clone(), page);
+            continue;
+        }
         let name = name.clone();
         let tracker = tracker.clone();
         let request = request.clone();
@@ -857,10 +1072,7 @@ async fn federated_search(
         });
     }
 
-    let preferences = state.db.get_runtime_preferences().await?;
-    let mut pages = std::collections::HashMap::new();
     let mut errors = Vec::new();
-    let mut source_status = Vec::new();
     while let Some(result) = tasks.join_next().await {
         let (tracker_name, result) =
             result.map_err(|error| AppError::unavailable("tracker_task_failed", error))?;
@@ -885,18 +1097,37 @@ async fn federated_search(
                 .await?;
                 assign_search_ids(&state.db, &mut page).await?;
                 enrich_search_downloads(state, &mut page).await?;
+                apply_search_eligibility(state, &mut page).await?;
                 enrich_search_deduplication(state, &tracker_name, &mut page).await?;
                 pages.insert(tracker_name, page);
             }
             Err(error) => {
                 tracing::warn!(tracker = %tracker_name, %error, "federated search source failed");
-                errors.push((tracker_name, error.to_string()));
-                let (tracker, error) = errors.last().expect("error was just appended");
-                source_status.push(crate::model::SourceLoadStatus {
-                    tracker: tracker.clone(),
-                    state: "unavailable".into(),
-                    error: Some(error.clone()),
-                });
+                let message = error.to_string();
+                if let Some(cached) = state
+                    .db
+                    .get_snapshot::<SearchPage>(&tracker_name, "search", &key)
+                    .await?
+                {
+                    let mut page = cached.value;
+                    assign_search_ids(&state.db, &mut page).await?;
+                    enrich_search_downloads(state, &mut page).await?;
+                    apply_search_eligibility(state, &mut page).await?;
+                    enrich_search_deduplication(state, &tracker_name, &mut page).await?;
+                    source_status.push(crate::model::SourceLoadStatus {
+                        tracker: tracker_name.clone(),
+                        state: "stale".into(),
+                        error: Some(message),
+                    });
+                    pages.insert(tracker_name, page);
+                } else {
+                    errors.push((tracker_name.clone(), message.clone()));
+                    source_status.push(crate::model::SourceLoadStatus {
+                        tracker: tracker_name,
+                        state: "unavailable".into(),
+                        error: Some(message),
+                    });
+                }
             }
         }
     }
@@ -987,6 +1218,7 @@ async fn federated_search(
             .cmp(&left_popularity)
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
+    let stale = source_status.iter().any(|source| source.state != "ready");
     Ok(Json(ApiEnvelope {
         data: SearchPage {
             current_page,
@@ -996,7 +1228,7 @@ async fn federated_search(
             deduplication: Default::default(),
             source_status,
         },
-        provenance: provenance("all", Utc::now(), !errors.is_empty()),
+        provenance: provenance("all", Utc::now(), stale),
     }))
 }
 
@@ -1826,6 +2058,8 @@ async fn canonical_artist_catalog(
                 &variant.tracker,
                 variant.format.as_deref(),
                 variant.encoding.as_deref(),
+                variant.media.as_deref(),
+                variant.size,
                 variant.leech_status,
                 variant.can_use_token || !variant.token_eligibility_known,
             ));
@@ -2476,11 +2710,15 @@ async fn downloads(
             .collect()
     };
     let mut observed = Vec::new();
+    let desired_per_client = offset.saturating_add(limit).min(10_500);
     for (name, client) in clients {
         let mut client_offset = 0;
         loop {
+            let page_limit = desired_per_client
+                .saturating_sub(client_offset)
+                .clamp(1, 500);
             let mut page = client
-                .downloads(500, client_offset)
+                .downloads(page_limit, client_offset)
                 .await
                 .map_err(|error| {
                     AppError::unavailable("download_client_unavailable", format!("{name}: {error}"))
@@ -2490,10 +2728,10 @@ async fn downloads(
                 observe_download(&state, download).await?;
             }
             observed.append(&mut page);
-            if count < 500 || client_offset >= 100_000 {
+            if count < page_limit as usize || client_offset + page_limit >= desired_per_client {
                 break;
             }
-            client_offset += 500;
+            client_offset += page_limit;
         }
     }
     observed.sort_by(|left, right| {
@@ -2704,6 +2942,10 @@ async fn enqueue_download(
         let task_state = state.clone();
         let task_job = job.clone();
         tokio::spawn(async move {
+            let permit = match task_state.download_slots.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
             if let Err(error) = process_download(task_state.clone(), task_job.clone()).await {
                 let message = truncate(&error.to_string(), 500);
                 tracing::error!(job_id = %task_job.id, error = %message, "download submission failed");
@@ -2716,6 +2958,7 @@ async fn enqueue_download(
                     )
                     .await;
             }
+            drop(permit);
         });
     }
     Ok(job)
@@ -2756,25 +2999,32 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .get(&profile.client)
         .ok_or_else(|| anyhow!("download client disappeared from configuration"))?;
 
-    let (mut metadata, mut canonical, raw) = tracker.torrent(job.torrent_id).await?;
+    let (mut metadata, mut canonical, raw) = tracker
+        .torrent_with_class(job.torrent_id, RequestClass::Download)
+        .await?;
     let preferences = state.db.get_runtime_preferences().await?;
     let token_available_or_unknown = metadata.can_use_token || !metadata.token_eligibility_known;
     let eligibility = preferences.release.eligibility(
         &job.tracker,
         canonical.variant.format.as_deref(),
         canonical.variant.encoding.as_deref(),
+        canonical.variant.media.as_deref(),
+        canonical.variant.size,
         canonical.variant.leech_status,
         token_available_or_unknown,
     );
     if !eligibility.eligible {
         let message = match eligibility.reason {
             crate::model::DownloadEligibilityReason::BelowQualityCutoff => format!(
-                "release quality '{}' is below the configured '{}' cutoff",
+                "release quality '{}' is below the configured cutoff",
                 crate::model::ReleasePreferences::quality_class(
                     canonical.variant.format.as_deref(),
                     canonical.variant.encoding.as_deref(),
-                ),
-                preferences.release.minimum_quality
+                )
+            ),
+            crate::model::DownloadEligibilityReason::BelowMediaCutoff => format!(
+                "release media '{}' is below the configured cutoff",
+                canonical.variant.media.as_deref().unwrap_or("Other")
             ),
             crate::model::DownloadEligibilityReason::TrackerDisabled => {
                 format!("downloads from {} are disabled by preferences", job.tracker)
@@ -2787,6 +3037,9 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
             }
             crate::model::DownloadEligibilityReason::TokenUnavailable => {
                 "a freeleech token is required but unavailable for this torrent".into()
+            }
+            crate::model::DownloadEligibilityReason::TokenCostUnknown => {
+                "an OPS freeleech token was requested, but the torrent size is unavailable".into()
             }
             crate::model::DownloadEligibilityReason::Eligible => {
                 "torrent is not eligible under the configured tracker policy".into()
@@ -2810,6 +3063,11 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
                 "freeleech token use is disabled by the configured tracker policy"
             ));
         }
+    }
+    if job.use_token && eligibility.token_cost.is_none() {
+        return Err(anyhow!(
+            "freeleech token cost is unknown because the tracker has no supported cost model or the torrent size is unavailable"
+        ));
     }
     if job.use_token && metadata.token_eligibility_known && !metadata.can_use_token {
         return Err(anyhow!("torrent is not eligible for a freeleech token"));
@@ -2873,7 +3131,10 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         )
         .await?;
 
-    if let Some(existing) = client.download(&info_hash).await? {
+    if let Some(existing) = client
+        .download_with_class(&info_hash, RequestClass::Download)
+        .await?
+    {
         let state_value = if existing.live.progress >= 1.0 {
             DownloadState::Complete
         } else {
@@ -2928,6 +3189,7 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
             let Ok(jobs) = state.db.list_jobs().await else {
                 continue;
             };
+            let mut unavailable_clients = HashSet::new();
             for job in jobs.into_iter().filter(|job| {
                 matches!(job.state, DownloadState::Active | DownloadState::Submitting)
             }) {
@@ -2939,7 +3201,13 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
                 let Some(client) = state.download_clients.get(&profile.client) else {
                     continue;
                 };
-                match client.download(info_hash).await {
+                if unavailable_clients.contains(&profile.client) {
+                    continue;
+                }
+                match client
+                    .download_with_class(info_hash, RequestClass::Background)
+                    .await
+                {
                     Ok(Some(status)) => {
                         let next = if status.live.progress >= 1.0 {
                             DownloadState::Complete
@@ -2972,6 +3240,9 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
                             .await;
                     }
                     Err(error) => {
+                        if is_provider_unavailable(&error) {
+                            unavailable_clients.insert(profile.client.clone());
+                        }
                         tracing::warn!(job_id = %job.id, %error, "qBittorrent reconciliation failed")
                     }
                 }
@@ -3118,7 +3389,9 @@ async fn resolve_due_track_indexes(state: &Arc<AppState>) -> Result<()> {
             .set_track_index_resolving(&job.tracker, job.group_id)
             .await?;
         let result: Result<()> = async {
-            let (detail, raw) = tracker.group(job.group_id).await?;
+            let (detail, raw) = tracker
+                .group_with_class(job.group_id, RequestClass::Background)
+                .await?;
             let index = track_index_from_group(&job.tracker, &detail, &raw);
             cache_release_detail(&state.db, &detail).await?;
             let now = Utc::now();
@@ -3163,7 +3436,9 @@ async fn resolve_due_track_indexes(state: &Arc<AppState>) -> Result<()> {
                     {
                         cached.value
                     } else {
-                        let (catalog, raw) = tracker.artist_catalog(artist_id).await?;
+                        let (catalog, raw) = tracker
+                            .artist_catalog_with_class(artist_id, RequestClass::Background)
+                            .await?;
                         cache_artist_catalog(&state.db, &catalog).await?;
                         let now = Utc::now();
                         state
@@ -3187,10 +3462,6 @@ async fn resolve_due_track_indexes(state: &Arc<AppState>) -> Result<()> {
         }
         .await;
         if let Err(error) = result {
-            let rate_limited = error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("rate limit");
             state
                 .db
                 .fail_track_index(&job.tracker, job.group_id, &error.to_string())
@@ -3201,8 +3472,8 @@ async fn resolve_due_track_indexes(state: &Arc<AppState>) -> Result<()> {
                 %error,
                 "release track indexing failed"
             );
-            if rate_limited {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+            if is_provider_unavailable(&error) {
+                break;
             }
         }
     }
@@ -3317,7 +3588,9 @@ async fn scan_download_clients(state: &Arc<AppState>) -> Result<()> {
         let scan_started_at = Utc::now();
         let mut offset = 0;
         loop {
-            let downloads = client.downloads(PAGE_SIZE, offset).await?;
+            let downloads = client
+                .downloads_with_class(PAGE_SIZE, offset, RequestClass::Background)
+                .await?;
             let count = downloads.len();
             for download in &downloads {
                 observe_download(state, download).await?;
@@ -3373,7 +3646,10 @@ async fn resolve_due_links(state: &Arc<AppState>) -> Result<()> {
                 .set_link_resolving(&link.client, &link.info_hash)
                 .await?;
         }
-        match tracker.torrent_by_hash(&info_hash).await {
+        match tracker
+            .torrent_by_hash_with_class(&info_hash, RequestClass::Background)
+            .await
+        {
             Ok((canonical, _raw)) => {
                 let now = Utc::now();
                 state
@@ -3421,7 +3697,9 @@ async fn refresh_canonical_by_hash(
         .trackers
         .get(&tracker_name)
         .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
-    let (canonical, _) = tracker.torrent_by_hash(&info_hash).await?;
+    let (canonical, _) = tracker
+        .torrent_by_hash_with_class(&info_hash, RequestClass::Background)
+        .await?;
     let now = Utc::now();
     state
         .db
@@ -3941,6 +4219,32 @@ async fn enrich_search_downloads(
     Ok(())
 }
 
+async fn apply_search_eligibility(
+    state: &Arc<AppState>,
+    page: &mut SearchPage,
+) -> Result<(), AppError> {
+    let preferences = state.db.get_runtime_preferences().await?;
+    for group in &mut page.groups {
+        for torrent in &mut group.torrents {
+            let tracker = if torrent.tracker.is_empty() {
+                &group.tracker
+            } else {
+                &torrent.tracker
+            };
+            torrent.eligibility = Some(preferences.release.eligibility(
+                tracker,
+                torrent.format.as_deref(),
+                torrent.encoding.as_deref(),
+                torrent.media.as_deref(),
+                torrent.size,
+                torrent.leech_status,
+                torrent.can_use_token,
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn enrich_variant_downloads(
     state: &Arc<AppState>,
     variants: &mut [TorrentVariant],
@@ -4119,7 +4423,9 @@ async fn refresh_group(state: Arc<AppState>, tracker_name: String, id: i64) -> R
         .trackers
         .get(&tracker_name)
         .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
-    let (detail, raw) = tracker.group(id).await?;
+    let (detail, raw) = tracker
+        .group_with_class(id, RequestClass::Background)
+        .await?;
     let track_index = track_index_from_group(&tracker_name, &detail, &raw);
     state.db.enqueue_track_index(&tracker_name, id).await?;
     state.db.put_track_index(&track_index).await?;
@@ -4144,7 +4450,9 @@ async fn refresh_artist_catalog(state: Arc<AppState>, tracker_name: String, id: 
         .trackers
         .get(&tracker_name)
         .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
-    let (catalog, raw) = tracker.artist_catalog(id).await?;
+    let (catalog, raw) = tracker
+        .artist_catalog_with_class(id, RequestClass::Background)
+        .await?;
     cache_artist_catalog(&state.db, &catalog).await?;
     seed_catalog_deduplication(&state, &tracker_name, &catalog).await?;
     let now = Utc::now();
@@ -4364,7 +4672,9 @@ async fn get_or_fetch_group(
     let Some(tracker) = state.trackers.get(tracker_name) else {
         return Ok(None);
     };
-    let (detail, raw) = tracker.group(group_id).await?;
+    let (detail, raw) = tracker
+        .group_with_class(group_id, RequestClass::Background)
+        .await?;
     cache_release_detail(&state.db, &detail).await?;
     let _ = store(
         &state.db,
@@ -4389,6 +4699,8 @@ async fn apply_download_eligibility(
             &variant.tracker,
             variant.format.as_deref(),
             variant.encoding.as_deref(),
+            variant.media.as_deref(),
+            variant.size,
             variant.leech_status,
             variant.can_use_token || !variant.token_eligibility_known,
         ));
@@ -4532,7 +4844,10 @@ async fn discover_cross_tracker_artist_catalog(
         let Some(counterpart_id) = counterpart_id else {
             continue;
         };
-        let (other, raw) = match tracker.artist_catalog(counterpart_id).await {
+        let (other, raw) = match tracker
+            .artist_catalog_with_class(counterpart_id, RequestClass::Background)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 transient_failure = true;
@@ -4806,6 +5121,22 @@ where
 {
     fn from(error: E) -> Self {
         let error = error.into();
+        if let Some(provider) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())
+        {
+            let (status, code) = match provider {
+                ProviderRequestError::Busy { .. } => {
+                    (StatusCode::TOO_MANY_REQUESTS, "provider_busy")
+                }
+                ProviderRequestError::Unknown(_) => (StatusCode::NOT_FOUND, "provider_not_found"),
+                _ if provider.is_unavailable() => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable")
+                }
+                _ => (StatusCode::BAD_GATEWAY, "provider_error"),
+            };
+            return Self::new(status, code, provider, true);
+        }
         tracing::error!(%error, "internal request failure");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4829,14 +5160,16 @@ fn truncate(value: &str, max: usize) -> String {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        live, ready, preferences, update_preferences, account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
+        live, ready, preferences, update_preferences, providers, pause_provider, resume_provider, account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
         download_job,
         library_artists, library_artist, artist_catalog, channels, update_channel, refresh_channel,
-        channel_run, channel_packs, channel_pack, replan_channel_pack, accept_channel_pack,
-        reject_channel_pack
+        channel_run, channel_packs, channel_pack, replan_channel_pack, attach_channel_pack_item,
+        accept_channel_pack, reject_channel_pack
     ),
     components(schemas(
         Health, Account, crate::model::TrackerAccount, Provenance, RuntimePreferences,
+        crate::model::ApiPreferences, crate::model::ProviderPolicyOverride,
+        crate::model::ProviderCircuitState, crate::model::ProviderQueueCounts, ProviderStatus,
         crate::model::ReleasePreferences, crate::model::TrackerPreference,
         crate::model::TrackerDownloadMode, crate::model::LeechStatus,
         crate::model::DownloadEligibility, crate::model::DownloadEligibilityReason,
@@ -4856,7 +5189,7 @@ fn truncate(value: &str, max: usize) -> String {
         crate::model::PackItemPlanState, crate::model::RecommendationSource,
         crate::model::PlannedDownload, crate::model::ChannelPackItem,
         crate::model::ChannelPlanSummary, ChannelPack, ChannelPackSummary, ChannelOverview,
-        DecideChannelPack, ChannelBatchResult,
+        DecideChannelPack, AttachChannelPackItem, ChannelBatchResult,
         ErrorBody, ErrorDetail
     )),
     tags((name = "wotbox", description = "Wotbox API"))

@@ -109,7 +109,9 @@ impl RawSingleCoverage {
                         || album.matched_torrent_ids.contains(&variant.torrent_id)
                 })
                 .any(|variant| {
-                    preferences.allows(variant.format.as_deref(), variant.encoding.as_deref())
+                    preferences
+                        .allows_quality(variant.format.as_deref(), variant.encoding.as_deref())
+                        && preferences.allows_media(variant.media.as_deref())
                 })
         };
         if self
@@ -730,7 +732,7 @@ mod tests {
         assert!(coverage.resolve(&ReleasePreferences::default()).is_none());
 
         let preferences = ReleasePreferences {
-            minimum_quality: "320".into(),
+            quality_cutoff_index: 3,
             ..ReleasePreferences::default()
         };
         let resolved = coverage.resolve(&preferences).expect("320 is now eligible");
@@ -989,13 +991,15 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let coverage = compute_raw_coverage(&single, &albums);
-            let preferences = ReleasePreferences {
-                minimum_quality: case
-                    .minimum_quality
-                    .clone()
-                    .unwrap_or_else(|| ReleasePreferences::default().minimum_quality),
-                ..ReleasePreferences::default()
-            };
+            let mut preferences = ReleasePreferences::default();
+            if let Some(minimum) = &case.minimum_quality {
+                preferences.quality_cutoff_index = preferences
+                    .quality_tiers
+                    .iter()
+                    .position(|tier| tier.iter().any(|value| value == minimum))
+                    .map(|index| index + 1)
+                    .unwrap_or(preferences.quality_cutoff_index);
+            }
             let resolved = coverage.resolve(&preferences);
             if resolved.is_some() != case.expected_covered {
                 coverage_failures.push(format!(

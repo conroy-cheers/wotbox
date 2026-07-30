@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, multipart};
 use serde::Deserialize;
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 use url::Url;
 
 use crate::{
@@ -12,13 +12,30 @@ use crate::{
         ClientDownloadState, DownloadDiagnostic, DownloadFile, DownloadProfile, LiveDownloadStatus,
         ObservedDownload,
     },
+    provider::{ProviderFailure, ProviderFailureKind, ProviderGovernor, RequestClass, retry_after},
 };
 
 #[async_trait]
 pub trait DownloadClient: Send + Sync {
     async fn health(&self) -> Result<String>;
+    async fn free_space(&self) -> Result<i64>;
     async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>>;
+    async fn downloads_with_class(
+        &self,
+        limit: u32,
+        offset: u32,
+        _class: RequestClass,
+    ) -> Result<Vec<ObservedDownload>> {
+        self.downloads(limit, offset).await
+    }
     async fn download(&self, info_hash: &str) -> Result<Option<ObservedDownload>>;
+    async fn download_with_class(
+        &self,
+        info_hash: &str,
+        _class: RequestClass,
+    ) -> Result<Option<ObservedDownload>> {
+        self.download(info_hash).await
+    }
     async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>>;
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>>;
     async fn add_torrent(
@@ -34,6 +51,8 @@ pub struct QbittorrentClient {
     base_url: String,
     api_key: String,
     client: Client,
+    governor: Option<ProviderGovernor>,
+    provider_id: String,
 }
 
 impl QbittorrentClient {
@@ -42,12 +61,25 @@ impl QbittorrentClient {
         if !api_key.starts_with("qbt_") || api_key.chars().count() != 32 {
             bail!("qBittorrent API key must be a 32-character qbt_ key");
         }
+        let provider_id = format!("qbittorrent:{name}");
         Ok(Self {
             name,
             base_url: config.base_url.trim_end_matches('/').into(),
             api_key,
             client: Client::builder().timeout(Duration::from_secs(30)).build()?,
+            governor: None,
+            provider_id,
         })
+    }
+
+    pub fn governed(
+        name: String,
+        config: &DownloadClientConfig,
+        governor: ProviderGovernor,
+    ) -> Result<Self> {
+        let mut client = Self::new(name, config)?;
+        client.governor = Some(governor);
+        Ok(client)
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -61,29 +93,76 @@ impl QbittorrentClient {
         info_hash: Option<&str>,
         limit: Option<u32>,
         offset: Option<u32>,
+        class: RequestClass,
     ) -> Result<Vec<ObservedDownload>> {
-        let mut request = self.request(reqwest::Method::GET, "/api/v2/torrents/info");
-        if let Some(info_hash) = info_hash {
-            request = request.query(&[("hashes", info_hash)]);
-        }
-        if let Some(limit) = limit {
-            request = request.query(&[
-                ("sort", "added_on".to_owned()),
-                ("reverse", "true".to_owned()),
-                ("limit", limit.to_string()),
-                ("offset", offset.unwrap_or_default().to_string()),
-            ]);
-        }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            bail!("qBittorrent list returned HTTP {}", response.status());
-        }
-        let torrents: Vec<QbitTorrent> = response.json().await?;
+        let torrents: Vec<QbitTorrent> = self
+            .execute(class, || async {
+                let mut request = self.request(reqwest::Method::GET, "/api/v2/torrents/info");
+                if let Some(info_hash) = info_hash {
+                    request = request.query(&[("hashes", info_hash)]);
+                }
+                if let Some(limit) = limit {
+                    request = request.query(&[
+                        ("sort", "added_on".to_owned()),
+                        ("reverse", "true".to_owned()),
+                        ("limit", limit.to_string()),
+                        ("offset", offset.unwrap_or_default().to_string()),
+                    ]);
+                }
+                let response = request.send().await.map_err(transient)?;
+                let response = successful(response, "qBittorrent list").await?;
+                response.json().await.map_err(transient)
+            })
+            .await?;
         Ok(torrents
             .into_iter()
             .map(|torrent| torrent.normalized(&self.name))
             .collect())
     }
+
+    async fn execute<T, F, Fut>(&self, class: RequestClass, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<T, ProviderFailure>>,
+    {
+        match &self.governor {
+            Some(governor) => governor
+                .execute(&self.provider_id, class, operation)
+                .await
+                .map_err(Into::into),
+            None => operation()
+                .await
+                .map_err(|failure| anyhow::anyhow!(failure.message)),
+        }
+    }
+}
+
+fn transient(error: impl ToString) -> ProviderFailure {
+    ProviderFailure::new(ProviderFailureKind::Transient, error)
+}
+
+async fn successful(
+    response: reqwest::Response,
+    operation: &str,
+) -> std::result::Result<reqwest::Response, ProviderFailure> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let retry = retry_after(&response);
+    let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+        ProviderFailureKind::RateLimited
+    } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        ProviderFailureKind::Authentication
+    } else if status.is_server_error() {
+        ProviderFailureKind::Transient
+    } else {
+        ProviderFailureKind::Permanent
+    };
+    Err(
+        ProviderFailure::new(kind, format!("{operation} returned HTTP {status}"))
+            .retry_after(retry),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +203,18 @@ struct AddTorrentResult {
     success_count: u64,
     #[serde(default)]
     failure_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncMainData {
+    #[serde(default)]
+    server_state: QbitServerState,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct QbitServerState {
+    #[serde(default)]
+    free_space_on_disk: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,23 +303,67 @@ fn unix_timestamp(value: i64) -> Option<DateTime<Utc>> {
 #[async_trait]
 impl DownloadClient for QbittorrentClient {
     async fn health(&self) -> Result<String> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v2/app/version")
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            bail!("qBittorrent health returned HTTP {}", response.status());
-        }
-        Ok(response.text().await?.trim().to_owned())
+        self.execute(RequestClass::Background, || async {
+            let response = self
+                .request(reqwest::Method::GET, "/api/v2/app/version")
+                .send()
+                .await
+                .map_err(transient)?;
+            let response = successful(response, "qBittorrent health").await?;
+            response
+                .text()
+                .await
+                .map(|value| value.trim().to_owned())
+                .map_err(transient)
+        })
+        .await
+    }
+
+    async fn free_space(&self) -> Result<i64> {
+        self.execute(RequestClass::Manual, || async {
+            let response = self
+                .request(reqwest::Method::GET, "/api/v2/sync/maindata")
+                .query(&[("rid", 0)])
+                .send()
+                .await
+                .map_err(transient)?;
+            let response = successful(response, "qBittorrent main data").await?;
+            response
+                .json::<SyncMainData>()
+                .await
+                .map(|value| value.server_state.free_space_on_disk)
+                .map_err(transient)
+        })
+        .await
     }
 
     async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>> {
-        self.fetch_downloads(None, Some(limit), Some(offset)).await
+        self.downloads_with_class(limit, offset, RequestClass::Interactive)
+            .await
+    }
+
+    async fn downloads_with_class(
+        &self,
+        limit: u32,
+        offset: u32,
+        class: RequestClass,
+    ) -> Result<Vec<ObservedDownload>> {
+        self.fetch_downloads(None, Some(limit), Some(offset), class)
+            .await
     }
 
     async fn download(&self, info_hash: &str) -> Result<Option<ObservedDownload>> {
+        self.download_with_class(info_hash, RequestClass::Interactive)
+            .await
+    }
+
+    async fn download_with_class(
+        &self,
+        info_hash: &str,
+        class: RequestClass,
+    ) -> Result<Option<ObservedDownload>> {
         Ok(self
-            .fetch_downloads(Some(info_hash), None, None)
+            .fetch_downloads(Some(info_hash), None, None, class)
             .await?
             .into_iter()
             .next())
@@ -238,29 +373,40 @@ impl DownloadClient for QbittorrentClient {
         if info_hashes.is_empty() {
             return Ok(Vec::new());
         }
-        self.fetch_downloads(Some(&info_hashes.join("|")), None, None)
-            .await
+        self.fetch_downloads(
+            Some(&info_hashes.join("|")),
+            None,
+            None,
+            RequestClass::Background,
+        )
+        .await
     }
 
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v2/torrents/files")
-            .query(&[("hash", info_hash)])
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            bail!("qBittorrent file list returned HTTP {}", response.status());
-        }
-        Ok(response
-            .json::<Vec<QbitFile>>()
-            .await?
-            .into_iter()
-            .map(|file| DownloadFile {
-                name: file.name,
-                size: file.size,
-                progress: file.progress,
-            })
-            .collect())
+        self.execute(RequestClass::Interactive, || async {
+            let response = self
+                .request(reqwest::Method::GET, "/api/v2/torrents/files")
+                .query(&[("hash", info_hash)])
+                .send()
+                .await
+                .map_err(transient)?;
+            let response = successful(response, "qBittorrent file list").await?;
+            response
+                .json::<Vec<QbitFile>>()
+                .await
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| DownloadFile {
+                            name: file.name,
+                            size: file.size,
+                            progress: file.progress,
+                        })
+                        .collect()
+                })
+                .map_err(transient)
+        })
+        .await
     }
 
     async fn add_torrent(
@@ -280,17 +426,17 @@ impl DownloadClient for QbittorrentClient {
             form = form.text("stopped", "true");
         }
         let response = self
-            .request(reqwest::Method::POST, "/api/v2/torrents/add")
-            .multipart(form)
-            .send()
+            .execute(RequestClass::Download, || async {
+                let response = self
+                    .request(reqwest::Method::POST, "/api/v2/torrents/add")
+                    .multipart(form)
+                    .send()
+                    .await
+                    .map_err(transient)?;
+                successful(response, "qBittorrent add").await
+            })
             .await
             .context("submit torrent to qBittorrent")?;
-        if response.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE {
-            bail!("qBittorrent rejected the torrent payload");
-        }
-        if !response.status().is_success() {
-            bail!("qBittorrent add returned HTTP {}", response.status());
-        }
         let body = response.text().await?;
         let body = body.trim();
         if body == "Ok." {
@@ -485,6 +631,31 @@ mod tests {
             .add_torrent(b"d4:infode".to_vec(), "ops-99.torrent", &test_profile())
             .await
             .expect("structured success");
+    }
+
+    #[tokio::test]
+    async fn reads_free_space_for_pack_planning() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/maindata"))
+            .and(query_param("rid", "0"))
+            .and(header(
+                "authorization",
+                "Bearer qbt_0123456789012345678901234567",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "server_state": {
+                    "free_space_on_disk": 987654321
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            test_client(&server).free_space().await.expect("free space"),
+            987654321
+        );
     }
 
     #[tokio::test]

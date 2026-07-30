@@ -8,13 +8,27 @@ import type {
 export type DisplayVariant = SearchTorrent | TorrentVariant;
 
 export const defaultReleasePreferences: ReleasePreferences = {
-  qualityOrder: ["hi_res", "lossless", "320", "v0", "other"],
-  minimumQuality: "lossless",
-  mediaTiers: [["WEB", "CD"], ["Vinyl"], ["SACD", "DVD", "Blu-ray"], ["Cassette"], ["Other"]],
+  qualityTiers: [["hi_res"], ["lossless"], ["320"], ["v0"], ["other"]],
+  qualityCutoffIndex: 2,
+  mediaTiers: [["WEB", "CD"], ["SACD", "DVD", "Blu-ray"], ["Vinyl"], ["Cassette"], ["Other"]],
+  mediaCutoffIndex: 2,
+  variantSortOrder: ["quality", "tracker", "media", "edition"],
   trackerOrder: ["ops", "red"],
   trackerPolicies: [
-    { tracker: "ops", mode: "freeleech_or_token", autoUseTokens: true },
-    { tracker: "red", mode: "freeleech_only", autoUseTokens: false }
+    {
+      tracker: "ops",
+      mode: "freeleech_or_token",
+      autoUseTokens: true,
+      downloadProfile: "ops",
+      autoTokenLimit: 1
+    },
+    {
+      tracker: "red",
+      mode: "freeleech_only",
+      autoUseTokens: false,
+      downloadProfile: "red",
+      autoTokenLimit: 0
+    }
   ]
 };
 
@@ -39,12 +53,11 @@ export function qualityClass(variant: Pick<DisplayVariant, "format" | "encoding"
 }
 
 export function isQualityAllowed(variant: DisplayVariant, preferences: ReleasePreferences): boolean {
-  const rank = preferences.qualityOrder.indexOf(qualityClass(variant));
-  const cutoff = preferences.qualityOrder.indexOf(preferences.minimumQuality);
-  return rank >= 0 && cutoff >= 0 && rank <= cutoff;
+  const rank = preferences.qualityTiers.findIndex((tier) => tier.includes(qualityClass(variant)));
+  return rank >= 0 && rank < preferences.qualityCutoffIndex;
 }
 
-function mediaRank(media: string | undefined, preferences: ReleasePreferences): number {
+export function mediaRank(media: string | undefined, preferences: ReleasePreferences): number {
   const normalized = (media ?? "other").trim().toLowerCase();
   const rank = preferences.mediaTiers.findIndex((tier) =>
     tier.some((candidate) => candidate.trim().toLowerCase() === normalized)
@@ -55,18 +68,42 @@ function mediaRank(media: string | undefined, preferences: ReleasePreferences): 
   return rank >= 0 ? rank : otherRank >= 0 ? otherRank : preferences.mediaTiers.length;
 }
 
+export function isMediaAllowed(variant: DisplayVariant, preferences: ReleasePreferences): boolean {
+  return mediaRank(variant.media, preferences) < preferences.mediaCutoffIndex;
+}
+
+function qualityRank(variant: DisplayVariant, preferences: ReleasePreferences): number {
+  const rank = preferences.qualityTiers.findIndex((tier) => tier.includes(qualityClass(variant)));
+  return rank >= 0 ? rank : preferences.qualityTiers.length;
+}
+
+function editionRank(title: string | undefined): number {
+  const normalized = (title ?? "").toLowerCase();
+  if (["super deluxe", "deluxe", "expanded", "extended", "anniversary", "bonus track"]
+    .some((label) => normalized.includes(label))) return 0;
+  if (["instrumental", "remix", "live", "karaoke"]
+    .some((label) => normalized.includes(label))) return 3;
+  return 1;
+}
+
 export function rankVariants<T extends DisplayVariant>(
   variants: T[],
   preferences: ReleasePreferences
 ): T[] {
-  return [...variants].sort((left, right) =>
-    trackerRank(left.tracker, preferences) - trackerRank(right.tracker, preferences)
-    || preferences.qualityOrder.indexOf(qualityClass(left))
-      - preferences.qualityOrder.indexOf(qualityClass(right))
-    || mediaRank(left.media, preferences) - mediaRank(right.media, preferences)
-    || (right.seeders ?? 0) - (left.seeders ?? 0)
-    || left.torrentId - right.torrentId
-  );
+  return [...variants].sort((left, right) => {
+    for (const criterion of preferences.variantSortOrder) {
+      const difference = criterion === "quality"
+        ? qualityRank(left, preferences) - qualityRank(right, preferences)
+        : criterion === "tracker"
+          ? trackerRank(left.tracker, preferences) - trackerRank(right.tracker, preferences)
+          : criterion === "media"
+            ? mediaRank(left.media, preferences) - mediaRank(right.media, preferences)
+            : editionRank(left.remasterTitle) - editionRank(right.remasterTitle);
+      if (difference) return difference;
+    }
+    return (right.seeders ?? 0) - (left.seeders ?? 0)
+      || left.torrentId - right.torrentId;
+  });
 }
 
 function trackerRank(tracker: string | undefined, preferences: ReleasePreferences): number {

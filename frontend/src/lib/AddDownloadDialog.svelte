@@ -15,11 +15,13 @@
   let {
     selection,
     tracker,
-    onclose
+    onclose,
+    oncomplete
   }: {
     selection: DownloadSelection | null;
     tracker: string;
     onclose: () => void;
+    oncomplete?: () => void;
   } = $props();
 
   let useToken = $state(false);
@@ -46,7 +48,12 @@
   const policy = $derived(
     ($preferences.data?.release ?? defaultReleasePreferences).trackerPolicies
       .find((candidate) => candidate.tracker.toLowerCase() === activeTracker.toLowerCase())
-      ?? { tracker: activeTracker, mode: "freeleech_only" as const, autoUseTokens: false }
+      ?? {
+        tracker: activeTracker,
+        mode: "freeleech_only" as const,
+        autoUseTokens: false,
+        autoTokenLimit: 0
+      }
   );
   const policyBlocked = $derived(Boolean(selection) && (
     policy.mode === "disabled"
@@ -60,24 +67,28 @@
   const requiresToken = $derived(Boolean(selection)
     && !selection!.torrent.freeleech
     && policy.mode === "freeleech_or_token");
+  const tokenCost = $derived(selection?.torrent.eligibility?.tokenCost);
 
   $effect(() => {
     if (!selection) return;
-    const initializationKey = `${activeTracker}:${selection.torrent.torrentId}:${policy.mode}:${policy.autoUseTokens}`;
+    const initializationKey = `${activeTracker}:${selection.torrent.torrentId}:${policy.mode}:${policy.autoUseTokens}:${policy.downloadProfile ?? ""}`;
     if (initializedTorrent === initializationKey) return;
     initializedTorrent = initializationKey;
     const eligibilityKnown = selection.torrent.tokenEligibilityKnown ?? true;
     useToken = !selection.torrent.freeleech
       && policy.autoUseTokens
+      && tokenCost !== undefined
       && (selection.torrent.canUseToken || !eligibilityKnown);
-    selectedProfile = $profiles.data?.find((profile) => profile.name === activeTracker)?.name
+    selectedProfile = policy.downloadProfile
+      ?? $profiles.data?.find((profile) => profile.name === activeTracker)?.name
       ?? $profiles.data?.[0]?.name
       ?? "";
   });
 
   $effect(() => {
     if (selection && !selectedProfile && $profiles.data?.length) {
-      selectedProfile = $profiles.data.find((profile) => profile.name === activeTracker)?.name
+      selectedProfile = policy.downloadProfile
+        ?? $profiles.data.find((profile) => profile.name === activeTracker)?.name
         ?? $profiles.data[0].name;
     }
   });
@@ -153,6 +164,7 @@
     submittedJob = null;
     monitorError = "";
     initializedTorrent = "";
+    oncomplete?.();
     onclose();
   }
 
@@ -193,6 +205,7 @@
         {@const eligibilityKnown = selection.torrent.tokenEligibilityKnown ?? true}
         {@const tokenDisabled = selection.torrent.freeleech
           || (eligibilityKnown && !selection.torrent.canUseToken)
+          || tokenCost === undefined
           || policy.mode === "disabled"
           || policy.mode === "freeleech_only"}
         <label class:disabled={tokenDisabled} class="token-toggle">
@@ -203,10 +216,12 @@
             <small>
               {#if selection.torrent.freeleech}
                 This torrent is already free on {activeTracker.toUpperCase()}.
+              {:else if tokenCost === undefined}
+                The token cost cannot be calculated because the torrent size or tracker cost model is unavailable.
               {:else if !eligibilityKnown}
-                {activeTracker.toUpperCase()} will verify token availability before qBittorrent is contacted.
+                This action consumes {tokenCost} {activeTracker.toUpperCase()} {tokenCost === 1 ? "token" : "tokens"}; availability will be verified before qBittorrent is contacted.
               {:else if selection.torrent.canUseToken}
-                This action consumes one {activeTracker.toUpperCase()} freeleech token.
+                This action consumes {tokenCost} {activeTracker.toUpperCase()} freeleech {tokenCost === 1 ? "token" : "tokens"}.
               {:else}
                 The tracker reports that this torrent is not token eligible.
               {/if}
@@ -222,6 +237,8 @@
                   ? `${activeTracker.toUpperCase()} downloads are disabled.`
                   : policy.mode === "freeleech_only"
                     ? `${activeTracker.toUpperCase()} is configured for already-free torrents only.`
+                    : selection.torrent.eligibility?.reason === "token_cost_unknown"
+                      ? "The OPS token cost cannot be calculated because the torrent size is unavailable."
                     : "A required freeleech token is not available for this torrent."}
               </small>
             </span>

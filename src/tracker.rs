@@ -1,8 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use gazelle_api::RateLimiter;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -16,6 +15,7 @@ use crate::{
         ReleaseSource, ReleaseSummary, SearchGroup, SearchPage, SearchTorrent, TorrentMetadata,
         TorrentVariant, sanitized, value_bool, value_f64, value_i64, value_string,
     },
+    provider::{ProviderFailure, ProviderFailureKind, ProviderGovernor, RequestClass, retry_after},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -35,11 +35,54 @@ pub trait TrackerClient: Send + Sync {
     fn name(&self) -> &str;
     async fn account(&self) -> Result<(Account, Value)>;
     async fn search(&self, request: &SearchRequest) -> Result<(SearchPage, Value)>;
+    async fn search_with_class(
+        &self,
+        request: &SearchRequest,
+        _class: RequestClass,
+    ) -> Result<(SearchPage, Value)> {
+        self.search(request).await
+    }
     async fn artist_catalog(&self, id: i64) -> Result<(ArtistCatalogPage, Value)>;
+    async fn artist_catalog_with_class(
+        &self,
+        id: i64,
+        _class: RequestClass,
+    ) -> Result<(ArtistCatalogPage, Value)> {
+        self.artist_catalog(id).await
+    }
     async fn group(&self, id: i64) -> Result<(ReleaseDetail, Value)>;
+    async fn group_with_class(
+        &self,
+        id: i64,
+        _class: RequestClass,
+    ) -> Result<(ReleaseDetail, Value)> {
+        self.group(id).await
+    }
     async fn torrent(&self, id: i64) -> Result<(TorrentMetadata, CanonicalTorrent, Value)>;
+    async fn torrent_with_class(
+        &self,
+        id: i64,
+        _class: RequestClass,
+    ) -> Result<(TorrentMetadata, CanonicalTorrent, Value)> {
+        self.torrent(id).await
+    }
     async fn torrent_by_hash(&self, info_hash: &str) -> Result<(CanonicalTorrent, Value)>;
+    async fn torrent_by_hash_with_class(
+        &self,
+        info_hash: &str,
+        _class: RequestClass,
+    ) -> Result<(CanonicalTorrent, Value)> {
+        self.torrent_by_hash(info_hash).await
+    }
     async fn download_torrent(&self, id: i64, use_token: bool) -> Result<Vec<u8>>;
+    async fn download_torrent_with_class(
+        &self,
+        id: i64,
+        use_token: bool,
+        _class: RequestClass,
+    ) -> Result<Vec<u8>> {
+        self.download_torrent(id, use_token).await
+    }
 }
 
 pub struct GazelleTrackerClient {
@@ -47,7 +90,8 @@ pub struct GazelleTrackerClient {
     base_url: Url,
     token: String,
     client: Client,
-    limiter: Arc<RateLimiter>,
+    governor: Option<ProviderGovernor>,
+    provider_id: String,
     kind: TrackerKind,
 }
 
@@ -59,40 +103,93 @@ impl GazelleTrackerClient {
             .user_agent(concat!("wotbox/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .build()?;
+        let provider_id = format!("tracker:{name}");
         Ok(Self {
             name,
             base_url,
             token: read_secret(&config.token_file)?,
             client,
-            limiter: Arc::new(RateLimiter::new(1, Duration::from_secs(2))),
+            governor: None,
+            provider_id,
             kind: config.kind,
         })
     }
 
-    async fn request(&self, action: &str, params: &[(&str, String)]) -> Result<Value> {
-        self.limiter.execute().await;
-        let endpoint = self.base_url.join("ajax.php")?;
-        let response = self
-            .client
-            .get(endpoint)
-            .header("Authorization", &self.token)
-            .query(&[("action", action)])
-            .query(params)
-            .send()
-            .await
-            .context("request tracker")?;
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            bail!("tracker_rate_limited");
+    pub fn governed(
+        name: String,
+        config: &TrackerConfig,
+        governor: ProviderGovernor,
+    ) -> Result<Self> {
+        let mut client = Self::new(name, config)?;
+        client.governor = Some(governor);
+        Ok(client)
+    }
+
+    async fn request(
+        &self,
+        action: &str,
+        params: &[(&str, String)],
+        class: RequestClass,
+    ) -> Result<Value> {
+        let operation = || async {
+            let endpoint = self
+                .base_url
+                .join("ajax.php")
+                .map_err(|error| ProviderFailure::new(ProviderFailureKind::Permanent, error))?;
+            let response = self
+                .client
+                .get(endpoint)
+                .header("Authorization", &self.token)
+                .query(&[("action", action)])
+                .query(params)
+                .send()
+                .await
+                .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
+            let status = response.status();
+            let retry = retry_after(&response);
+            let body: Value = response
+                .json()
+                .await
+                .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
+            let message = tracker_error(&body);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(
+                    ProviderFailure::new(ProviderFailureKind::RateLimited, message)
+                        .retry_after(retry),
+                );
+            }
+            if !status.is_success() {
+                let mut failure = ProviderFailure::from_message(format!(
+                    "tracker returned HTTP {status}: {message}"
+                ));
+                if failure.kind == ProviderFailureKind::Permanent {
+                    failure.kind =
+                        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                            ProviderFailureKind::Authentication
+                        } else if status.is_server_error() {
+                            ProviderFailureKind::Transient
+                        } else {
+                            ProviderFailureKind::Permanent
+                        };
+                }
+                return Err(failure);
+            }
+            if body.get("status").and_then(Value::as_str) != Some("success") {
+                return Err(ProviderFailure::from_message(format!(
+                    "tracker rejected request: {message}"
+                )));
+            }
+            Ok(body)
+        };
+        match &self.governor {
+            Some(governor) => governor
+                .execute(&self.provider_id, class, operation)
+                .await
+                .map_err(Into::into),
+            None => operation()
+                .await
+                .map_err(|failure| anyhow!(failure.message)),
         }
-        let status = response.status();
-        let body: Value = response.json().await.context("decode tracker response")?;
-        if !status.is_success() {
-            bail!("tracker returned HTTP {status}: {}", tracker_error(&body));
-        }
-        if body.get("status").and_then(Value::as_str) != Some("success") {
-            bail!("tracker rejected request: {}", tracker_error(&body));
-        }
-        Ok(body)
     }
 }
 
@@ -103,7 +200,9 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn account(&self) -> Result<(Account, Value)> {
-        let raw = self.request("index", &[]).await?;
+        let raw = self
+            .request("index", &[], RequestClass::Interactive)
+            .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         let stats = response.get("userstats").unwrap_or(&Value::Null);
         let account = Account {
@@ -121,6 +220,15 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn search(&self, request: &SearchRequest) -> Result<(SearchPage, Value)> {
+        self.search_with_class(request, RequestClass::Interactive)
+            .await
+    }
+
+    async fn search_with_class(
+        &self,
+        request: &SearchRequest,
+        class: RequestClass,
+    ) -> Result<(SearchPage, Value)> {
         let mut params = Vec::new();
         push(&mut params, "searchstr", request.query.as_ref());
         push(&mut params, "artistname", request.artist.as_ref());
@@ -134,7 +242,7 @@ impl TrackerClient for GazelleTrackerClient {
         if let Some(page) = request.page {
             params.push(("page", page.to_string()));
         }
-        let raw = self.request("browse", &params).await?;
+        let raw = self.request("browse", &params, class).await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         let groups = response
             .get("results")
@@ -162,7 +270,18 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn artist_catalog(&self, id: i64) -> Result<(ArtistCatalogPage, Value)> {
-        let raw = self.request("artist", &[("id", id.to_string())]).await?;
+        self.artist_catalog_with_class(id, RequestClass::Interactive)
+            .await
+    }
+
+    async fn artist_catalog_with_class(
+        &self,
+        id: i64,
+        class: RequestClass,
+    ) -> Result<(ArtistCatalogPage, Value)> {
+        let raw = self
+            .request("artist", &[("id", id.to_string())], class)
+            .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         Ok((
             normalize_artist_catalog(&self.name, self.kind, id, &response)?,
@@ -171,8 +290,16 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn group(&self, id: i64) -> Result<(ReleaseDetail, Value)> {
+        self.group_with_class(id, RequestClass::Interactive).await
+    }
+
+    async fn group_with_class(
+        &self,
+        id: i64,
+        class: RequestClass,
+    ) -> Result<(ReleaseDetail, Value)> {
         let raw = self
-            .request("torrentgroup", &[("id", id.to_string())])
+            .request("torrentgroup", &[("id", id.to_string())], class)
             .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         Ok((
@@ -182,7 +309,17 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn torrent(&self, id: i64) -> Result<(TorrentMetadata, CanonicalTorrent, Value)> {
-        let raw = self.request("torrent", &[("id", id.to_string())]).await?;
+        self.torrent_with_class(id, RequestClass::Interactive).await
+    }
+
+    async fn torrent_with_class(
+        &self,
+        id: i64,
+        class: RequestClass,
+    ) -> Result<(TorrentMetadata, CanonicalTorrent, Value)> {
+        let raw = self
+            .request("torrent", &[("id", id.to_string())], class)
+            .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         let torrent = response.get("torrent").unwrap_or(&response);
         let group = response.get("group").unwrap_or(&Value::Null);
@@ -207,9 +344,18 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn torrent_by_hash(&self, info_hash: &str) -> Result<(CanonicalTorrent, Value)> {
+        self.torrent_by_hash_with_class(info_hash, RequestClass::Interactive)
+            .await
+    }
+
+    async fn torrent_by_hash_with_class(
+        &self,
+        info_hash: &str,
+        class: RequestClass,
+    ) -> Result<(CanonicalTorrent, Value)> {
         let requested_hash = info_hash.to_ascii_uppercase();
         let raw = self
-            .request("torrent", &[("hash", requested_hash.clone())])
+            .request("torrent", &[("hash", requested_hash.clone())], class)
             .await?;
         let response = raw.get("response").cloned().unwrap_or(Value::Null);
         let canonical = normalize_canonical_torrent(
@@ -223,36 +369,77 @@ impl TrackerClient for GazelleTrackerClient {
     }
 
     async fn download_torrent(&self, id: i64, use_token: bool) -> Result<Vec<u8>> {
-        self.limiter.execute().await;
-        let endpoint = self.base_url.join("ajax.php")?;
-        let mut query = vec![("action", "download".to_owned()), ("id", id.to_string())];
-        if use_token {
-            query.push(("usetoken", "1".to_owned()));
-        }
-        let response = self
-            .client
-            .get(endpoint)
-            .header("Authorization", &self.token)
-            .query(&query)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            bail!(
-                "tracker torrent download returned HTTP {}",
-                response.status()
-            );
-        }
-        let bytes = response.bytes().await?;
-        if bytes.is_empty() || bytes.first() != Some(&b'd') {
-            if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
-                bail!(
-                    "tracker rejected torrent download: {}",
-                    tracker_error(&body)
-                );
+        self.download_torrent_with_class(id, use_token, RequestClass::Download)
+            .await
+    }
+
+    async fn download_torrent_with_class(
+        &self,
+        id: i64,
+        use_token: bool,
+        class: RequestClass,
+    ) -> Result<Vec<u8>> {
+        let operation = || async {
+            let endpoint = self
+                .base_url
+                .join("ajax.php")
+                .map_err(|error| ProviderFailure::new(ProviderFailureKind::Permanent, error))?;
+            let mut query = vec![("action", "download".to_owned()), ("id", id.to_string())];
+            if use_token {
+                query.push(("usetoken", "1".to_owned()));
             }
-            bail!("tracker returned an invalid torrent payload");
+            let response = self
+                .client
+                .get(endpoint)
+                .header("Authorization", &self.token)
+                .query(&query)
+                .send()
+                .await
+                .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
+            let status = response.status();
+            let retry = retry_after(&response);
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
+            if !status.is_success() {
+                let message = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .map(|body| tracker_error(&body))
+                    .unwrap_or_else(|| format!("tracker torrent download returned HTTP {status}"));
+                let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                    ProviderFailureKind::RateLimited
+                } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                    ProviderFailureKind::Authentication
+                } else if status.is_server_error() {
+                    ProviderFailureKind::Transient
+                } else {
+                    ProviderFailure::from_message(&message).kind
+                };
+                return Err(ProviderFailure::new(kind, message).retry_after(retry));
+            }
+            if bytes.is_empty() || bytes.first() != Some(&b'd') {
+                let message = if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                    format!(
+                        "tracker rejected torrent download: {}",
+                        tracker_error(&body)
+                    )
+                } else {
+                    "tracker returned an invalid torrent payload".into()
+                };
+                return Err(ProviderFailure::from_message(message));
+            }
+            Ok(bytes.to_vec())
+        };
+        match &self.governor {
+            Some(governor) => governor
+                .execute(&self.provider_id, class, operation)
+                .await
+                .map_err(Into::into),
+            None => operation()
+                .await
+                .map_err(|failure| anyhow!(failure.message)),
         }
-        Ok(bytes.to_vec())
     }
 }
 
@@ -414,6 +601,7 @@ fn normalize_search_torrent(tracker: &str, value: &Value) -> Option<SearchTorren
         freeleech: leech_status.has_no_download_debit(),
         leech_status,
         can_use_token: value_bool(value, &["canUseToken", "can_use_token"]),
+        eligibility: None,
         remaster_title: value_string(value, &["remasterTitle"]),
         info_hash: value_string(value, &["infoHash", "info_hash"])
             .map(|hash| hash.to_ascii_lowercase()),

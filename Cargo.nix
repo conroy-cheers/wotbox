@@ -2203,25 +2203,6 @@ rec {
         sha256 = "0w75k89hw39p0mnnhlrwr23q50rza1yjki44qvh2mgrnj065a1qx";
 
       };
-      "colored" = rec {
-        crateName = "colored";
-        version = "3.1.1";
-        edition = "2021";
-        sha256 = "0d5cpbgvyvmmky199s885s6385ykd75q6qg3d2kcxjxq563ldygs";
-        authors = [
-          "Thomas Wickham <mackwic@gmail.com>"
-        ];
-        dependencies = [
-          {
-            name = "windows-sys";
-            packageId = "windows-sys 0.61.2";
-            target = { target, features }: (target."windows" or false);
-            features = [ "Win32_Foundation" "Win32_System_Console" ];
-          }
-        ];
-        features = {
-        };
-      };
       "combine" = rec {
         crateName = "combine";
         version = "4.6.7";
@@ -3752,84 +3733,6 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "async-await" "async-await-macro" "channel" "default" "futures-channel" "futures-io" "futures-macro" "futures-sink" "io" "memchr" "sink" "slab" "std" ];
       };
-      "gazelle_api" = rec {
-        crateName = "gazelle_api";
-        version = "0.25.0";
-        edition = "2024";
-        sha256 = "13c77642b7pr9r8y47wi8vxpxhp55ygw95v5s2l8rcfn0v14b7pq";
-        authors = [
-          "RogueOneEcho"
-        ];
-        dependencies = [
-          {
-            name = "async-trait";
-            packageId = "async-trait";
-          }
-          {
-            name = "html-escape";
-            packageId = "html-escape";
-          }
-          {
-            name = "log";
-            packageId = "log";
-            features = [ "std" ];
-          }
-          {
-            name = "miette";
-            packageId = "miette";
-          }
-          {
-            name = "regex";
-            packageId = "regex";
-          }
-          {
-            name = "reqwest";
-            packageId = "reqwest";
-            usesDefaultFeatures = false;
-            features = [ "rustls" "json" "multipart" "stream" ];
-          }
-          {
-            name = "rogue_logging";
-            packageId = "rogue_logging";
-            features = [ "log" ];
-          }
-          {
-            name = "serde";
-            packageId = "serde";
-            features = [ "derive" ];
-          }
-          {
-            name = "serde_json";
-            packageId = "serde_json";
-          }
-          {
-            name = "serde_yaml";
-            packageId = "serde_yaml";
-          }
-          {
-            name = "thiserror";
-            packageId = "thiserror";
-          }
-          {
-            name = "tokio";
-            packageId = "tokio";
-            features = [ "full" ];
-          }
-          {
-            name = "urlencoding";
-            packageId = "urlencoding";
-          }
-        ];
-        devDependencies = [
-          {
-            name = "rogue_logging";
-            packageId = "rogue_logging";
-          }
-        ];
-        features = {
-        };
-        resolvedDefaultFeatures = [ "default" ];
-      };
       "generic-array" = rec {
         crateName = "generic-array";
         version = "0.14.7";
@@ -4414,20 +4317,6 @@ rec {
         features = {
           "zeroize" = [ "digest/zeroize" ];
         };
-      };
-      "html-escape" = rec {
-        crateName = "html-escape";
-        version = "0.2.14";
-        edition = "2021";
-        sha256 = "17iq6ycj6l2a1kml8xd1awayddb9l3ccw009mzjyyfdz3hnzzha6";
-        libName = "html_escape";
-        authors = [
-          "Magic Len <len@magiclen.org>"
-        ];
-        features = {
-          "default" = [ "std" ];
-        };
-        resolvedDefaultFeatures = [ "default" "std" ];
       };
       "http" = rec {
         crateName = "http";
@@ -6185,67 +6074,6 @@ rec {
         features = {
         };
         resolvedDefaultFeatures = [ "default" ];
-      };
-      "miette" = rec {
-        crateName = "miette";
-        version = "7.6.0";
-        edition = "2018";
-        sha256 = "1dwjnnpcff4jzpf5ns1m19di2p0n5j31zmjv5dskrih7i3nfz62z";
-        authors = [
-          "Kat Marchán <kzm@zkat.tech>"
-        ];
-        dependencies = [
-          {
-            name = "cfg-if";
-            packageId = "cfg-if";
-          }
-          {
-            name = "miette-derive";
-            packageId = "miette-derive";
-            optional = true;
-          }
-          {
-            name = "unicode-width";
-            packageId = "unicode-width";
-          }
-        ];
-        features = {
-          "default" = [ "derive" ];
-          "derive" = [ "dep:miette-derive" ];
-          "fancy" = [ "fancy-no-backtrace" "dep:backtrace" "dep:backtrace-ext" ];
-          "fancy-base" = [ "dep:owo-colors" "dep:textwrap" ];
-          "fancy-no-backtrace" = [ "fancy-base" "dep:terminal_size" "dep:supports-hyperlinks" "dep:supports-color" "dep:supports-unicode" ];
-          "fancy-no-syscall" = [ "fancy-base" ];
-          "serde" = [ "dep:serde" ];
-          "syntect-highlighter" = [ "fancy-no-backtrace" "dep:syntect" ];
-        };
-        resolvedDefaultFeatures = [ "default" "derive" ];
-      };
-      "miette-derive" = rec {
-        crateName = "miette-derive";
-        version = "7.6.0";
-        edition = "2018";
-        sha256 = "12w13a67n2cc37nzidvv0v0vrvf4rsflzxz6slhbn3cm9rqjjnyv";
-        procMacro = true;
-        libName = "miette_derive";
-        authors = [
-          "Kat Marchán <kzm@zkat.tech>"
-        ];
-        dependencies = [
-          {
-            name = "proc-macro2";
-            packageId = "proc-macro2";
-          }
-          {
-            name = "quote";
-            packageId = "quote";
-          }
-          {
-            name = "syn";
-            packageId = "syn 2.0.119";
-          }
-        ];
-
       };
       "mime" = rec {
         crateName = "mime";
@@ -8294,48 +8122,6 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" ];
       };
-      "rogue_logging" = rec {
-        crateName = "rogue_logging";
-        version = "0.7.3";
-        edition = "2021";
-        sha256 = "1rglic7v0p82cxk5xz6zv45j3216gwgmqrsabh1hi6gzvc7hbd4a";
-        authors = [
-          "RogueOneEcho"
-        ];
-        dependencies = [
-          {
-            name = "chrono";
-            packageId = "chrono";
-          }
-          {
-            name = "clap";
-            packageId = "clap";
-            features = [ "derive" ];
-          }
-          {
-            name = "colored";
-            packageId = "colored";
-            optional = true;
-          }
-          {
-            name = "log";
-            packageId = "log";
-            optional = true;
-            features = [ "std" ];
-          }
-          {
-            name = "serde";
-            packageId = "serde";
-            features = [ "derive" ];
-          }
-        ];
-        features = {
-          "log" = [ "dep:log" "dep:colored" ];
-          "miette" = [ "dep:miette" ];
-          "miette-fancy" = [ "miette" "miette/fancy" "dep:owo-colors" ];
-        };
-        resolvedDefaultFeatures = [ "log" ];
-      };
       "rust_decimal" = rec {
         crateName = "rust_decimal";
         version = "1.42.1";
@@ -10163,38 +9949,6 @@ rec {
           {
             name = "serde";
             packageId = "serde";
-          }
-        ];
-
-      };
-      "serde_yaml" = rec {
-        crateName = "serde_yaml";
-        version = "0.9.34+deprecated";
-        edition = "2021";
-        sha256 = "0isba1fjyg3l6rxk156k600ilzr8fp7crv82rhal0rxz5qd1m2va";
-        authors = [
-          "David Tolnay <dtolnay@gmail.com>"
-        ];
-        dependencies = [
-          {
-            name = "indexmap";
-            packageId = "indexmap";
-          }
-          {
-            name = "itoa";
-            packageId = "itoa";
-          }
-          {
-            name = "ryu";
-            packageId = "ryu";
-          }
-          {
-            name = "serde";
-            packageId = "serde";
-          }
-          {
-            name = "unsafe-libyaml";
-            packageId = "unsafe-libyaml";
           }
         ];
 
@@ -13275,25 +13029,6 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "emoji" "general-category" ];
       };
-      "unicode-width" = rec {
-        crateName = "unicode-width";
-        version = "0.1.14";
-        edition = "2021";
-        sha256 = "1bzn2zv0gp8xxbxbhifw778a7fc93pa6a1kj24jgg9msj07f7mkx";
-        libName = "unicode_width";
-        authors = [
-          "kwantam <kwantam@gmail.com>"
-          "Manish Goregaokar <manishsmail@gmail.com>"
-        ];
-        features = {
-          "compiler_builtins" = [ "dep:compiler_builtins" ];
-          "core" = [ "dep:core" ];
-          "default" = [ "cjk" ];
-          "rustc-dep-of-std" = [ "std" "core" "compiler_builtins" ];
-          "std" = [ "dep:std" ];
-        };
-        resolvedDefaultFeatures = [ "cjk" "default" ];
-      };
       "unicode-xid" = rec {
         crateName = "unicode-xid";
         version = "0.2.6";
@@ -13308,18 +13043,6 @@ rec {
         features = {
         };
         resolvedDefaultFeatures = [ "default" ];
-      };
-      "unsafe-libyaml" = rec {
-        crateName = "unsafe-libyaml";
-        version = "0.2.11";
-        edition = "2021";
-        crateBin = [];
-        sha256 = "0qdq69ffl3v5pzx9kzxbghzn0fzn266i1xn70y88maybz9csqfk7";
-        libName = "unsafe_libyaml";
-        authors = [
-          "David Tolnay <dtolnay@gmail.com>"
-        ];
-
       };
       "untrusted" = rec {
         crateName = "untrusted";
@@ -13377,17 +13100,6 @@ rec {
           "std" = [ "idna/std" "percent-encoding/std" "form_urlencoded/std" "serde?/std" ];
         };
         resolvedDefaultFeatures = [ "default" "std" ];
-      };
-      "urlencoding" = rec {
-        crateName = "urlencoding";
-        version = "2.1.3";
-        edition = "2021";
-        sha256 = "1nj99jp37k47n0hvaz5fvz7z6jd0sb4ppvfy3nphr1zbnyixpy6s";
-        authors = [
-          "Kornel <kornel@geekhood.net>"
-          "Bertram Truong <b@bertramtruong.com>"
-        ];
-
       };
       "utf8_iter" = rec {
         crateName = "utf8_iter";
@@ -15497,10 +15209,6 @@ rec {
           {
             name = "dotenvy";
             packageId = "dotenvy";
-          }
-          {
-            name = "gazelle_api";
-            packageId = "gazelle_api";
           }
           {
             name = "hex";

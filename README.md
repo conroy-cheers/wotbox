@@ -22,9 +22,14 @@ field provenance, sanitized snapshots, and local download state.
   only the normalized announce hostname for tracker routing and attaches live
   transfer state to releases resolved from the tracker by info hash.
 
-The `gazelle_api` crate is used for its tracker rate limiter. Its higher-level
-models are not used as the public Wotbox contract because Gazelle trackers
-expose small response differences. Each adapter normalizes its source while
+Every external request passes through Wotbox's provider governor. Tracker,
+Last.fm, Apple, and qBittorrent limits are enforced across interactive,
+download, scheduled, and background work; retries cannot bypass the same
+queue. Rate-limit cooldowns, hard blocks, manual pauses, and failure history
+are persisted in SQLite. Hard blocks require an explicit resume in
+Preferences, while expired cooldowns allow one half-open probe. Wotbox also
+holds an exclusive lock beside the SQLite database so two processes cannot
+silently double the request rate. Each adapter normalizes its source while
 retaining a sanitized payload. Releases and artists have local UUIDs;
 high-confidence matches merge automatically, borderline matches enter Match
 Review, and rejected pairs stay separate. Metadata fields are selected by
@@ -78,7 +83,7 @@ query-backed state:
 - `/releases/{releaseId}` — canonical release detail, selected torrent,
   exact live client attachment, expanded variants, and source context
 - `/matches` — review ambiguous artist and release matches
-- `/preferences` — runtime release preferences
+- `/preferences` — runtime release, channel, and external API safety preferences
 
 The embedded server returns the SPA shell for these routes so they can be
 loaded directly. Unknown paths render the Wotbox 404 view and carry an HTTP
@@ -181,15 +186,34 @@ Recommendation Channels turn external album discovery into reviewable,
 historical packs. The country chart channel reads Apple's country-specific Top
 100 Albums feed; the Last.fm channel expands recent top artists through
 similar artists and their leading albums. Each channel has its own weekly,
-timezone-aware schedule. Refreshing resolves Albums and EPs against configured
+timezone-aware schedule and is disabled until explicitly enabled or manually
+refreshed. Refreshing resolves Albums and EPs against configured
 trackers and creates a plan under the normal quality, tracker, freeleech, and
 token rules, but never downloads automatically. A user may accept every
-executable plan item, reject the batch while retaining it in history, or add
-individual releases through the normal confirmation dialog.
+executable plan item or a selected subset, reject the batch while retaining it
+in history, attach a manually found Album/EP to an unresolved recommendation,
+or add individual releases through the normal confirmation dialog. Pack
+planning removes duplicate releases, observes per-tracker automatic-token
+limits, uses an explicit tracker download profile, and excludes items that
+would exceed the download client's currently reported free space. Token limits
+count actual tracker charges: OPS rounds each torrent up at one token per 320
+MiB, while RED uses one token for each eligible torrent.
 
-Channel settings live in Preferences. The Last.fm API key remains a file-based
+Channel and provider settings live in Preferences. Provider limits may only be
+made more conservative than the built-in defaults; the status cards expose
+queues, cooldowns, blocks, last success, pause, and cautious resume controls.
+When a provider is unavailable, cached snapshots remain usable and the global
+banner links back to those controls. Tracker Search uses fresh or stale cached
+results when possible and redirects to the locally indexed Library when every
+tracker is unavailable.
+
+The Last.fm API key remains a file-based
 secret configured with `lastfm_api_key_file`; environment-based development
-may instead provide `LASTFM_API_KEY`.
+may instead provide `LASTFM_API_KEY`. The recommendation methods are read-only
+and do not use a Last.fm shared secret. A source request is attempted once;
+provider cooldowns and the channel scheduler own any later retry so nested
+backoff loops cannot amplify traffic. Failed scheduled refreshes receive an
+exponential scheduler retry and remain visible on the Channels page.
 
 `flake.nix` exports the packaged service, the separately buildable frontend,
 the development shell, and `nixosModules.default`. See

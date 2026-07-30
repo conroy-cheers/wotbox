@@ -8,6 +8,7 @@
   } from "./api";
   import {
     defaultReleasePreferences,
+    isMediaAllowed,
     isQualityAllowed,
     rankVariants,
     type DisplayVariant
@@ -59,8 +60,13 @@
     return "library" in variant ? variant.library : undefined;
   }
 
+  function tokenCost(variant: DisplayVariant): number | undefined {
+    return "eligibility" in variant ? variant.eligibility?.tokenCost : undefined;
+  }
+
   function isDownloadable(variant: DisplayVariant): boolean {
     if (!isQualityAllowed(variant, policy)) return false;
+    if (!isMediaAllowed(variant, policy)) return false;
     if ("eligibility" in variant && variant.eligibility) return variant.eligibility.eligible;
     const variantTracker = variant.tracker ?? tracker;
     const trackerPolicy = policyFor(variantTracker);
@@ -74,7 +80,12 @@
   function policyFor(variantTracker: string) {
     return policy.trackerPolicies.find((candidate) =>
       candidate.tracker.toLowerCase() === variantTracker.toLowerCase()
-    ) ?? { tracker: variantTracker, mode: "freeleech_only" as const, autoUseTokens: false };
+    ) ?? {
+      tracker: variantTracker,
+      mode: "freeleech_only" as const,
+      autoUseTokens: false,
+      autoTokenLimit: 0
+    };
   }
 
   function policyBlockExplanation(variant: DisplayVariant): string {
@@ -91,6 +102,8 @@
       explanation = `${trackerLabel} is set to “Already free only”, and this torrent is not freeleech.`;
     } else if (reason === "token_unavailable") {
       explanation = `${trackerLabel} is set to “Free or token”, but this torrent cannot use a freeleech token.`;
+    } else if (reason === "token_cost_unknown") {
+      explanation = `${trackerLabel} token cost cannot be calculated because the torrent size is unavailable.`;
     } else {
       explanation = `This ${trackerLabel} torrent does not satisfy the current download-cost policy.`;
     }
@@ -149,6 +162,7 @@
 
 {#snippet variantRow(variant: DisplayVariant, isPreferred = false, showToggle = false)}
   {@const qualityAllowed = isQualityAllowed(variant, policy)}
+  {@const mediaAllowed = isMediaAllowed(variant, policy)}
   {@const allowed = isDownloadable(variant)}
   {@const library = libraryState(variant)}
   {@const policyTooltipId = `policy-${variant.tracker ?? tracker}-${variant.torrentId}`}
@@ -169,7 +183,8 @@
     <span class="peer-count" title="Seeders"><Users size={14} /> {variant.seeders ?? 0}</span>
     <div class="torrent-flags">
       {#if isPreferred && allowed}<span class="preferred-badge">Preferred</span>{/if}
-      {#if !qualityAllowed}<span class="cutoff-badge">Below cutoff</span>
+      {#if !qualityAllowed}<span class="cutoff-badge">Quality rejected</span>
+      {:else if !mediaAllowed}<span class="cutoff-badge">Media rejected</span>
       {:else if !allowed}
         <span class="policy-tooltip">
           <button
@@ -183,6 +198,14 @@
         </span>
       {/if}
       {#if variant.freeleech}<span class="free-badge">Free</span>{/if}
+      {#if !variant.freeleech}
+        {@const cost = tokenCost(variant)}
+        {#if cost !== undefined}
+          <span class="token-badge">
+            {cost} {cost === 1 ? "token" : "tokens"}
+          </span>
+        {/if}
+      {/if}
       {#if library?.availability === "present"}<span class="library-badge">In Library</span>{/if}
       {#if library?.availability === "missing"}<span class="missing-badge">Missing</span>{/if}
     </div>

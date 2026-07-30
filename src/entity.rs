@@ -462,9 +462,16 @@ pub mod channel_run {
         pub channel_id: String,
         pub trigger: String,
         pub status: String,
+        pub phase: Option<String>,
+        #[sea_orm(default_value = 0)]
+        pub progress_completed: i32,
+        pub progress_total: Option<i32>,
+        pub progress_message: Option<String>,
         pub pack_id: Option<String>,
         pub error: Option<String>,
         pub started_at: String,
+        #[sea_orm(default_value = "")]
+        pub updated_at: String,
         pub finished_at: Option<String>,
     }
 
@@ -585,6 +592,38 @@ pub mod single_album_coverage {
         pub state: String,
         #[sea_orm(column_type = "Json", nullable)]
         pub coverage_json: Option<Json>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod provider_state {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "provider_states")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub display_name: String,
+        pub kind: String,
+        pub state: String,
+        pub reason_code: Option<String>,
+        pub message: Option<String>,
+        pub last_request_at: Option<String>,
+        pub last_success_at: Option<String>,
+        pub last_failure_at: Option<String>,
+        pub retry_at: Option<String>,
+        #[sea_orm(default_value = 0)]
+        pub consecutive_failures: i64,
+        #[sea_orm(default_value = 0)]
+        pub minimum_interval_ms: i64,
+        #[sea_orm(default_value = 1)]
+        pub max_concurrency: i64,
         pub updated_at: String,
     }
 

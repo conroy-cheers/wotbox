@@ -8,8 +8,9 @@ use crate::entity::{
     artist_source, canonical_alias, canonical_artist, canonical_backfill_state, canonical_release,
     canonical_release_artist, canonical_release_credit, canonical_torrent, channel_config,
     channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership, download_client_scan,
-    download_event, download_job, download_release_link, match_candidate, release_source,
-    release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
+    download_event, download_job, download_release_link, match_candidate, provider_state,
+    release_source, release_track_index, runtime_preference, single_album_coverage,
+    tracker_snapshot,
 };
 
 pub struct Migrator;
@@ -21,7 +22,58 @@ impl MigratorTrait for Migrator {
             Box::new(InitialSchema),
             Box::new(CanonicalIdentitySchema),
             Box::new(ChannelSchema),
+            Box::new(ChannelProgressSchema),
+            Box::new(ProviderSafetySchema),
         ]
+    }
+}
+
+struct ProviderSafetySchema;
+
+impl MigrationName for ProviderSafetySchema {
+    fn name(&self) -> &str {
+        "m20260730_000005_provider_safety"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ProviderSafetySchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, provider_state::Entity).await
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+struct ChannelProgressSchema;
+
+impl MigrationName for ChannelProgressSchema {
+    fn name(&self) -> &str {
+        "m20260730_000004_channel_progress"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ChannelProgressSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        for column in [
+            channel_run::Column::Phase,
+            channel_run::Column::ProgressCompleted,
+            channel_run::Column::ProgressTotal,
+            channel_run::Column::ProgressMessage,
+            channel_run::Column::UpdatedAt,
+        ] {
+            add_column_if_missing(manager, &schema, channel_run::Entity, column).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

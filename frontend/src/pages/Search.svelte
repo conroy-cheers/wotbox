@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { createQuery } from "@tanstack/svelte-query";
+  import { createMutation, createQuery } from "@tanstack/svelte-query";
   import { derived, writable } from "svelte/store";
-  import { Disc3, Search as SearchIcon, SlidersHorizontal } from "@lucide/svelte";
-  import { api, appPath, type Envelope, type PublicConfig, type SearchGroup, type SearchPage, type SearchTorrent } from "../lib/api";
+  import { Check, Disc3, Search as SearchIcon, SlidersHorizontal } from "@lucide/svelte";
+  import { api, ApiError, appPath, type ChannelPack, type Envelope, type PublicConfig, type SearchGroup, type SearchPage, type SearchTorrent } from "../lib/api";
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
@@ -43,6 +43,9 @@
   let showRedundantSingles = $state(initial.get("covered") === "1");
   let expandedGroups = $state(integerSet(initial, "expanded"));
   const requestedAddTorrent = optionalPositiveInteger(initial, "add");
+  const channelPack = initial.get("pack") ?? "";
+  const channelItem = optionalPositiveInteger(initial, "item");
+  const channelPlanVersion = optionalPositiveInteger(initial, "version");
 
   const config = createQuery({
     queryKey: ["config"],
@@ -61,11 +64,21 @@
     return {
       queryKey: ["search", values],
       queryFn: () => api<Envelope<SearchPage>>(`/api/v1/search?${params}`),
-      enabled: Boolean(values.submitted),
-      refetchInterval: 5_000
+      enabled: Boolean(values.submitted)
     };
   });
   const results = createQuery(resultOptions);
+  const attach = createMutation({
+    mutationFn: (releaseId: string) =>
+      api<ChannelPack>(`/api/v1/channel-packs/${channelPack}/items/${channelItem}/attach`, {
+        method: "POST",
+        body: JSON.stringify({
+          planVersion: channelPlanVersion,
+          releaseId
+        })
+      }),
+    onSuccess: (pack) => navigateView(`/channels/${pack.channelId}/packs/${pack.id}`)
+  });
 
   function viewQuery(overrides: ViewQuery = {}): ViewQuery {
     return {
@@ -78,6 +91,9 @@
       page: initialValues.page > 1 ? initialValues.page : undefined,
       covered: showRedundantSingles,
       expanded: [...expandedGroups],
+      pack: channelPack || undefined,
+      item: channelItem,
+      version: channelPlanVersion,
       ...overrides
     };
   }
@@ -128,6 +144,19 @@
         selected = { group, torrent };
         break;
       }
+    }
+  });
+
+  $effect(() => {
+    if (
+      $results.error instanceof ApiError
+      && ["all_trackers_unavailable", "tracker_unavailable", "provider_unavailable"].includes(
+        $results.error.code ?? ""
+      )
+    ) {
+      const params = new URLSearchParams();
+      if (query) params.set("q", query);
+      location.assign(appPath(`/library${params.size ? `?${params}` : ""}`));
     }
   });
 </script>
@@ -183,6 +212,13 @@
 </form>
 
 <StaleNotice provenance={$results.data?.provenance} />
+
+{#if channelPack && channelItem && channelPlanVersion}
+  <div class="notice-banner">
+    Select an Album or EP below to attach it to the recommendation pack.
+  </div>
+{/if}
+{#if $attach.isError}<div class="error-panel">{$attach.error.message}</div>{/if}
 
 {#if $results.data?.data.sourceStatus.some((source) => source.state !== "ready")}
   <div class="notice-banner">
@@ -269,6 +305,15 @@
               {#each group.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}
             </div>
           </div>
+          {#if channelPack && channelItem && channelPlanVersion && group.id}
+            <div class="channel-attach-action">
+              <button
+                class="secondary-button compact-button"
+                disabled={$attach.isPending}
+                onclick={() => group.id && $attach.mutate(group.id)}
+              ><Check size={14} /> {$attach.isPending ? "Attaching…" : "Use for recommendation"}</button>
+            </div>
+          {/if}
           <PreferredVariants
             variants={group.torrents}
             releaseId={group.id}

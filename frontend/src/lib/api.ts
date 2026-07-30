@@ -57,6 +57,7 @@ export type SearchTorrent = {
   freeleech: boolean;
   leechStatus?: LeechStatus;
   canUseToken: boolean;
+  eligibility?: DownloadEligibility;
   remasterTitle?: string;
   infoHash?: string;
   downloads: LiveDownloadStatus[];
@@ -195,9 +196,12 @@ export type DownloadEligibility = {
     | "tracker_disabled"
     | "freeleech_required"
     | "token_unavailable"
-    | "below_quality_cutoff";
+    | "token_cost_unknown"
+    | "below_quality_cutoff"
+    | "below_media_cutoff";
   requiresToken: boolean;
   tokenAvailable: boolean;
+  tokenCost?: number;
 };
 
 export type ArtistCredit = {
@@ -408,11 +412,14 @@ export type CreateDownload = {
 };
 
 export type QualityPreference = "hi_res" | "lossless" | "320" | "v0" | "other";
+export type VariantSortCriterion = "quality" | "tracker" | "media" | "edition";
 
 export type ReleasePreferences = {
-  qualityOrder: QualityPreference[];
-  minimumQuality: QualityPreference;
+  qualityTiers: QualityPreference[][];
+  qualityCutoffIndex: number;
   mediaTiers: string[][];
+  mediaCutoffIndex: number;
+  variantSortOrder: VariantSortCriterion[];
   trackerOrder: string[];
   trackerPolicies: TrackerPreference[];
 };
@@ -427,10 +434,56 @@ export type TrackerPreference = {
   tracker: string;
   mode: TrackerDownloadMode;
   autoUseTokens: boolean;
+  downloadProfile?: string;
+  autoTokenLimit: number;
 };
 
 export type RuntimePreferences = {
   release: ReleasePreferences;
+  api: ApiPreferences;
+};
+
+export type ApiPreferences = {
+  providers: Record<string, ProviderPolicyOverride>;
+};
+
+export type ProviderPolicyOverride = {
+  minimumIntervalMs?: number;
+  maxConcurrency?: number;
+};
+
+export type ProviderCircuitState =
+  | "available"
+  | "cooldown"
+  | "half_open"
+  | "blocked"
+  | "paused";
+
+export type ProviderStatus = {
+  id: string;
+  displayName: string;
+  kind: string;
+  state: ProviderCircuitState;
+  reasonCode?: string;
+  message?: string;
+  lastRequestAt?: string;
+  lastSuccessAt?: string;
+  lastFailureAt?: string;
+  retryAt?: string;
+  consecutiveFailures: number;
+  minimumIntervalMs: number;
+  safeMinimumIntervalMs: number;
+  maxConcurrency: number;
+  safeMaxConcurrency: number;
+  queued: {
+    interactive: number;
+    download: number;
+    manual: number;
+    scheduled: number;
+    background: number;
+  };
+  canPause: boolean;
+  canResume: boolean;
 };
 
 export type ChannelKind = "country_chart" | "lastfm";
@@ -452,12 +505,14 @@ export type ChannelConfig = {
     period: "7day" | "1month" | "3month" | "6month" | "12month" | "overall";
     packSize: number;
     suppressionPacks: number;
+    catalogCountry: string;
   };
   credentialConfigured: boolean;
   nextRefreshAt?: string;
   lastSuccessfulAt?: string;
   lastAttemptAt?: string;
   lastError?: string;
+  failureCount: number;
   updatedAt: string;
 };
 
@@ -466,9 +521,14 @@ export type ChannelRun = {
   channelId: string;
   trigger: "scheduled" | "manual";
   status: "running" | "successful" | "partial" | "failed";
+  phase?: "discovering" | "matching" | "planning" | "saving";
+  progressCompleted: number;
+  progressTotal?: number;
+  progressMessage?: string;
   packId?: string;
   error?: string;
   startedAt: string;
+  updatedAt: string;
   finishedAt?: string;
 };
 
@@ -510,6 +570,13 @@ export type ChannelPackItem = {
     url?: string;
     mbid?: string;
     score?: number;
+    catalogCountry?: string;
+    substitutedFrom?: {
+      title: string;
+      url?: string;
+      mbid?: string;
+      releaseType: string;
+    };
   };
   matchState: "matched" | "unmatched" | "ambiguous" | "error";
   release?: ReleaseSummary;
@@ -518,6 +585,10 @@ export type ChannelPackItem = {
     | "executable"
     | "already_owned"
     | "already_downloading"
+    | "duplicate"
+    | "token_budget_exceeded"
+    | "capacity_blocked"
+    | "excluded"
     | "unmatched"
     | "ambiguous"
     | "policy_blocked"
@@ -529,6 +600,7 @@ export type ChannelPackItem = {
     torrentId: number;
     profile: string;
     useToken: boolean;
+    tokenCost: number;
     size?: number;
     format?: string;
     encoding?: string;
@@ -571,6 +643,18 @@ export type DownloadSelection = {
 const configuredBase = window.__WOTBOX_CONFIG__?.basePath ?? "";
 export const basePath = configuredBase === "/" ? "" : configuredBase;
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly retryable = false
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export function appPath(path = "/"): string {
   return `${basePath}${path}`;
 }
@@ -587,7 +671,12 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message = body?.error?.message ?? `Request failed with HTTP ${response.status}`;
-    throw new Error(message);
+    throw new ApiError(
+      message,
+      response.status,
+      body?.error?.code,
+      Boolean(body?.error?.retryable)
+    );
   }
   return body as T;
 }

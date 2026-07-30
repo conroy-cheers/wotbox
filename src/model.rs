@@ -19,6 +19,14 @@ pub struct TrackerPreference {
     pub tracker: String,
     pub mode: TrackerDownloadMode,
     pub auto_use_tokens: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_profile: Option<String>,
+    #[serde(default = "default_auto_token_limit")]
+    pub auto_token_limit: u32,
+}
+
+fn default_auto_token_limit() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
@@ -45,7 +53,9 @@ pub enum DownloadEligibilityReason {
     TrackerDisabled,
     FreeleechRequired,
     TokenUnavailable,
+    TokenCostUnknown,
     BelowQualityCutoff,
+    BelowMediaCutoff,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -55,6 +65,8 @@ pub struct DownloadEligibility {
     pub reason: DownloadEligibilityReason,
     pub requires_token: bool,
     pub token_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cost: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -196,6 +208,8 @@ pub struct SearchTorrent {
     #[serde(default)]
     pub leech_status: LeechStatus,
     pub can_use_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility: Option<DownloadEligibility>,
     pub remaster_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info_hash: Option<String>,
@@ -236,16 +250,72 @@ pub struct CreateDownload {
     pub use_token: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantSortCriterion {
+    Quality,
+    Tracker,
+    Media,
+    Edition,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleasePreferences {
-    pub quality_order: Vec<String>,
-    pub minimum_quality: String,
+    #[serde(default = "default_quality_tiers")]
+    pub quality_tiers: Vec<Vec<String>>,
+    #[serde(default = "default_quality_cutoff")]
+    pub quality_cutoff_index: usize,
     pub media_tiers: Vec<Vec<String>>,
+    #[serde(default = "default_media_cutoff")]
+    pub media_cutoff_index: usize,
+    #[serde(default = "default_variant_sort_order")]
+    pub variant_sort_order: Vec<VariantSortCriterion>,
     #[serde(default = "default_tracker_order")]
     pub tracker_order: Vec<String>,
     #[serde(default = "default_tracker_preferences")]
     pub tracker_policies: Vec<TrackerPreference>,
+    #[serde(default, rename = "qualityOrder", skip_serializing)]
+    pub legacy_quality_order: Vec<String>,
+    #[serde(default, rename = "minimumQuality", skip_serializing)]
+    pub legacy_minimum_quality: String,
+}
+
+fn default_quality_tiers() -> Vec<Vec<String>> {
+    vec![
+        vec!["hi_res".into()],
+        vec!["lossless".into()],
+        vec!["320".into()],
+        vec!["v0".into()],
+        vec!["other".into()],
+    ]
+}
+
+fn default_quality_cutoff() -> usize {
+    2
+}
+
+fn default_media_tiers() -> Vec<Vec<String>> {
+    vec![
+        vec!["WEB".into(), "CD".into()],
+        vec!["SACD".into(), "DVD".into(), "Blu-ray".into()],
+        vec!["Vinyl".into()],
+        vec!["Cassette".into()],
+        vec!["Other".into()],
+    ]
+}
+
+fn default_media_cutoff() -> usize {
+    2
+}
+
+fn default_variant_sort_order() -> Vec<VariantSortCriterion> {
+    vec![
+        VariantSortCriterion::Quality,
+        VariantSortCriterion::Tracker,
+        VariantSortCriterion::Media,
+        VariantSortCriterion::Edition,
+    ]
 }
 
 fn default_tracker_order() -> Vec<String> {
@@ -258,11 +328,15 @@ fn default_tracker_preferences() -> Vec<TrackerPreference> {
             tracker: "ops".into(),
             mode: TrackerDownloadMode::FreeleechOrToken,
             auto_use_tokens: true,
+            download_profile: Some("ops".into()),
+            auto_token_limit: 1,
         },
         TrackerPreference {
             tracker: "red".into(),
             mode: TrackerDownloadMode::FreeleechOnly,
             auto_use_tokens: false,
+            download_profile: Some("red".into()),
+            auto_token_limit: 0,
         },
     ]
 }
@@ -270,23 +344,15 @@ fn default_tracker_preferences() -> Vec<TrackerPreference> {
 impl Default for ReleasePreferences {
     fn default() -> Self {
         Self {
-            quality_order: vec![
-                "hi_res".into(),
-                "lossless".into(),
-                "320".into(),
-                "v0".into(),
-                "other".into(),
-            ],
-            minimum_quality: "lossless".into(),
-            media_tiers: vec![
-                vec!["WEB".into(), "CD".into()],
-                vec!["Vinyl".into()],
-                vec!["SACD".into(), "DVD".into(), "Blu-ray".into()],
-                vec!["Cassette".into()],
-                vec!["Other".into()],
-            ],
+            quality_tiers: default_quality_tiers(),
+            quality_cutoff_index: default_quality_cutoff(),
+            media_tiers: default_media_tiers(),
+            media_cutoff_index: default_media_cutoff(),
+            variant_sort_order: default_variant_sort_order(),
             tracker_order: default_tracker_order(),
             tracker_policies: default_tracker_preferences(),
+            legacy_quality_order: Vec::new(),
+            legacy_minimum_quality: String::new(),
         }
     }
 }
@@ -295,30 +361,155 @@ impl Default for ReleasePreferences {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimePreferences {
     pub release: ReleasePreferences,
+    #[serde(default)]
+    pub api: ApiPreferences,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPreferences {
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, ProviderPolicyOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPolicyOverride {
+    pub minimum_interval_ms: Option<u64>,
+    pub max_concurrency: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCircuitState {
+    Available,
+    Cooldown,
+    HalfOpen,
+    Blocked,
+    Paused,
+}
+
+impl ProviderCircuitState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Cooldown => "cooldown",
+            Self::HalfOpen => "half_open",
+            Self::Blocked => "blocked",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+impl std::str::FromStr for ProviderCircuitState {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "available" => Self::Available,
+            "cooldown" => Self::Cooldown,
+            "half_open" => Self::HalfOpen,
+            "blocked" => Self::Blocked,
+            "paused" => Self::Paused,
+            _ => anyhow::bail!("unknown provider circuit state {value}"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderQueueCounts {
+    pub interactive: usize,
+    pub download: usize,
+    pub manual: usize,
+    pub scheduled: usize,
+    pub background: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStatus {
+    pub id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub state: ProviderCircuitState,
+    pub reason_code: Option<String>,
+    pub message: Option<String>,
+    pub last_request_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+    pub minimum_interval_ms: u64,
+    pub safe_minimum_interval_ms: u64,
+    pub max_concurrency: u32,
+    pub safe_max_concurrency: u32,
+    pub queued: ProviderQueueCounts,
+    pub can_pause: bool,
+    pub can_resume: bool,
 }
 
 impl ReleasePreferences {
+    pub fn migrate_legacy(mut self) -> Self {
+        let was_legacy = !self.legacy_quality_order.is_empty();
+        if !self.legacy_quality_order.is_empty() {
+            let cutoff = self
+                .legacy_quality_order
+                .iter()
+                .position(|value| value == &self.legacy_minimum_quality)
+                .map(|index| index + 1)
+                .unwrap_or_else(default_quality_cutoff);
+            self.quality_tiers = self
+                .legacy_quality_order
+                .drain(..)
+                .map(|value| vec![value])
+                .collect();
+            self.quality_cutoff_index = cutoff;
+            self.legacy_minimum_quality.clear();
+        }
+        let legacy_default = vec![
+            vec!["WEB".to_owned(), "CD".to_owned()],
+            vec!["Vinyl".to_owned()],
+            vec!["SACD".to_owned(), "DVD".to_owned(), "Blu-ray".to_owned()],
+            vec!["Cassette".to_owned()],
+            vec!["Other".to_owned()],
+        ];
+        if self.media_tiers == legacy_default {
+            self.media_tiers = default_media_tiers();
+            self.media_cutoff_index = default_media_cutoff();
+        } else if was_legacy {
+            self.media_cutoff_index = self.media_tiers.len();
+        }
+        self
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         const QUALITIES: [&str; 5] = ["hi_res", "lossless", "320", "v0", "other"];
-        if self.quality_order.len() != QUALITIES.len()
+        if self.quality_tiers.is_empty()
+            || self.quality_tiers.iter().any(Vec::is_empty)
+            || self.quality_tiers.iter().flatten().count() != QUALITIES.len()
             || QUALITIES.iter().any(|quality| {
-                self.quality_order
+                self.quality_tiers
                     .iter()
+                    .flatten()
                     .filter(|item| item == quality)
                     .count()
                     != 1
             })
         {
             return Err(
-                "qualityOrder must contain hi_res, lossless, 320, v0, and other exactly once"
+                "qualityTiers must contain hi_res, lossless, 320, v0, and other exactly once"
                     .into(),
             );
         }
-        if !self.quality_order.contains(&self.minimum_quality) {
-            return Err("minimumQuality must be present in qualityOrder".into());
+        if self.quality_cutoff_index > self.quality_tiers.len() {
+            return Err("qualityCutoffIndex must be between zero and the tier count".into());
         }
         if self.media_tiers.is_empty() || self.media_tiers.iter().any(Vec::is_empty) {
             return Err("mediaTiers must contain at least one non-empty tier".into());
+        }
+        if self.media_cutoff_index > self.media_tiers.len() {
+            return Err("mediaCutoffIndex must be between zero and the tier count".into());
         }
         let mut media = std::collections::HashSet::new();
         for value in self.media_tiers.iter().flatten() {
@@ -326,6 +517,26 @@ impl ReleasePreferences {
             if normalized.is_empty() || !media.insert(normalized) {
                 return Err("media values must be non-empty and unique across tiers".into());
             }
+        }
+        const CRITERIA: [VariantSortCriterion; 4] = [
+            VariantSortCriterion::Quality,
+            VariantSortCriterion::Tracker,
+            VariantSortCriterion::Media,
+            VariantSortCriterion::Edition,
+        ];
+        if self.variant_sort_order.len() != CRITERIA.len()
+            || CRITERIA.iter().any(|criterion| {
+                self.variant_sort_order
+                    .iter()
+                    .filter(|value| *value == criterion)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(
+                "variantSortOrder must contain quality, tracker, media, and edition exactly once"
+                    .into(),
+            );
         }
         let normalized_order = self
             .tracker_order
@@ -350,6 +561,16 @@ impl ReleasePreferences {
             if !normalized_order.contains(&tracker) {
                 return Err("every tracker policy must be present in trackerOrder".into());
             }
+            if policy
+                .download_profile
+                .as_deref()
+                .is_some_and(|profile| profile.trim().is_empty())
+            {
+                return Err("downloadProfile must be non-empty when configured".into());
+            }
+            if policy.auto_token_limit > 100 {
+                return Err("autoTokenLimit cannot exceed 100".into());
+            }
         }
         Ok(())
     }
@@ -371,22 +592,35 @@ impl ReleasePreferences {
         }
     }
 
-    pub fn allows(&self, format: Option<&str>, encoding: Option<&str>) -> bool {
-        let Some(quality) = self
-            .quality_order
+    pub fn quality_rank(&self, format: Option<&str>, encoding: Option<&str>) -> usize {
+        self.quality_tiers
             .iter()
-            .position(|item| item == Self::quality_class(format, encoding))
-        else {
-            return false;
-        };
-        let Some(cutoff) = self
-            .quality_order
+            .position(|tier| {
+                tier.iter()
+                    .any(|item| item == Self::quality_class(format, encoding))
+            })
+            .unwrap_or(self.quality_tiers.len())
+    }
+
+    pub fn media_rank(&self, media: Option<&str>) -> usize {
+        let media = media.unwrap_or("other");
+        self.media_tiers
             .iter()
-            .position(|item| item == &self.minimum_quality)
-        else {
-            return false;
-        };
-        quality <= cutoff
+            .position(|tier| tier.iter().any(|item| item.eq_ignore_ascii_case(media)))
+            .or_else(|| {
+                self.media_tiers
+                    .iter()
+                    .position(|tier| tier.iter().any(|item| item.eq_ignore_ascii_case("other")))
+            })
+            .unwrap_or(self.media_tiers.len())
+    }
+
+    pub fn allows_quality(&self, format: Option<&str>, encoding: Option<&str>) -> bool {
+        self.quality_rank(format, encoding) < self.quality_cutoff_index
+    }
+
+    pub fn allows_media(&self, media: Option<&str>) -> bool {
+        self.media_rank(media) < self.media_cutoff_index
     }
 
     pub fn tracker_policy(&self, tracker: &str) -> TrackerPreference {
@@ -398,27 +632,49 @@ impl ReleasePreferences {
                 tracker: tracker.to_ascii_lowercase(),
                 mode: TrackerDownloadMode::FreeleechOnly,
                 auto_use_tokens: false,
+                download_profile: None,
+                auto_token_limit: default_auto_token_limit(),
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn eligibility(
         &self,
         tracker: &str,
         format: Option<&str>,
         encoding: Option<&str>,
+        media: Option<&str>,
+        size: Option<i64>,
         leech_status: LeechStatus,
         can_use_token: bool,
     ) -> DownloadEligibility {
-        if !self.allows(format, encoding) {
+        let free = leech_status.has_no_download_debit();
+        let token_cost = if free {
+            Some(0)
+        } else if can_use_token {
+            Self::token_cost(tracker, size)
+        } else {
+            None
+        };
+        if !self.allows_quality(format, encoding) {
             return DownloadEligibility {
                 eligible: false,
                 reason: DownloadEligibilityReason::BelowQualityCutoff,
                 requires_token: false,
                 token_available: can_use_token,
+                token_cost,
+            };
+        }
+        if !self.allows_media(media) {
+            return DownloadEligibility {
+                eligible: false,
+                reason: DownloadEligibilityReason::BelowMediaCutoff,
+                requires_token: false,
+                token_available: can_use_token,
+                token_cost,
             };
         }
         let policy = self.tracker_policy(tracker);
-        let free = leech_status.has_no_download_debit();
         let (eligible, reason, requires_token) = match policy.mode {
             TrackerDownloadMode::Disabled => {
                 (false, DownloadEligibilityReason::TrackerDisabled, false)
@@ -428,6 +684,9 @@ impl ReleasePreferences {
             }
             TrackerDownloadMode::FreeleechOrToken if !free && !can_use_token => {
                 (false, DownloadEligibilityReason::TokenUnavailable, true)
+            }
+            TrackerDownloadMode::FreeleechOrToken if !free && token_cost.is_none() => {
+                (false, DownloadEligibilityReason::TokenCostUnknown, true)
             }
             TrackerDownloadMode::FreeleechOrToken if !free => {
                 (true, DownloadEligibilityReason::Eligible, true)
@@ -439,7 +698,20 @@ impl ReleasePreferences {
             reason,
             requires_token,
             token_available: can_use_token,
+            token_cost,
         }
+    }
+
+    pub fn token_cost(tracker: &str, size: Option<i64>) -> Option<u32> {
+        const OPS_TOKEN_BYTES: u64 = 320 * 1024 * 1024;
+        if tracker.eq_ignore_ascii_case("red") {
+            return Some(1);
+        }
+        if !tracker.eq_ignore_ascii_case("ops") {
+            return None;
+        }
+        let size = u64::try_from(size?).ok().filter(|size| *size > 0)?;
+        u32::try_from(size.div_ceil(OPS_TOKEN_BYTES)).ok()
     }
 }
 
@@ -923,6 +1195,12 @@ pub struct LastfmChannelSettings {
     pub period: String,
     pub pack_size: u16,
     pub suppression_packs: u16,
+    #[serde(default = "default_catalog_country")]
+    pub catalog_country: String,
+}
+
+fn default_catalog_country() -> String {
+    "AU".into()
 }
 
 impl Default for LastfmChannelSettings {
@@ -932,6 +1210,7 @@ impl Default for LastfmChannelSettings {
             period: "3month".into(),
             pack_size: 25,
             suppression_packs: 8,
+            catalog_country: default_catalog_country(),
         }
     }
 }
@@ -957,6 +1236,8 @@ pub struct ChannelConfig {
     pub last_attempt_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub failure_count: u32,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -965,7 +1246,7 @@ impl ChannelConfig {
         Self {
             id: "country_chart".into(),
             kind: ChannelKind::CountryChart,
-            enabled: true,
+            enabled: false,
             schedule: ChannelSchedule::default(),
             country_chart: Some(CountryChartChannelSettings::default()),
             lastfm: None,
@@ -974,6 +1255,7 @@ impl ChannelConfig {
             last_successful_at: None,
             last_attempt_at: None,
             last_error: None,
+            failure_count: 0,
             updated_at: now,
         }
     }
@@ -991,6 +1273,7 @@ impl ChannelConfig {
             last_successful_at: None,
             last_attempt_at: None,
             last_error: None,
+            failure_count: 0,
             updated_at: now,
         }
     }
@@ -1012,6 +1295,15 @@ pub enum ChannelRunTrigger {
     Manual,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelRunPhase {
+    Discovering,
+    Matching,
+    Planning,
+    Saving,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelRun {
@@ -1020,10 +1312,19 @@ pub struct ChannelRun {
     pub trigger: ChannelRunTrigger,
     pub status: ChannelRunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ChannelRunPhase>,
+    #[serde(default)]
+    pub progress_completed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -1051,6 +1352,10 @@ pub enum PackItemPlanState {
     Executable,
     AlreadyOwned,
     AlreadyDownloading,
+    Duplicate,
+    TokenBudgetExceeded,
+    CapacityBlocked,
+    Excluded,
     Unmatched,
     Ambiguous,
     PolicyBlocked,
@@ -1076,6 +1381,21 @@ pub struct RecommendationSource {
     pub mbid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substituted_from: Option<RecommendationSubstitution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationSubstitution {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbid: Option<String>,
+    pub release_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1085,6 +1405,8 @@ pub struct PlannedDownload {
     pub torrent_id: i64,
     pub profile: String,
     pub use_token: bool,
+    #[serde(default)]
+    pub token_cost: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1172,6 +1494,15 @@ pub struct ChannelOverview {
 #[serde(rename_all = "camelCase")]
 pub struct DecideChannelPack {
     pub plan_version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinals: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachChannelPackItem {
+    pub plan_version: i32,
+    pub release_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1245,21 +1576,54 @@ mod preference_tests {
     #[test]
     fn default_cutoff_accepts_lossless_and_hi_res_only() {
         let preferences = ReleasePreferences::default();
-        assert!(preferences.allows(Some("FLAC"), Some("Lossless")));
-        assert!(preferences.allows(Some("FLAC"), Some("24bit Lossless")));
-        assert!(!preferences.allows(Some("MP3"), Some("320")));
-        assert!(!preferences.allows(Some("MP3"), Some("V0 (VBR)")));
+        assert!(preferences.allows_quality(Some("FLAC"), Some("Lossless")));
+        assert!(preferences.allows_quality(Some("FLAC"), Some("24bit Lossless")));
+        assert!(!preferences.allows_quality(Some("MP3"), Some("320")));
+        assert!(!preferences.allows_quality(Some("MP3"), Some("V0 (VBR)")));
+        assert!(preferences.allows_media(Some("WEB")));
+        assert!(!preferences.allows_media(Some("Vinyl")));
     }
 
     #[test]
     fn rejects_incomplete_or_duplicate_preference_orders() {
         let mut preferences = ReleasePreferences::default();
-        preferences.quality_order[4] = "lossless".into();
+        preferences.quality_tiers[4] = vec!["lossless".into()];
         assert!(preferences.validate().is_err());
 
         let mut preferences = ReleasePreferences::default();
         preferences.media_tiers[1].push("web".into());
         assert!(preferences.validate().is_err());
+    }
+
+    #[test]
+    fn old_tracker_preferences_receive_safe_pack_defaults() {
+        let policy: super::TrackerPreference = serde_json::from_value(serde_json::json!({
+            "tracker": "ops",
+            "mode": "freeleech_or_token",
+            "autoUseTokens": true
+        }))
+        .expect("legacy tracker preference");
+        assert_eq!(policy.download_profile, None);
+        assert_eq!(policy.auto_token_limit, 1);
+    }
+
+    #[test]
+    fn migrates_legacy_quality_and_default_media_preferences() {
+        let preferences: super::RuntimePreferences = serde_json::from_value(serde_json::json!({
+            "release": {
+                "qualityOrder": ["hi_res", "lossless", "320", "v0", "other"],
+                "minimumQuality": "lossless",
+                "mediaTiers": [["WEB", "CD"], ["Vinyl"], ["SACD", "DVD", "Blu-ray"], ["Cassette"], ["Other"]],
+                "trackerOrder": ["ops", "red"],
+                "trackerPolicies": []
+            }
+        }))
+        .expect("legacy preferences");
+        let migrated = preferences.release.migrate_legacy();
+        assert_eq!(migrated.quality_cutoff_index, 2);
+        assert_eq!(migrated.quality_tiers[1], vec!["lossless"]);
+        assert_eq!(migrated.media_tiers[1], vec!["SACD", "DVD", "Blu-ray"]);
+        assert_eq!(migrated.media_cutoff_index, 2);
     }
 
     #[test]
@@ -1269,16 +1633,21 @@ mod preference_tests {
             "ops",
             Some("FLAC"),
             Some("Lossless"),
+            Some("WEB"),
+            Some(320 * 1024 * 1024),
             LeechStatus::Regular,
             true,
         );
         assert!(ops.eligible);
         assert!(ops.requires_token);
+        assert_eq!(ops.token_cost, Some(1));
 
         let red = preferences.eligibility(
             "red",
             Some("FLAC"),
             Some("Lossless"),
+            Some("WEB"),
+            Some(1),
             LeechStatus::Regular,
             true,
         );
@@ -1289,11 +1658,48 @@ mod preference_tests {
             "red",
             Some("FLAC"),
             Some("Lossless"),
+            Some("WEB"),
+            Some(1),
             LeechStatus::PersonalFreeleech,
             false,
         );
         assert!(red_free.eligible);
         assert!(!red_free.requires_token);
+        assert_eq!(red_free.token_cost, Some(0));
+    }
+
+    #[test]
+    fn calculates_tracker_specific_token_costs_and_blocks_unknown_ops_sizes() {
+        assert_eq!(ReleasePreferences::token_cost("ops", Some(1)), Some(1));
+        assert_eq!(
+            ReleasePreferences::token_cost("ops", Some(320 * 1024 * 1024)),
+            Some(1)
+        );
+        assert_eq!(
+            ReleasePreferences::token_cost("ops", Some(320 * 1024 * 1024 + 1)),
+            Some(2)
+        );
+        assert_eq!(
+            ReleasePreferences::token_cost("ops", Some(535_494_014)),
+            Some(2)
+        );
+        assert_eq!(ReleasePreferences::token_cost("ops", None), None);
+        assert_eq!(ReleasePreferences::token_cost("red", None), Some(1));
+
+        let eligibility = ReleasePreferences::default().eligibility(
+            "ops",
+            Some("FLAC"),
+            Some("Lossless"),
+            Some("WEB"),
+            None,
+            LeechStatus::Regular,
+            true,
+        );
+        assert!(!eligibility.eligible);
+        assert_eq!(
+            eligibility.reason,
+            DownloadEligibilityReason::TokenCostUnknown
+        );
     }
 
     #[test]

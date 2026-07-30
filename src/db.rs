@@ -19,15 +19,16 @@ use crate::{
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
         channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
         download_client_scan, download_event, download_job, download_release_link, match_candidate,
-        release_source, release_track_index, runtime_preference, single_album_coverage,
-        tracker_snapshot,
+        provider_state, release_source, release_track_index, runtime_preference,
+        single_album_coverage, tracker_snapshot,
     },
     migration::Migrator,
     model::{
         ArtistCatalogPage, ArtistCreditSource, ArtistRole, CanonicalTorrent, ChannelConfig,
         ChannelPack, ChannelPackDecision, ChannelPackItem, ChannelPackSummary, ChannelRun,
-        ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob, DownloadState,
-        LiveDownloadStatus, ReleaseDetail, ReleaseSummary, RuntimePreferences,
+        ChannelRunPhase, ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob,
+        DownloadState, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseSummary,
+        RuntimePreferences,
     },
 };
 
@@ -88,6 +89,23 @@ pub struct TrackIndexProgress {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredProviderState {
+    pub id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub state: ProviderCircuitState,
+    pub reason_code: Option<String>,
+    pub message: Option<String>,
+    pub last_request_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+    pub minimum_interval_ms: u64,
+    pub max_concurrency: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalBackfillProgress {
@@ -142,7 +160,11 @@ impl Database {
             .one(&self.connection)
             .await?;
         model
-            .map(|model| serde_json::from_value(model.value_json).map_err(Into::into))
+            .map(|model| {
+                let mut preferences: RuntimePreferences = serde_json::from_value(model.value_json)?;
+                preferences.release = preferences.release.migrate_legacy();
+                Ok(preferences)
+            })
             .unwrap_or_else(|| Ok(RuntimePreferences::default()))
     }
 
@@ -162,6 +184,61 @@ impl Database {
                 key: Set("runtime".into()),
                 value_json: Set(value),
                 updated_at: Set(now),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn provider_state(&self, id: &str) -> Result<Option<StoredProviderState>> {
+        provider_state::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await?
+            .map(provider_state_from_model)
+            .transpose()
+    }
+
+    pub async fn put_provider_state(&self, state: &StoredProviderState) -> Result<()> {
+        let updated_at = Utc::now().to_rfc3339();
+        if let Some(model) = provider_state::Entity::find_by_id(&state.id)
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.display_name = Set(state.display_name.clone());
+            active.kind = Set(state.kind.clone());
+            active.state = Set(state.state.as_str().into());
+            active.reason_code = Set(state.reason_code.clone());
+            active.message = Set(state.message.clone());
+            active.last_request_at = Set(state.last_request_at.map(|value| value.to_rfc3339()));
+            active.last_success_at = Set(state.last_success_at.map(|value| value.to_rfc3339()));
+            active.last_failure_at = Set(state.last_failure_at.map(|value| value.to_rfc3339()));
+            active.retry_at = Set(state.retry_at.map(|value| value.to_rfc3339()));
+            active.consecutive_failures = Set(i64::from(state.consecutive_failures));
+            active.minimum_interval_ms =
+                Set(i64::try_from(state.minimum_interval_ms).unwrap_or(i64::MAX));
+            active.max_concurrency = Set(i64::from(state.max_concurrency));
+            active.updated_at = Set(updated_at);
+            active.update(&self.connection).await?;
+        } else {
+            provider_state::ActiveModel {
+                id: Set(state.id.clone()),
+                display_name: Set(state.display_name.clone()),
+                kind: Set(state.kind.clone()),
+                state: Set(state.state.as_str().into()),
+                reason_code: Set(state.reason_code.clone()),
+                message: Set(state.message.clone()),
+                last_request_at: Set(state.last_request_at.map(|value| value.to_rfc3339())),
+                last_success_at: Set(state.last_success_at.map(|value| value.to_rfc3339())),
+                last_failure_at: Set(state.last_failure_at.map(|value| value.to_rfc3339())),
+                retry_at: Set(state.retry_at.map(|value| value.to_rfc3339())),
+                consecutive_failures: Set(i64::from(state.consecutive_failures)),
+                minimum_interval_ms: Set(
+                    i64::try_from(state.minimum_interval_ms).unwrap_or(i64::MAX)
+                ),
+                max_concurrency: Set(i64::from(state.max_concurrency)),
+                updated_at: Set(updated_at),
             }
             .insert(&self.connection)
             .await?;
@@ -256,11 +333,21 @@ impl Database {
             .all(&self.connection)
             .await?
         {
+            let channel_id = model.channel_id.clone();
+            let message = "Service restarted during channel refresh";
             let mut active = model.into_active_model();
             active.status = Set("failed".into());
-            active.error = Set(Some("Service restarted during channel refresh".into()));
-            active.finished_at = Set(Some(Utc::now().to_rfc3339()));
+            active.error = Set(Some(message.into()));
+            let now = Utc::now().to_rfc3339();
+            active.updated_at = Set(now.clone());
+            active.finished_at = Set(Some(now));
             active.update(&self.connection).await?;
+            if let Some(mut channel) = self.get_channel(&channel_id).await? {
+                channel.last_error = Some(message.into());
+                channel.failure_count = channel.failure_count.saturating_add(1);
+                channel.updated_at = Utc::now();
+                self.put_channel(&channel).await?;
+            }
         }
         Ok(())
     }
@@ -281,14 +368,20 @@ impl Database {
             transaction.rollback().await?;
             return Ok(None);
         }
+        let now = Utc::now();
         let run = ChannelRun {
             id: Uuid::new_v4(),
             channel_id: channel_id.into(),
             trigger,
             status: ChannelRunStatus::Running,
+            phase: Some(ChannelRunPhase::Discovering),
+            progress_completed: 0,
+            progress_total: None,
+            progress_message: Some("Contacting recommendation source".into()),
             pack_id: None,
             error: None,
-            started_at: Utc::now(),
+            started_at: now,
+            updated_at: now,
             finished_at: None,
         };
         channel_run::ActiveModel {
@@ -296,9 +389,14 @@ impl Database {
             channel_id: Set(run.channel_id.clone()),
             trigger: Set(channel_run_trigger(&run.trigger).into()),
             status: Set("running".into()),
+            phase: Set(Some("discovering".into())),
+            progress_completed: Set(0),
+            progress_total: Set(None),
+            progress_message: Set(run.progress_message.clone()),
             pack_id: Set(None),
             error: Set(None),
             started_at: Set(run.started_at.to_rfc3339()),
+            updated_at: Set(run.updated_at.to_rfc3339()),
             finished_at: Set(None),
         }
         .insert(&transaction)
@@ -330,7 +428,33 @@ impl Database {
             active.status = Set(channel_run_status(&status).into());
             active.pack_id = Set(pack_id.map(|value| value.to_string()));
             active.error = Set(error.map(|value| value.chars().take(500).collect()));
-            active.finished_at = Set(Some(Utc::now().to_rfc3339()));
+            let now = Utc::now().to_rfc3339();
+            active.updated_at = Set(now.clone());
+            active.finished_at = Set(Some(now));
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn update_channel_run_progress(
+        &self,
+        id: Uuid,
+        phase: ChannelRunPhase,
+        completed: u32,
+        total: Option<u32>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        if let Some(model) = channel_run::Entity::find_by_id(id.to_string())
+            .filter(channel_run::Column::Status.eq("running"))
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.phase = Set(Some(channel_run_phase(&phase).into()));
+            active.progress_completed = Set(completed.min(i32::MAX as u32) as i32);
+            active.progress_total = Set(total.map(|value| value.min(i32::MAX as u32) as i32));
+            active.progress_message = Set(message.map(|value| value.chars().take(200).collect()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
             active.update(&self.connection).await?;
         }
         Ok(())
@@ -2953,6 +3077,36 @@ fn snapshot_from_model<T: DeserializeOwned>(model: tracker_snapshot::Model) -> R
     })
 }
 
+fn provider_state_from_model(model: provider_state::Model) -> Result<StoredProviderState> {
+    Ok(StoredProviderState {
+        id: model.id,
+        display_name: model.display_name,
+        kind: model.kind,
+        state: ProviderCircuitState::from_str(&model.state)?,
+        reason_code: model.reason_code,
+        message: model.message,
+        last_request_at: model
+            .last_request_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        last_success_at: model
+            .last_success_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        last_failure_at: model
+            .last_failure_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        retry_at: model.retry_at.as_deref().map(parse_timestamp).transpose()?,
+        consecutive_failures: u32::try_from(model.consecutive_failures).unwrap_or(u32::MAX),
+        minimum_interval_ms: u64::try_from(model.minimum_interval_ms).unwrap_or_default(),
+        max_concurrency: u32::try_from(model.max_concurrency).unwrap_or(1).max(1),
+    })
+}
+
 fn channel_run_trigger(value: &ChannelRunTrigger) -> &'static str {
     match value {
         ChannelRunTrigger::Scheduled => "scheduled",
@@ -2966,6 +3120,15 @@ fn channel_run_status(value: &ChannelRunStatus) -> &'static str {
         ChannelRunStatus::Successful => "successful",
         ChannelRunStatus::Partial => "partial",
         ChannelRunStatus::Failed => "failed",
+    }
+}
+
+fn channel_run_phase(value: &ChannelRunPhase) -> &'static str {
+    match value {
+        ChannelRunPhase::Discovering => "discovering",
+        ChannelRunPhase::Matching => "matching",
+        ChannelRunPhase::Planning => "planning",
+        ChannelRunPhase::Saving => "saving",
     }
 }
 
@@ -2991,9 +3154,24 @@ fn channel_run_from_model(model: channel_run::Model) -> Result<ChannelRun> {
             "failed" => ChannelRunStatus::Failed,
             _ => ChannelRunStatus::Running,
         },
+        phase: match model.phase.as_deref() {
+            Some("discovering") => Some(ChannelRunPhase::Discovering),
+            Some("matching") => Some(ChannelRunPhase::Matching),
+            Some("planning") => Some(ChannelRunPhase::Planning),
+            Some("saving") => Some(ChannelRunPhase::Saving),
+            _ => None,
+        },
+        progress_completed: model.progress_completed.max(0) as u32,
+        progress_total: model.progress_total.map(|value| value.max(0) as u32),
+        progress_message: model.progress_message,
         pack_id: model.pack_id.as_deref().map(Uuid::parse_str).transpose()?,
         error: model.error,
         started_at: parse_timestamp(&model.started_at)?,
+        updated_at: if model.updated_at.is_empty() {
+            parse_timestamp(&model.started_at)?
+        } else {
+            parse_timestamp(&model.updated_at)?
+        },
         finished_at: model
             .finished_at
             .as_deref()
@@ -3004,9 +3182,19 @@ fn channel_run_from_model(model: channel_run::Model) -> Result<ChannelRun> {
 
 fn channel_pack_from_model(
     model: channel_pack::Model,
-    items: Vec<ChannelPackItem>,
+    mut items: Vec<ChannelPackItem>,
     current_fingerprint: &str,
 ) -> Result<ChannelPack> {
+    for item in &mut items {
+        if let Some(plan) = &mut item.plan
+            && plan.use_token
+            && plan.token_cost == 0
+            && let Some(token_cost) =
+                crate::model::ReleasePreferences::token_cost(&plan.tracker, plan.size)
+        {
+            plan.token_cost = token_cost;
+        }
+    }
     let mut summary = crate::model::ChannelPlanSummary::default();
     for item in &items {
         if matches!(
@@ -3017,7 +3205,7 @@ fn channel_pack_from_model(
             summary.executable += 1;
             if let Some(plan) = &item.plan {
                 summary.total_size += plan.size.unwrap_or_default();
-                summary.token_uses += usize::from(plan.use_token);
+                summary.token_uses += plan.token_cost as usize;
                 *summary.by_tracker.entry(plan.tracker.clone()).or_default() += 1;
             }
         } else {
@@ -3182,9 +3370,9 @@ mod tests {
     use crate::{
         entity::download_release_link,
         model::{
-            CanonicalTorrent, ChannelPackItem, ClientDownloadState, LiveDownloadStatus,
-            PackItemPlanState, RecommendationMatchState, RecommendationSource, ReleaseSummary,
-            TorrentVariant,
+            CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
+            ClientDownloadState, LiveDownloadStatus, PackItemPlanState, RecommendationMatchState,
+            RecommendationSource, ReleaseSummary, TorrentVariant,
         },
         tracker::fallback_artist_credit,
     };
@@ -3218,7 +3406,7 @@ mod tests {
             .await
             .expect("database");
         let mut preferences = crate::model::RuntimePreferences::default();
-        preferences.release.minimum_quality = "320".into();
+        preferences.release.quality_cutoff_index = 3;
         db.put_runtime_preferences(&preferences)
             .await
             .expect("save preferences");
@@ -3240,7 +3428,7 @@ mod tests {
         let channels = db.list_channels().await.expect("channels");
         assert_eq!(channels.len(), 2);
         assert!(
-            channels
+            !channels
                 .iter()
                 .find(|channel| channel.id == "country_chart")
                 .expect("chart")
@@ -3258,6 +3446,8 @@ mod tests {
                 url: None,
                 mbid: None,
                 score: None,
+                catalog_country: None,
+                substituted_from: None,
             },
             match_state: RecommendationMatchState::Unmatched,
             release: None,
@@ -3286,6 +3476,47 @@ mod tests {
                 .expect("load stale pack")
                 .expect("pack")
                 .plan_stale
+        );
+    }
+
+    #[tokio::test]
+    async fn recovers_interrupted_channel_runs_with_visible_retry_state() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        db.ensure_default_channels().await.expect("seed channels");
+        let run = db
+            .create_channel_run("country_chart", ChannelRunTrigger::Scheduled)
+            .await
+            .expect("create run")
+            .expect("new run");
+
+        db.recover_channel_runs().await.expect("recover runs");
+
+        let recovered = db
+            .get_channel_run(run.id)
+            .await
+            .expect("load run")
+            .expect("run");
+        assert_eq!(recovered.status, ChannelRunStatus::Failed);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("restarted"))
+        );
+        let channel = db
+            .get_channel("country_chart")
+            .await
+            .expect("load channel")
+            .expect("channel");
+        assert_eq!(channel.failure_count, 1);
+        assert!(
+            channel
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("restarted"))
         );
     }
 
