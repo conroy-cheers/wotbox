@@ -17,7 +17,9 @@
     defaultReleasePreferences,
     qualityLabels
   } from "../lib/releasePreferences";
+  import { buildPreferencePayload } from "../lib/preferencePayload";
   import TierEditor from "../lib/TierEditor.svelte";
+  import BackgroundJobsPanel from "../lib/BackgroundJobsPanel.svelte";
 
   const queryClient = useQueryClient();
   const preferences = createQuery({
@@ -132,25 +134,16 @@
   }
 
   function payload(): RuntimePreferences {
-    return {
-      release: {
-        qualityTiers: structuredClone(qualityTiers),
-        qualityCutoffIndex,
-        mediaTiers: structuredClone(mediaTiers),
-        mediaCutoffIndex,
-        variantSortOrder: [...variantSortOrder],
-        trackerOrder: [...trackerOrder],
-        trackerPolicies: trackerOrder.map((tracker) => {
-          const policy = trackerPolicy(tracker);
-          return {
-            ...policy,
-            downloadProfile: policy.downloadProfile || undefined,
-            autoTokenLimit: Math.max(0, Math.min(100, Number(policy.autoTokenLimit) || 0))
-          };
-        })
-      },
-      api: { providers: structuredClone(apiPolicies) }
-    };
+    return buildPreferencePayload({
+      qualityTiers,
+      qualityCutoffIndex,
+      mediaTiers,
+      mediaCutoffIndex,
+      variantSortOrder,
+      trackerOrder,
+      trackerPolicies: trackerOrder.map((tracker) => trackerPolicy(tracker)),
+      apiPolicies
+    });
   }
 
   async function save() {
@@ -271,6 +264,7 @@
   <a href="#download-planning"><strong>Download planning</strong><span>Trackers, cost, and profiles</span></a>
   <a href="#quality-media"><strong>Quality &amp; media</strong><span>Cutoff and format ranking</span></a>
   <a href="#api-safety"><strong>API safety</strong><span>Limits and circuit state</span></a>
+  <a href="#background-work"><strong>Background work</strong><span>Progress, retries, and failures</span></a>
   <a href="#channels"><strong>Channels</strong><span>Sources and schedules</span></a>
 </nav>
 
@@ -335,7 +329,7 @@
             <legend>Token automation</legend>
             <label class="inline-check token-auto-toggle">
               <input type="checkbox" bind:checked={policy.autoUseTokens} />
-              Automatically spend tokens when a planned torrent needs one
+              <span>Automatically spend tokens when a planned torrent needs one</span>
             </label>
             <label class="dialog-field token-limit">
               <span>Maximum tokens per recommendation pack</span>
@@ -512,6 +506,8 @@
       </button>
     </div>
   </section>
+
+  <BackgroundJobsPanel />
 
   <section class="preferences-panel channel-preferences" id="channels">
     <div class="section-heading">

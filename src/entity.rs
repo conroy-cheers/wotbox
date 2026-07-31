@@ -632,3 +632,47 @@ pub mod provider_state {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod background_job {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "background_jobs")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        #[sea_orm(unique)]
+        pub deduplication_key: String,
+        pub kind: String,
+        #[sea_orm(column_type = "Json")]
+        pub payload_json: Json,
+        pub state: String,
+        #[sea_orm(default_value = 0)]
+        pub priority: i64,
+        #[sea_orm(default_value = 0)]
+        pub attempts: i64,
+        #[sea_orm(default_value = 8)]
+        pub max_attempts: i64,
+        pub next_run_at: Option<String>,
+        pub lease_owner: Option<String>,
+        pub lease_until: Option<String>,
+        #[sea_orm(default_value = 0)]
+        pub progress_completed: i64,
+        pub progress_total: Option<i64>,
+        pub progress_message: Option<String>,
+        pub last_error_code: Option<String>,
+        pub last_error_message: Option<String>,
+        pub parent_id: Option<String>,
+        pub recurring_interval_seconds: Option<i64>,
+        pub created_at: String,
+        pub updated_at: String,
+        pub started_at: Option<String>,
+        pub finished_at: Option<String>,
+        pub cancelled_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

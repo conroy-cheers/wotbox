@@ -1,11 +1,12 @@
-use std::{collections::HashMap, path::Path, str::FromStr};
+use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectOptions,
-    Database as SeaDatabase, DatabaseConnection, EntityTrait, IntoActiveModel, ModelTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectOptions, ConnectionTrait,
+    Database as SeaDatabase, DatabaseConnection, DatabaseTransaction, EntityTrait, IntoActiveModel,
+    ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode,
+    TransactionOptions, TransactionTrait, sea_query::Expr,
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -15,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     dedupe::{CatalogMembership, RawSingleCoverage, ReleaseTrackIndex},
     entity::{
-        artist_source, canonical_alias, canonical_artist, canonical_backfill_state,
+        artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
         channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
         download_client_scan, download_event, download_job, download_release_link, match_candidate,
@@ -24,10 +25,11 @@ use crate::{
     },
     migration::Migrator,
     model::{
-        ArtistCatalogPage, ArtistCreditSource, ArtistRole, CanonicalTorrent, ChannelConfig,
-        ChannelPack, ChannelPackDecision, ChannelPackItem, ChannelPackSummary, ChannelRun,
-        ChannelRunPhase, ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob,
-        DownloadState, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseSummary,
+        ArtistCatalogPage, ArtistCreditSource, ArtistRole, BackgroundJobCounts, BackgroundJobState,
+        BackgroundJobStatus, BackgroundJobsOverview, CanonicalTorrent, ChannelConfig, ChannelPack,
+        ChannelPackDecision, ChannelPackItem, ChannelPackSummary, ChannelRun, ChannelRunPhase,
+        ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob, DownloadState,
+        LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseSummary,
         RuntimePreferences,
     },
 };
@@ -106,6 +108,25 @@ pub struct StoredProviderState {
     pub max_concurrency: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredBackgroundJob {
+    pub id: Uuid,
+    pub kind: String,
+    pub payload: Value,
+    pub attempts: u32,
+}
+
+pub struct EnqueueBackgroundJob<'a> {
+    pub deduplication_key: &'a str,
+    pub kind: &'a str,
+    pub payload: Value,
+    pub priority: i64,
+    pub max_attempts: u32,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub parent_id: Option<Uuid>,
+    pub recurring_interval_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalBackfillProgress {
@@ -129,6 +150,7 @@ impl Database {
             .map_sqlx_sqlite_opts(|options| {
                 options
                     .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(30))
                     .foreign_keys(true)
             });
         let connection = SeaDatabase::connect(options)
@@ -138,6 +160,16 @@ impl Database {
             .await
             .context("run database migrations")?;
         Ok(Self { connection })
+    }
+
+    async fn begin_write(&self) -> Result<DatabaseTransaction> {
+        Ok(self
+            .connection
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
+            .await?)
     }
 
     pub async fn get_snapshot<T: DeserializeOwned>(
@@ -189,6 +221,460 @@ impl Database {
             .await?;
         }
         Ok(())
+    }
+
+    pub async fn enqueue_background_job(&self, request: EnqueueBackgroundJob<'_>) -> Result<Uuid> {
+        let transaction = self.begin_write().await?;
+        let id = self
+            .enqueue_background_job_on(&transaction, request)
+            .await?;
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    async fn enqueue_background_job_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        request: EnqueueBackgroundJob<'_>,
+    ) -> Result<Uuid> {
+        let now = Utc::now();
+        if let Some(model) = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(request.deduplication_key))
+            .one(connection)
+            .await?
+        {
+            let id = Uuid::parse_str(&model.id)?;
+            let mut active = model.clone().into_active_model();
+            active.priority = Set(model.priority.max(request.priority));
+            active.max_attempts = Set(i64::from(request.max_attempts.max(1)));
+            active.parent_id = Set(request.parent_id.map(|value| value.to_string()));
+            active.recurring_interval_seconds = Set(request
+                .recurring_interval_seconds
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)));
+            if matches!(model.state.as_str(), "completed" | "failed" | "cancelled") {
+                active.kind = Set(request.kind.into());
+                active.payload_json = Set(request.payload);
+                active.state = Set("pending".into());
+                active.attempts = Set(0);
+                active.next_run_at = Set(request.next_run_at.map(|value| value.to_rfc3339()));
+                active.lease_owner = Set(None);
+                active.lease_until = Set(None);
+                active.progress_completed = Set(0);
+                active.progress_total = Set(None);
+                active.progress_message = Set(None);
+                active.last_error_code = Set(None);
+                active.last_error_message = Set(None);
+                active.started_at = Set(None);
+                active.finished_at = Set(None);
+                active.cancelled_at = Set(None);
+            }
+            active.updated_at = Set(now.to_rfc3339());
+            active.update(connection).await?;
+            return Ok(id);
+        }
+        let id = Uuid::new_v4();
+        background_job::ActiveModel {
+            id: Set(id.to_string()),
+            deduplication_key: Set(request.deduplication_key.into()),
+            kind: Set(request.kind.into()),
+            payload_json: Set(request.payload),
+            state: Set("pending".into()),
+            priority: Set(request.priority),
+            attempts: Set(0),
+            max_attempts: Set(i64::from(request.max_attempts.max(1))),
+            next_run_at: Set(request.next_run_at.map(|value| value.to_rfc3339())),
+            lease_owner: Set(None),
+            lease_until: Set(None),
+            progress_completed: Set(0),
+            progress_total: Set(None),
+            progress_message: Set(None),
+            last_error_code: Set(None),
+            last_error_message: Set(None),
+            parent_id: Set(request.parent_id.map(|value| value.to_string())),
+            recurring_interval_seconds: Set(request
+                .recurring_interval_seconds
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX))),
+            created_at: Set(now.to_rfc3339()),
+            updated_at: Set(now.to_rfc3339()),
+            started_at: Set(None),
+            finished_at: Set(None),
+            cancelled_at: Set(None),
+        }
+        .insert(connection)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn recover_expired_background_jobs(&self) -> Result<u64> {
+        let now = Utc::now();
+        let cutoff = now.to_rfc3339();
+        let models = background_job::Entity::find()
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseUntil.lte(cutoff.clone()))
+            .all(&self.connection)
+            .await?;
+        let mut count = 0;
+        for model in models {
+            let attempts = model.attempts + 1;
+            let terminal = attempts >= model.max_attempts;
+            let result = background_job::Entity::update_many()
+                .col_expr(
+                    background_job::Column::State,
+                    Expr::value(if terminal { "failed" } else { "retrying" }),
+                )
+                .col_expr(background_job::Column::Attempts, Expr::value(attempts))
+                .col_expr(
+                    background_job::Column::NextRunAt,
+                    Expr::value((!terminal).then(|| now.to_rfc3339())),
+                )
+                .col_expr(
+                    background_job::Column::LeaseOwner,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    background_job::Column::LeaseUntil,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    background_job::Column::LastErrorCode,
+                    Expr::value(Some("worker_lease_expired")),
+                )
+                .col_expr(
+                    background_job::Column::LastErrorMessage,
+                    Expr::value(Some("Worker stopped before completing the job")),
+                )
+                .col_expr(
+                    background_job::Column::FinishedAt,
+                    Expr::value(terminal.then(|| now.to_rfc3339())),
+                )
+                .col_expr(
+                    background_job::Column::ProgressMessage,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    background_job::Column::UpdatedAt,
+                    Expr::value(now.to_rfc3339()),
+                )
+                .filter(background_job::Column::Id.eq(model.id))
+                .filter(background_job::Column::State.eq("running"))
+                .filter(background_job::Column::LeaseUntil.lte(cutoff.clone()))
+                .exec(&self.connection)
+                .await?;
+            count += result.rows_affected;
+        }
+        Ok(count)
+    }
+
+    pub async fn release_background_job_lease(&self, owner: &str) -> Result<u64> {
+        let now = Utc::now();
+        Ok(background_job::Entity::update_many()
+            .col_expr(background_job::Column::State, Expr::value("retrying"))
+            .col_expr(
+                background_job::Column::NextRunAt,
+                Expr::value(Some(now.to_rfc3339())),
+            )
+            .col_expr(
+                background_job::Column::LeaseOwner,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                background_job::Column::LeaseUntil,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                background_job::Column::ProgressMessage,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                background_job::Column::LastErrorCode,
+                Expr::value(Some("service_shutdown")),
+            )
+            .col_expr(
+                background_job::Column::LastErrorMessage,
+                Expr::value(Some("Service stopped before the job completed")),
+            )
+            .col_expr(
+                background_job::Column::UpdatedAt,
+                Expr::value(now.to_rfc3339()),
+            )
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .exec(&self.connection)
+            .await?
+            .rows_affected)
+    }
+
+    pub async fn claim_background_job(
+        &self,
+        owner: &str,
+        lease_duration: std::time::Duration,
+    ) -> Result<Option<StoredBackgroundJob>> {
+        loop {
+            let now = Utc::now();
+            let Some(model) = background_job::Entity::find()
+                .filter(background_job::Column::State.is_in(["pending", "retrying"]))
+                .filter(
+                    Condition::any()
+                        .add(background_job::Column::NextRunAt.is_null())
+                        .add(background_job::Column::NextRunAt.lte(now.to_rfc3339())),
+                )
+                .order_by_desc(background_job::Column::Priority)
+                .order_by_asc(background_job::Column::CreatedAt)
+                .one(&self.connection)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let stored = stored_background_job(&model)?;
+            let result = background_job::Entity::update_many()
+                .col_expr(background_job::Column::State, Expr::value("running"))
+                .col_expr(
+                    background_job::Column::LeaseOwner,
+                    Expr::value(Some(owner.to_owned())),
+                )
+                .col_expr(
+                    background_job::Column::LeaseUntil,
+                    Expr::value(Some(
+                        (now + chrono::Duration::from_std(lease_duration)?).to_rfc3339(),
+                    )),
+                )
+                .col_expr(
+                    background_job::Column::StartedAt,
+                    Expr::value(Some(now.to_rfc3339())),
+                )
+                .col_expr(
+                    background_job::Column::UpdatedAt,
+                    Expr::value(now.to_rfc3339()),
+                )
+                .filter(background_job::Column::Id.eq(model.id))
+                .filter(background_job::Column::State.is_in(["pending", "retrying"]))
+                .exec(&self.connection)
+                .await?;
+            if result.rows_affected == 1 {
+                return Ok(Some(stored));
+            }
+        }
+    }
+
+    pub async fn heartbeat_background_job(
+        &self,
+        id: Uuid,
+        owner: &str,
+        lease_duration: std::time::Duration,
+        completed: u64,
+        total: Option<u64>,
+        message: Option<&str>,
+    ) -> Result<bool> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let now = Utc::now();
+        let mut active = model.into_active_model();
+        active.lease_until = Set(Some(
+            (now + chrono::Duration::from_std(lease_duration)?).to_rfc3339(),
+        ));
+        active.progress_completed = Set(i64::try_from(completed).unwrap_or(i64::MAX));
+        active.progress_total = Set(total.map(|value| i64::try_from(value).unwrap_or(i64::MAX)));
+        active.progress_message = Set(message.map(|value| value.chars().take(200).collect()));
+        active.updated_at = Set(now.to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(true)
+    }
+
+    pub async fn complete_background_job(&self, id: Uuid, owner: &str) -> Result<()> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(());
+        };
+        if model.state == "cancelled" {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let recurring = model.recurring_interval_seconds;
+        let mut active = model.into_active_model();
+        if let Some(seconds) = recurring {
+            active.state = Set("pending".into());
+            active.next_run_at = Set(Some(
+                (now + chrono::Duration::seconds(seconds.max(1))).to_rfc3339(),
+            ));
+            active.progress_completed = Set(0);
+            active.progress_total = Set(None);
+            active.progress_message = Set(None);
+        } else {
+            active.state = Set("completed".into());
+            active.next_run_at = Set(None);
+        }
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(None);
+        active.last_error_message = Set(None);
+        active.finished_at = Set(Some(now.to_rfc3339()));
+        active.updated_at = Set(now.to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_background_job(
+        &self,
+        id: Uuid,
+        owner: &str,
+        delay: std::time::Duration,
+        increment_attempt: bool,
+        code: &str,
+        message: &str,
+    ) -> Result<()> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(());
+        };
+        if model.state == "cancelled" {
+            return Ok(());
+        }
+        let attempts = model.attempts + i64::from(increment_attempt);
+        let terminal = increment_attempt && attempts >= model.max_attempts;
+        let now = Utc::now();
+        let mut active = model.into_active_model();
+        active.state = Set(if terminal { "failed" } else { "retrying" }.into());
+        active.attempts = Set(attempts);
+        active.next_run_at = Set((!terminal).then(|| {
+            (now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1)))
+                .to_rfc3339()
+        }));
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(Some(code.into()));
+        active.last_error_message = Set(Some(message.chars().take(500).collect()));
+        active.finished_at = Set(terminal.then(|| now.to_rfc3339()));
+        active.updated_at = Set(now.to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
+    pub async fn background_jobs_overview(&self, limit: u64) -> Result<BackgroundJobsOverview> {
+        let mut counts = BackgroundJobCounts::default();
+        for (state, count) in [
+            ("pending", &mut counts.pending),
+            ("running", &mut counts.running),
+            ("retrying", &mut counts.retrying),
+            ("completed", &mut counts.completed),
+            ("failed", &mut counts.failed),
+            ("cancelled", &mut counts.cancelled),
+        ] {
+            *count = background_job::Entity::find()
+                .filter(background_job::Column::State.eq(state))
+                .count(&self.connection)
+                .await?;
+        }
+        let limit = limit.clamp(1, 500);
+        let mut jobs = Vec::new();
+        for state in [
+            "running",
+            "retrying",
+            "failed",
+            "pending",
+            "completed",
+            "cancelled",
+        ] {
+            let remaining = limit.saturating_sub(jobs.len() as u64);
+            if remaining == 0 {
+                break;
+            }
+            let mut query = background_job::Entity::find()
+                .filter(background_job::Column::State.eq(state))
+                .limit(remaining);
+            query = if state == "pending" {
+                query
+                    .order_by_desc(background_job::Column::Priority)
+                    .order_by_asc(background_job::Column::CreatedAt)
+            } else if state == "retrying" {
+                query
+                    .order_by_asc(background_job::Column::NextRunAt)
+                    .order_by_desc(background_job::Column::Priority)
+            } else {
+                query.order_by_desc(background_job::Column::UpdatedAt)
+            };
+            jobs.extend(
+                query
+                    .all(&self.connection)
+                    .await?
+                    .into_iter()
+                    .map(background_job_status)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(BackgroundJobsOverview { counts, jobs })
+    }
+
+    pub async fn prune_background_jobs(&self, retention: chrono::Duration) -> Result<u64> {
+        let cutoff = (Utc::now() - retention).to_rfc3339();
+        Ok(background_job::Entity::delete_many()
+            .filter(background_job::Column::State.is_in(["completed", "cancelled"]))
+            .filter(background_job::Column::UpdatedAt.lt(cutoff))
+            .exec(&self.connection)
+            .await?
+            .rows_affected)
+    }
+
+    pub async fn cancel_background_job(&self, id: Uuid) -> Result<bool> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if matches!(model.state.as_str(), "completed" | "failed" | "cancelled") {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        let mut active = model.into_active_model();
+        active.state = Set("cancelled".into());
+        active.cancelled_at = Set(Some(now.to_rfc3339()));
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_message = Set(None);
+        active.updated_at = Set(now.to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(true)
+    }
+
+    pub async fn retry_failed_background_job(&self, id: Uuid) -> Result<bool> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::State.is_in(["failed", "cancelled"]))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut active = model.into_active_model();
+        active.state = Set("pending".into());
+        active.attempts = Set(0);
+        active.next_run_at = Set(None);
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_completed = Set(0);
+        active.progress_total = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(None);
+        active.last_error_message = Set(None);
+        active.finished_at = Set(None);
+        active.cancelled_at = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(true)
     }
 
     pub async fn provider_state(&self, id: &str) -> Result<Option<StoredProviderState>> {
@@ -357,7 +843,7 @@ impl Database {
         channel_id: &str,
         trigger: ChannelRunTrigger,
     ) -> Result<Option<ChannelRun>> {
-        let transaction = self.connection.begin().await?;
+        let transaction = self.begin_write().await?;
         if channel_run::Entity::find()
             .filter(channel_run::Column::ChannelId.eq(channel_id))
             .filter(channel_run::Column::Status.eq("running"))
@@ -469,7 +955,7 @@ impl Database {
         items: &[ChannelPackItem],
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
-        let transaction = self.connection.begin().await?;
+        let transaction = self.begin_write().await?;
         channel_pack::ActiveModel {
             id: Set(id.to_string()),
             channel_id: Set(channel_id.into()),
@@ -590,7 +1076,7 @@ impl Database {
         fingerprint: &str,
         items: &[ChannelPackItem],
     ) -> Result<i32> {
-        let transaction = self.connection.begin().await?;
+        let transaction = self.begin_write().await?;
         let model = channel_pack::Entity::find_by_id(id.to_string())
             .one(&transaction)
             .await?
@@ -670,12 +1156,28 @@ impl Database {
         group_id: i64,
         priority: i64,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.ensure_track_index_on(&transaction, tracker, group_id, priority)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn ensure_track_index_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        tracker: &str,
+        group_id: i64,
+        priority: i64,
+    ) -> Result<()> {
         let now = Utc::now();
+        let mut should_enqueue = false;
         if let Some(model) = release_track_index::Entity::find_by_id((tracker.to_owned(), group_id))
-            .one(&self.connection)
+            .one(connection)
             .await?
         {
             let current_priority = model.priority;
+            let current_state = model.state.clone();
             let expired = model
                 .expires_at
                 .as_deref()
@@ -688,9 +1190,12 @@ impl Database {
                 active.state = Set("pending".into());
                 active.next_retry_at = Set(None);
                 active.updated_at = Set(now.to_rfc3339());
+                should_enqueue = true;
             }
-            active.update(&self.connection).await?;
+            should_enqueue |= current_state != "indexed";
+            active.update(connection).await?;
         } else {
+            should_enqueue = true;
             release_track_index::ActiveModel {
                 tracker: Set(tracker.into()),
                 group_id: Set(group_id),
@@ -704,18 +1209,38 @@ impl Database {
                 updated_at: Set(now.to_rfc3339()),
                 priority: Set(priority),
             }
-            .insert(&self.connection)
+            .insert(connection)
+            .await?;
+        }
+        if should_enqueue {
+            self.enqueue_background_job_on(
+                connection,
+                EnqueueBackgroundJob {
+                    deduplication_key: &format!(
+                        "track-index:{}:{group_id}:v1",
+                        tracker.to_ascii_lowercase()
+                    ),
+                    kind: "index_tracklist",
+                    payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    priority,
+                    max_attempts: 12,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
             .await?;
         }
         Ok(())
     }
 
     pub async fn ensure_single_coverage(&self, tracker: &str, group_id: i64) -> Result<()> {
-        if single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
-            .one(&self.connection)
-            .await?
-            .is_none()
-        {
+        let transaction = self.begin_write().await?;
+        let existing = single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&transaction)
+            .await?;
+        let should_enqueue = existing.as_ref().is_none_or(|model| model.state != "ready");
+        if existing.is_none() {
             single_album_coverage::ActiveModel {
                 tracker: Set(tracker.into()),
                 single_group_id: Set(group_id),
@@ -723,9 +1248,29 @@ impl Database {
                 coverage_json: Set(None),
                 updated_at: Set(Utc::now().to_rfc3339()),
             }
-            .insert(&self.connection)
+            .insert(&transaction)
             .await?;
         }
+        if should_enqueue {
+            self.enqueue_background_job_on(
+                &transaction,
+                EnqueueBackgroundJob {
+                    deduplication_key: &format!(
+                        "single-coverage:{}:{group_id}:v1",
+                        tracker.to_ascii_lowercase()
+                    ),
+                    kind: "compute_single_coverage",
+                    payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    priority: 5,
+                    max_attempts: 20,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -766,23 +1311,94 @@ impl Database {
     }
 
     pub async fn put_track_index(&self, index: &ReleaseTrackIndex) -> Result<()> {
+        self.put_track_index_with_parent(index, None).await
+    }
+
+    pub async fn put_track_index_with_parent(
+        &self,
+        index: &ReleaseTrackIndex,
+        parent_id: Option<Uuid>,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        let index_json = serde_json::to_value(index)?;
+        let mut changed = false;
         if let Some(model) =
             release_track_index::Entity::find_by_id((index.tracker.clone(), index.group_id))
-                .one(&self.connection)
+                .one(&transaction)
                 .await?
         {
+            changed = model.index_json.as_ref() != Some(&index_json);
             let now = Utc::now();
             let mut active = model.into_active_model();
             active.state = Set("indexed".into());
-            active.index_json = Set(Some(serde_json::to_value(index)?));
+            active.index_json = Set(Some(index_json));
             active.attempts = Set(0);
             active.next_retry_at = Set(None);
             active.error_message = Set(None);
             active.fetched_at = Set(Some(now.to_rfc3339()));
             active.expires_at = Set(Some((now + chrono::Duration::hours(24)).to_rfc3339()));
             active.updated_at = Set(now.to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(&transaction).await?;
         }
+        transaction.commit().await?;
+        if changed {
+            for group_id in self
+                .affected_single_groups_on(&self.connection, &index.tracker, index.group_id)
+                .await?
+            {
+                self.invalidate_single_coverage(&index.tracker, group_id, parent_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn invalidate_single_coverage(
+        &self,
+        tracker: &str,
+        group_id: i64,
+        parent_id: Option<Uuid>,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        let now = Utc::now().to_rfc3339();
+        if let Some(model) =
+            single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+                .one(&transaction)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set("pending".into());
+            active.updated_at = Set(now.clone());
+            active.update(&transaction).await?;
+        } else {
+            single_album_coverage::ActiveModel {
+                tracker: Set(tracker.into()),
+                single_group_id: Set(group_id),
+                state: Set("pending".into()),
+                coverage_json: Set(None),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        self.enqueue_background_job_on(
+            &transaction,
+            EnqueueBackgroundJob {
+                deduplication_key: &format!(
+                    "single-coverage:{}:{group_id}:v1",
+                    tracker.to_ascii_lowercase()
+                ),
+                kind: "compute_single_coverage",
+                payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                priority: 5,
+                max_attempts: 20,
+                next_run_at: None,
+                parent_id,
+                recurring_interval_seconds: None,
+            },
+        )
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -829,7 +1445,27 @@ impl Database {
         tracker: &str,
         catalog: &ArtistCatalogPage,
     ) -> Result<()> {
-        let transaction = self.connection.begin().await?;
+        let transaction = self.begin_write().await?;
+        let mut old_groups = std::collections::HashMap::new();
+        let mut old_singles = std::collections::HashSet::new();
+        for model in dedupe_catalog_membership::Entity::find()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq(tracker))
+            .filter(dedupe_catalog_membership::Column::ArtistId.eq(catalog.artist.artist_id))
+            .all(&transaction)
+            .await?
+        {
+            old_groups.insert(model.group_id, model.group_json.clone());
+            let group: crate::model::ArtistCatalogRelease =
+                serde_json::from_value(model.group_json)?;
+            if group
+                .release
+                .release_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+            {
+                old_singles.insert(group.release.group_id);
+            }
+        }
         dedupe_catalog_membership::Entity::delete_many()
             .filter(dedupe_catalog_membership::Column::Tracker.eq(tracker))
             .filter(dedupe_catalog_membership::Column::ArtistId.eq(catalog.artist.artist_id))
@@ -837,18 +1473,91 @@ impl Database {
             .await?;
         let now = Utc::now().to_rfc3339();
         let mut seen_groups = std::collections::HashSet::new();
+        let mut new_groups = std::collections::HashMap::new();
+        let mut new_singles = std::collections::HashSet::new();
         for group in &catalog.groups {
             if !seen_groups.insert(group.release.group_id) {
                 continue;
             }
+            let group_json = serde_json::to_value(group)?;
+            new_groups.insert(group.release.group_id, group_json.clone());
             dedupe_catalog_membership::ActiveModel {
                 tracker: Set(tracker.into()),
                 artist_id: Set(catalog.artist.artist_id),
                 group_id: Set(group.release.group_id),
-                group_json: Set(serde_json::to_value(group)?),
+                group_json: Set(group_json),
                 updated_at: Set(now.clone()),
             }
             .insert(&transaction)
+            .await?;
+            let release_type = group.release.release_type.as_deref();
+            let is_album = release_type.is_some_and(|kind| kind.eq_ignore_ascii_case("album"));
+            let is_single = release_type.is_some_and(|kind| kind.eq_ignore_ascii_case("single"));
+            if group
+                .roles
+                .contains(&crate::model::ArtistCatalogRole::Primary)
+                && group.listed_on_tracker
+                && !group.variants.is_empty()
+                && (is_album || is_single)
+            {
+                self.ensure_track_index_on(
+                    &transaction,
+                    tracker,
+                    group.release.group_id,
+                    if is_album { 20 } else { 0 },
+                )
+                .await?;
+            }
+            if is_single {
+                new_singles.insert(group.release.group_id);
+            }
+        }
+        let mut dirty_singles = std::collections::HashSet::new();
+        if old_groups != new_groups {
+            dirty_singles.extend(old_singles);
+            dirty_singles.extend(new_singles);
+        }
+        for group_id in dirty_singles {
+            if single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+                .one(&transaction)
+                .await?
+                .is_none()
+            {
+                single_album_coverage::ActiveModel {
+                    tracker: Set(tracker.into()),
+                    single_group_id: Set(group_id),
+                    state: Set("pending".into()),
+                    coverage_json: Set(None),
+                    updated_at: Set(now.clone()),
+                }
+                .insert(&transaction)
+                .await?;
+            } else if let Some(model) =
+                single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+                    .one(&transaction)
+                    .await?
+            {
+                let mut active = model.into_active_model();
+                active.state = Set("pending".into());
+                active.updated_at = Set(now.clone());
+                active.update(&transaction).await?;
+            }
+            self.enqueue_background_job_on(
+                &transaction,
+                EnqueueBackgroundJob {
+                    deduplication_key: &format!(
+                        "single-coverage:{}:{group_id}:v1",
+                        tracker.to_ascii_lowercase()
+                    ),
+                    kind: "compute_single_coverage",
+                    payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    priority: 5,
+                    max_attempts: 20,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
             .await?;
         }
         transaction.commit().await?;
@@ -867,6 +1576,44 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    async fn affected_single_groups_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        tracker: &str,
+        changed_group_id: i64,
+    ) -> Result<Vec<i64>> {
+        let artist_ids = dedupe_catalog_membership::Entity::find()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq(tracker))
+            .filter(dedupe_catalog_membership::Column::GroupId.eq(changed_group_id))
+            .all(connection)
+            .await?
+            .into_iter()
+            .map(|model| model.artist_id)
+            .collect::<std::collections::HashSet<_>>();
+        if artist_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut singles = std::collections::HashSet::new();
+        for model in dedupe_catalog_membership::Entity::find()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq(tracker))
+            .filter(dedupe_catalog_membership::Column::ArtistId.is_in(artist_ids))
+            .all(connection)
+            .await?
+        {
+            let group: crate::model::ArtistCatalogRelease =
+                serde_json::from_value(model.group_json)?;
+            if group
+                .release
+                .release_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+            {
+                singles.insert(group.release.group_id);
+            }
+        }
+        Ok(singles.into_iter().collect())
     }
 
     pub async fn list_track_indexes(&self) -> Result<Vec<StoredTrackIndex>> {
@@ -903,6 +1650,16 @@ impl Database {
             resolving: resolving as usize,
             failed: failed as usize,
         })
+    }
+
+    pub async fn pending_single_coverages(&self) -> Result<Vec<(String, i64)>> {
+        Ok(single_album_coverage::Entity::find()
+            .filter(single_album_coverage::Column::State.is_in(["pending", "failed"]))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| (model.tracker, model.single_group_id))
+            .collect())
     }
 
     pub async fn put_single_coverage(
@@ -2510,7 +3267,7 @@ impl Database {
         if canonical.release.artists.is_empty() {
             return Ok(());
         }
-        let transaction = self.connection.begin().await?;
+        let transaction = self.begin_write().await?;
         canonical_release_artist::Entity::delete_many()
             .filter(canonical_release_artist::Column::Tracker.eq(&canonical.release.tracker))
             .filter(canonical_release_artist::Column::GroupId.eq(canonical.release.group_id))
@@ -2571,6 +3328,7 @@ impl Database {
         announce_host: Option<&str>,
         tracker: Option<&str>,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let now_value = Utc::now();
         let now = now_value.to_rfc3339();
         let completed_at =
@@ -2581,13 +3339,15 @@ impl Database {
         } else {
             "unconfigured"
         };
+        let should_resolve;
         if let Some(model) =
             download_release_link::Entity::find_by_id((live.client.clone(), hash.clone()))
-                .one(&self.connection)
+                .one(&transaction)
                 .await?
         {
             let linked = model.resolution_state == "linked";
             let tracker_changed = model.tracker.as_deref() != tracker;
+            should_resolve = tracker.is_some() && (!linked || tracker_changed);
             let has_library_added_at = model.library_added_at.is_some();
             let has_completed_at = model.completed_at.is_some();
             let mut active = model.into_active_model();
@@ -2608,11 +3368,12 @@ impl Database {
             if !has_completed_at && completed_at.is_some() {
                 active.completed_at = Set(completed_at);
             }
-            active.update(&self.connection).await?;
+            active.update(&transaction).await?;
         } else {
+            should_resolve = tracker.is_some();
             download_release_link::ActiveModel {
                 client: Set(live.client.clone()),
-                info_hash: Set(hash),
+                info_hash: Set(hash.clone()),
                 announce_host: Set(announce_host.map(str::to_owned)),
                 tracker: Set(tracker.map(str::to_owned)),
                 group_id: Set(None),
@@ -2631,9 +3392,29 @@ impl Database {
                 library_added_at: Set(completed_at.clone()),
                 completed_at: Set(completed_at),
             }
-            .insert(&self.connection)
+            .insert(&transaction)
             .await?;
         }
+        if should_resolve && let Some(tracker) = tracker {
+            self.enqueue_background_job_on(
+                &transaction,
+                EnqueueBackgroundJob {
+                    deduplication_key: &format!(
+                        "resolve-hash:{}:{hash}",
+                        tracker.to_ascii_lowercase()
+                    ),
+                    kind: "resolve_download_hash",
+                    payload: serde_json::json!({ "tracker": tracker, "infoHash": hash }),
+                    priority: 20,
+                    max_attempts: 30,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -2717,6 +3498,26 @@ impl Database {
         Ok(models.into_iter().map(link_from_model).collect())
     }
 
+    pub async fn links_for_tracker_hash(
+        &self,
+        tracker: &str,
+        info_hash: &str,
+    ) -> Result<Vec<DownloadReleaseLink>> {
+        Ok(download_release_link::Entity::find()
+            .filter(download_release_link::Column::Tracker.eq(tracker))
+            .filter(download_release_link::Column::InfoHash.eq(info_hash.to_ascii_lowercase()))
+            .filter(download_release_link::Column::ResolutionState.is_in([
+                "pending",
+                "resolving",
+                "failed",
+            ]))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(link_from_model)
+            .collect())
+    }
+
     pub async fn recover_resolving_links(&self) -> Result<()> {
         let models = download_release_link::Entity::find()
             .filter(download_release_link::Column::ResolutionState.eq("resolving"))
@@ -2738,7 +3539,7 @@ impl Database {
         scan_started_at: DateTime<Utc>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let transaction = self.connection.begin().await?;
+        let transaction = self.begin_write().await?;
         let stale = download_release_link::Entity::find()
             .filter(download_release_link::Column::Client.eq(client))
             .filter(download_release_link::Column::LastSeenAt.lt(scan_started_at.to_rfc3339()))
@@ -3107,6 +3908,67 @@ fn provider_state_from_model(model: provider_state::Model) -> Result<StoredProvi
     })
 }
 
+fn stored_background_job(model: &background_job::Model) -> Result<StoredBackgroundJob> {
+    Ok(StoredBackgroundJob {
+        id: Uuid::parse_str(&model.id)?,
+        kind: model.kind.clone(),
+        payload: model.payload_json.clone(),
+        attempts: u32::try_from(model.attempts).unwrap_or(u32::MAX),
+    })
+}
+
+fn background_job_status(model: background_job::Model) -> Result<BackgroundJobStatus> {
+    let state = BackgroundJobState::from_str(&model.state)?;
+    Ok(BackgroundJobStatus {
+        id: Uuid::parse_str(&model.id)?,
+        deduplication_key: model.deduplication_key,
+        kind: model.kind,
+        state,
+        priority: model.priority,
+        attempts: u32::try_from(model.attempts).unwrap_or(u32::MAX),
+        max_attempts: u32::try_from(model.max_attempts).unwrap_or(u32::MAX),
+        next_run_at: model
+            .next_run_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?,
+        lease_until: model
+            .lease_until
+            .map(|value| parse_timestamp(&value))
+            .transpose()?,
+        progress_completed: u64::try_from(model.progress_completed).unwrap_or_default(),
+        progress_total: model
+            .progress_total
+            .and_then(|value| u64::try_from(value).ok()),
+        progress_message: model.progress_message,
+        last_error_code: model.last_error_code,
+        last_error_message: model.last_error_message,
+        parent_id: model
+            .parent_id
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()?,
+        created_at: parse_timestamp(&model.created_at)?,
+        updated_at: parse_timestamp(&model.updated_at)?,
+        started_at: model
+            .started_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?,
+        finished_at: model
+            .finished_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?,
+        can_cancel: matches!(
+            state,
+            BackgroundJobState::Pending
+                | BackgroundJobState::Running
+                | BackgroundJobState::Retrying
+        ),
+        can_retry: matches!(
+            state,
+            BackgroundJobState::Failed | BackgroundJobState::Cancelled
+        ),
+    })
+}
+
 fn channel_run_trigger(value: &ChannelRunTrigger) -> &'static str {
     match value {
         ChannelRunTrigger::Scheduled => "scheduled",
@@ -3377,7 +4239,171 @@ mod tests {
         tracker::fallback_artist_credit,
     };
 
-    use super::Database;
+    use super::{Database, EnqueueBackgroundJob};
+
+    #[tokio::test]
+    async fn background_jobs_are_deduplicated_leased_recovered_and_controllable() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("jobs.sqlite"))
+            .await
+            .expect("database");
+        let request = || EnqueueBackgroundJob {
+            deduplication_key: "test:durable-job",
+            kind: "test_job",
+            payload: serde_json::json!({ "value": 1 }),
+            priority: 10,
+            max_attempts: 3,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: None,
+        };
+
+        let id = db.enqueue_background_job(request()).await.expect("enqueue");
+        assert_eq!(
+            db.enqueue_background_job(request())
+                .await
+                .expect("deduplicated enqueue"),
+            id
+        );
+        assert_eq!(
+            db.background_jobs_overview(10)
+                .await
+                .expect("overview")
+                .counts
+                .pending,
+            1
+        );
+
+        let claimed = db
+            .claim_background_job("worker-one", std::time::Duration::ZERO)
+            .await
+            .expect("claim")
+            .expect("claimed job");
+        assert_eq!(claimed.id, id);
+        assert_eq!(
+            db.recover_expired_background_jobs().await.expect("recover"),
+            1
+        );
+        let claimed = db
+            .claim_background_job("worker-two", std::time::Duration::from_secs(60))
+            .await
+            .expect("second claim")
+            .expect("recovered job");
+        assert_eq!(claimed.id, id);
+        assert_eq!(
+            db.release_background_job_lease("worker-two")
+                .await
+                .expect("release on shutdown"),
+            1
+        );
+        let claimed = db
+            .claim_background_job("worker-three", std::time::Duration::from_secs(60))
+            .await
+            .expect("third claim")
+            .expect("released job");
+        assert_eq!(claimed.id, id);
+        assert!(db.cancel_background_job(id).await.expect("cancel"));
+        db.complete_background_job(id, "worker-three")
+            .await
+            .expect("stale completion ignored");
+        assert_eq!(
+            db.background_jobs_overview(10)
+                .await
+                .expect("overview")
+                .jobs[0]
+                .state,
+            crate::model::BackgroundJobState::Cancelled
+        );
+
+        assert!(
+            db.retry_failed_background_job(id)
+                .await
+                .expect("manual retry")
+        );
+        let claimed = db
+            .claim_background_job("worker-four", std::time::Duration::from_secs(60))
+            .await
+            .expect("fourth claim")
+            .expect("retried job");
+        db.complete_background_job(claimed.id, "worker-four")
+            .await
+            .expect("complete");
+        assert_eq!(
+            db.background_jobs_overview(10)
+                .await
+                .expect("overview")
+                .jobs[0]
+                .state,
+            crate::model::BackgroundJobState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_job_enqueues_are_serialized_and_deduplicated() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("concurrent-jobs.sqlite"))
+            .await
+            .expect("database");
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let db = db.clone();
+            tasks.spawn(async move {
+                db.enqueue_background_job(EnqueueBackgroundJob {
+                    deduplication_key: "test:concurrent-job",
+                    kind: "test_job",
+                    payload: serde_json::json!({ "value": 1 }),
+                    priority: 10,
+                    max_attempts: 3,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                })
+                .await
+            });
+        }
+        let mut ids = std::collections::HashSet::new();
+        while let Some(result) = tasks.join_next().await {
+            ids.insert(result.expect("task").expect("enqueue"));
+        }
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            db.background_jobs_overview(10)
+                .await
+                .expect("overview")
+                .counts
+                .pending,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_changes_enqueue_background_work_transactionally() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("transactional-jobs.sqlite"))
+            .await
+            .expect("database");
+
+        db.enqueue_track_index_with_priority("ops", 42, 20)
+            .await
+            .expect("track index");
+        db.ensure_single_coverage("ops", 42)
+            .await
+            .expect("single coverage");
+        let overview = db.background_jobs_overview(10).await.expect("overview");
+        assert_eq!(overview.counts.pending, 2);
+        assert!(
+            overview
+                .jobs
+                .iter()
+                .any(|job| job.kind == "index_tracklist")
+        );
+        assert!(
+            overview
+                .jobs
+                .iter()
+                .any(|job| job.kind == "compute_single_coverage")
+        );
+    }
 
     #[tokio::test]
     async fn migrates_and_keeps_multi_client_hash_associations() {

@@ -215,7 +215,7 @@
               <div class="artist-mosaic" class:single={artist.artworks.length < 2}>
                 {#if artist.artworks.length}
                   {#each artist.artworks as artwork}
-                    <img src={artwork} alt="" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
+                    <img src={artwork} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
                   {/each}
                 {:else}
                   <Disc3 size={38} />
@@ -261,7 +261,7 @@
               <a class="cover" href={item.release.id ? appPath(`/releases/${item.release.id}?from=library`) : undefined}>
                 <Disc3 size={28} />
                 {#if item.release.artwork}
-                  <img src={item.release.artwork} alt="" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
+                  <img src={item.release.artwork} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
                 {/if}
               </a>
               <div>

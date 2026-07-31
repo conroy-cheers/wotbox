@@ -449,6 +449,77 @@ pub struct ProviderStatus {
     pub can_resume: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundJobState {
+    Pending,
+    Running,
+    Retrying,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl std::str::FromStr for BackgroundJobState {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "retrying" => Self::Retrying,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => anyhow::bail!("unknown background job state {value}"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundJobStatus {
+    pub id: Uuid,
+    pub deduplication_key: String,
+    pub kind: String,
+    pub state: BackgroundJobState,
+    pub priority: i64,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub lease_until: Option<DateTime<Utc>>,
+    pub progress_completed: u64,
+    pub progress_total: Option<u64>,
+    pub progress_message: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub parent_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub can_cancel: bool,
+    pub can_retry: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundJobCounts {
+    pub pending: u64,
+    pub running: u64,
+    pub retrying: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundJobsOverview {
+    pub counts: BackgroundJobCounts,
+    pub jobs: Vec<BackgroundJobStatus>,
+}
+
 impl ReleasePreferences {
     pub fn migrate_legacy(mut self) -> Self {
         let was_legacy = !self.legacy_quality_order.is_empty();

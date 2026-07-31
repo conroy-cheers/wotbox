@@ -5,11 +5,11 @@ use sea_orm_migration::{
 };
 
 use crate::entity::{
-    artist_source, canonical_alias, canonical_artist, canonical_backfill_state, canonical_release,
-    canonical_release_artist, canonical_release_credit, canonical_torrent, channel_config,
-    channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership, download_client_scan,
-    download_event, download_job, download_release_link, match_candidate, provider_state,
-    release_source, release_track_index, runtime_preference, single_album_coverage,
+    artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
+    canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
+    channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
+    download_client_scan, download_event, download_job, download_release_link, match_candidate,
+    provider_state, release_source, release_track_index, runtime_preference, single_album_coverage,
     tracker_snapshot,
 };
 
@@ -24,7 +24,54 @@ impl MigratorTrait for Migrator {
             Box::new(ChannelSchema),
             Box::new(ChannelProgressSchema),
             Box::new(ProviderSafetySchema),
+            Box::new(BackgroundJobSchema),
         ]
+    }
+}
+
+struct BackgroundJobSchema;
+
+impl MigrationName for BackgroundJobSchema {
+    fn name(&self) -> &str {
+        "m20260731_000006_background_jobs"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for BackgroundJobSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, background_job::Entity).await?;
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .name("idx_background_jobs_due")
+                .table(background_job::Entity)
+                .col(background_job::Column::State)
+                .col(background_job::Column::NextRunAt)
+                .col(background_job::Column::Priority)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_background_jobs_lease")
+                .table(background_job::Entity)
+                .col(background_job::Column::State)
+                .col(background_job::Column::LeaseUntil)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_background_jobs_updated")
+                .table(background_job::Entity)
+                .col(background_job::Column::UpdatedAt)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

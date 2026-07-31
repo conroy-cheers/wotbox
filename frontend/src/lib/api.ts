@@ -486,6 +486,43 @@ export type ProviderStatus = {
   canResume: boolean;
 };
 
+export type BackgroundJobState =
+  | "pending"
+  | "running"
+  | "retrying"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type BackgroundJobStatus = {
+  id: string;
+  deduplicationKey: string;
+  kind: string;
+  state: BackgroundJobState;
+  priority: number;
+  attempts: number;
+  maxAttempts: number;
+  nextRunAt?: string;
+  leaseUntil?: string;
+  progressCompleted: number;
+  progressTotal?: number;
+  progressMessage?: string;
+  lastErrorCode?: string;
+  lastErrorMessage?: string;
+  parentId?: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  canCancel: boolean;
+  canRetry: boolean;
+};
+
+export type BackgroundJobsOverview = {
+  counts: Record<BackgroundJobState, number>;
+  jobs: BackgroundJobStatus[];
+};
+
 export type ChannelKind = "country_chart" | "lastfm";
 
 export type ChannelConfig = {

@@ -38,6 +38,16 @@ Tracker preference remains deliberately limited to download economics and
 variant ranking: OPS tokens are plentiful, while RED defaults to
 already-free torrents only.
 
+Long-running library work uses a durable SQLite queue instead of detached
+polling loops. Jobs have deduplication keys, priorities, bounded attempts,
+provider-aware retry times, progress, cancellation, parent links, and expiring
+worker leases. Two workers bound concurrency; expired leases are recovered
+without allowing stale workers to commit outcomes. Domain changes and their
+dependent jobs are written in one transaction, and tracklist changes invalidate
+only affected Single-to-Album coverage. Preferences → Background work exposes
+the live queue, failures, cancellation, and manual retry. Completed task history
+is retained for 30 days.
+
 The download API exposes `GET /api/v1/downloads` as `{ items, index }`, where
 each visible item combines a canonical release, its matched torrent variant,
 and live client state. Pending, failed, and unconfigured torrents remain
@@ -83,7 +93,8 @@ query-backed state:
 - `/releases/{releaseId}` — canonical release detail, selected torrent,
   exact live client attachment, expanded variants, and source context
 - `/matches` — review ambiguous artist and release matches
-- `/preferences` — runtime release, channel, and external API safety preferences
+- `/preferences` — runtime release, channel, external API safety, and background
+  task controls
 
 The embedded server returns the SPA shell for these routes so they can be
 loaded directly. Unknown paths render the Wotbox 404 view and carry an HTTP

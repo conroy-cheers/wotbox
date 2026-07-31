@@ -579,6 +579,46 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
 .provider-metrics strong { color: var(--text); }
 .provider-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .provider-actions small { color: var(--muted); font-size: 9px; }
+.background-work-panel { min-height: 0; margin-top: 18px; scroll-margin-top: 18px; }
+.job-counts {
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px;
+}
+.job-counts > div {
+  display: flex; flex-direction: column; gap: 2px; padding: 10px;
+  border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.012);
+}
+.job-counts > div.attention { border-color: rgba(210,78,94,.45); }
+.job-counts strong { font-size: 17px; }
+.job-counts span { color: var(--muted); font-size: 9px; text-transform: capitalize; }
+.background-job-list {
+  max-height: 480px; overflow: auto; border: 1px solid var(--line); border-radius: 10px;
+}
+.background-job-row {
+  display: grid; grid-template-columns: 9px minmax(0, 1fr) auto; align-items: start; gap: 11px;
+  padding: 12px 13px; border-bottom: 1px solid var(--line);
+}
+.background-job-row:last-child { border-bottom: 0; }
+.job-state-dot { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: var(--muted); }
+.job-state-dot.running { background: var(--accent-strong); box-shadow: 0 0 0 4px rgba(168,149,255,.09); }
+.job-state-dot.completed { background: var(--good); }
+.job-state-dot.failed { background: var(--bad); }
+.job-state-dot.retrying { background: #e2c777; }
+.background-job-copy { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.background-job-copy header { display: flex; align-items: center; gap: 8px; }
+.background-job-copy strong { font-size: 11px; }
+.background-job-copy > span, .background-job-copy small { color: var(--muted); font-size: 9px; line-height: 1.4; }
+.background-job-copy small { color: #d9a1a9; }
+.job-state {
+  padding: 2px 5px; border-radius: 99px; color: var(--muted); background: rgba(130,135,150,.1);
+  font-size: 8px; font-weight: 800; text-transform: uppercase;
+}
+.job-state.running { color: var(--accent-strong); }
+.job-state.completed { color: var(--good); }
+.job-state.failed { color: var(--bad); }
+.job-state.retrying { color: #e2c777; }
+.background-job-actions { display: flex; gap: 6px; }
+.job-progress { height: 3px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.06); }
+.job-progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .tracker-settings-panel, .quality-media-grid, .channel-preferences { scroll-margin-top: 18px; }
 .tracker-settings-panel { min-height: 0; }
 .settings-context { display: flex; gap: 8px; margin: -4px 0 14px; }
@@ -621,6 +661,7 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
 .token-policy > p strong { color: var(--text); }
 .token-auto-toggle { align-self: center; min-width: 0; white-space: normal; line-height: 1.4; }
 .token-auto-toggle input { flex: 0 0 auto; accent-color: var(--accent); }
+.token-auto-toggle span { min-width: 0; white-space: normal; }
 .token-limit input { width: 100%; }
 .quality-media-grid { margin-top: 16px; }
 .preference-list { display: grid; gap: 7px; }
@@ -809,7 +850,10 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
     position: fixed; z-index: 60; display: flex; inset: auto 10px 10px; justify-content: space-around;
     padding: 6px; border: 1px solid var(--line); border-radius: 14px; background: rgba(20,23,31,.94); backdrop-filter: blur(18px);
   }
-  .mobile-nav a { flex-direction: column; gap: 3px; padding: 7px 14px; font-size: 9px; }
+  .mobile-nav a {
+    flex: 1 1 0; min-width: 0; flex-direction: column; gap: 3px; padding: 7px 3px;
+    text-align: center; font-size: 9px;
+  }
   .mobile-nav a.active { color: var(--accent-strong); }
   .page-heading h1 { font-size: 34px; }
   .settings-nav {
@@ -817,6 +861,9 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
     overflow-x: auto; scrollbar-width: thin;
   }
   .tracker-policy-fields, .token-policy { grid-template-columns: 1fr; }
+  .job-counts { grid-template-columns: repeat(3, 1fr); }
+  .background-job-row { grid-template-columns: 9px minmax(0, 1fr); }
+  .background-job-actions { grid-column: 2; }
   .token-policy > p { grid-column: 1; }
   .preference-save-actions { align-items: stretch; flex-direction: column; }
   .preference-save-actions > div { display: grid; grid-template-columns: 1fr; }

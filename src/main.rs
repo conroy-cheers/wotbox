@@ -1,4 +1,5 @@
 mod api;
+mod background;
 mod channel;
 mod config;
 mod db;
@@ -12,10 +13,8 @@ mod release_matcher;
 mod tracker;
 
 use anyhow::{Context, Result};
-use api::{
-    AppState, router, spawn_channel_scheduler, spawn_deduplication_indexer, spawn_download_indexer,
-    spawn_reconciler,
-};
+use api::{AppState, router, spawn_channel_scheduler, spawn_reconciler};
+use background::spawn_background_workers;
 use clap::Parser;
 use config::{Cli, Config};
 use tower_http::{
@@ -31,9 +30,8 @@ async fn main() -> Result<()> {
     init_tracing();
     let config = Config::load(cli.config.as_deref())?;
     let state = AppState::new(&config).await?;
+    let background_runtime = spawn_background_workers(state.clone()).await?;
     spawn_reconciler(state.clone());
-    spawn_download_indexer(state.clone());
-    spawn_deduplication_indexer(state.clone());
     spawn_channel_scheduler(state.clone());
 
     let app = router(state)
@@ -46,9 +44,18 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {address}"))?;
     tracing::info!(%address, base_path = %config.base_path, "Wotbox listening");
+    let (server_shutdown, server_shutdown_signal) = tokio::sync::oneshot::channel();
+    let shutdown = tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = server_shutdown.send(());
+        background_runtime.shutdown().await;
+    });
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            let _ = server_shutdown_signal.await;
+        })
         .await?;
+    shutdown.await?;
     Ok(())
 }
 

@@ -25,21 +25,22 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::{
+    background::{self, BackgroundJobNotifier},
     channel,
     config::{Config, DownloadClientKind, TrackerKind, read_secret},
     db::{Cached, Database},
-    dedupe::{compute_raw_coverage, track_index_from_group},
+    dedupe::track_index_from_group,
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
-        ArtistCredit, ArtistCreditSource, ArtistRole, AttachChannelPackItem, CanonicalDownload,
-        CanonicalTorrent, ChannelBatchResult, ChannelConfig, ChannelKind, ChannelOverview,
-        ChannelPack, ChannelPackDecision, ChannelPackSummary, ChannelRun, ChannelRunStatus,
-        ChannelRunTrigger, ClientDownloadState, CreateDownload, DecideChannelPack,
-        DeduplicationIndexStatus, DownloadJob, DownloadProfile, DownloadState, DownloadsPage,
-        LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage, LibraryAvailability,
-        LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState, LiveDownloadStatus,
-        Provenance, ProviderStatus, PublicConfig, ReleaseDetail, ReleaseSummary,
-        RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant, value_i64,
+        ArtistCredit, ArtistCreditSource, ArtistRole, AttachChannelPackItem,
+        BackgroundJobsOverview, CanonicalDownload, CanonicalTorrent, ChannelBatchResult,
+        ChannelConfig, ChannelKind, ChannelOverview, ChannelPack, ChannelPackDecision,
+        ChannelPackSummary, ChannelRun, ChannelRunStatus, ChannelRunTrigger, ClientDownloadState,
+        CreateDownload, DecideChannelPack, DeduplicationIndexStatus, DownloadJob, DownloadProfile,
+        DownloadState, DownloadsPage, LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage,
+        LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState,
+        LiveDownloadStatus, Provenance, ProviderStatus, PublicConfig, ReleaseDetail,
+        ReleaseSummary, RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant, value_i64,
     },
     provider::{
         ProviderDefinition, ProviderGovernor, ProviderRequestError, RequestClass,
@@ -65,6 +66,7 @@ pub struct AppState {
     pub source_client: reqwest::Client,
     pub providers: ProviderGovernor,
     pub lastfm_api_key: Option<String>,
+    pub background_jobs: BackgroundJobNotifier,
     download_slots: Arc<Semaphore>,
     _instance_lock: Arc<File>,
 }
@@ -157,6 +159,7 @@ impl AppState {
                 .as_deref()
                 .map(read_secret)
                 .transpose()?,
+            background_jobs: BackgroundJobNotifier::new(),
             download_slots: Arc::new(Semaphore::new(2)),
             _instance_lock: Arc::new(instance_lock),
         });
@@ -165,19 +168,6 @@ impl AppState {
         state.db.recover_resolving_links().await?;
         state.db.recover_track_indexes().await?;
         seed_existing_job_links(&state).await?;
-        let backfill_db = state.db.clone();
-        tokio::spawn(async move {
-            loop {
-                match backfill_db.backfill_canonical_identities(20).await {
-                    Ok(0) => break,
-                    Ok(_) => tokio::time::sleep(Duration::from_millis(500)).await,
-                    Err(error) => {
-                        tracing::warn!(%error, "canonical identity backfill paused");
-                        break;
-                    }
-                }
-            }
-        });
         Ok(state)
     }
 }
@@ -216,6 +206,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(preferences).put(update_preferences),
         )
         .route("/api/v1/providers", get(providers))
+        .route("/api/v1/background-jobs", get(background_jobs))
+        .route(
+            "/api/v1/background-jobs/{id}/cancel",
+            axum::routing::post(cancel_background_job),
+        )
+        .route(
+            "/api/v1/background-jobs/{id}/retry",
+            axum::routing::post(retry_background_job),
+        )
         .route(
             "/api/v1/providers/{id}/pause",
             axum::routing::post(pause_provider),
@@ -353,6 +352,61 @@ async fn update_preferences(
 #[utoipa::path(get, path = "/api/v1/providers", responses((status = 200, body = [ProviderStatus])))]
 async fn providers(State(state): State<Arc<AppState>>) -> Json<Vec<ProviderStatus>> {
     Json(state.providers.statuses().await)
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+struct BackgroundJobsQuery {
+    #[serde(default = "default_background_job_limit")]
+    limit: u64,
+}
+
+fn default_background_job_limit() -> u64 {
+    100
+}
+
+#[utoipa::path(get, path = "/api/v1/background-jobs", params(BackgroundJobsQuery), responses((status = 200, body = BackgroundJobsOverview)))]
+async fn background_jobs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BackgroundJobsQuery>,
+) -> Result<Json<BackgroundJobsOverview>, AppError> {
+    Ok(Json(
+        state
+            .db
+            .background_jobs_overview(query.limit.clamp(1, 500))
+            .await?,
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/background-jobs/{id}/cancel", params(("id" = Uuid, Path)), responses((status = 204)))]
+async fn cancel_background_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if state.db.cancel_background_job(id).await? {
+        state.background_jobs.wake();
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::conflict(
+            "job_not_cancellable",
+            "The background job was not found or has already finished",
+        ))
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/background-jobs/{id}/retry", params(("id" = Uuid, Path)), responses((status = 202)))]
+async fn retry_background_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if state.db.retry_failed_background_job(id).await? {
+        state.background_jobs.wake();
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err(AppError::conflict(
+            "job_not_retryable",
+            "The background job was not found or is not failed or cancelled",
+        ))
+    }
 }
 
 #[utoipa::path(post, path = "/api/v1/providers/{id}/pause", params(("id" = String, Path)), responses((status = 200, body = ProviderStatus)))]
@@ -2761,16 +2815,7 @@ async fn downloads(
         };
         let stale = canonical.expires_at <= Utc::now();
         if stale {
-            let refresh_state = state.clone();
-            let refresh_tracker = tracker.to_owned();
-            let refresh_hash = download.live.info_hash.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    refresh_canonical_by_hash(refresh_state, refresh_tracker, refresh_hash).await
-                {
-                    tracing::warn!(%error, "asynchronous canonical torrent refresh failed");
-                }
-            });
+            background::enqueue_hash_resolution(&state, tracker, &download.live.info_hash).await?;
         }
         let mut variant = canonical.value.variant.clone();
         variant.downloads = vec![download.live.clone()];
@@ -2817,12 +2862,11 @@ async fn retry_download_link(
             "This torrent does not have a failed configured-tracker resolution",
         ));
     }
-    let task_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(error) = resolve_due_links(&task_state).await {
-            tracing::warn!(%error, "manual release resolution retry failed");
-        }
-    });
+    if let Some(link) = state.db.get_link(&client_name, &info_hash).await?
+        && let Some(tracker) = link.tracker
+    {
+        background::enqueue_hash_resolution(&state, &tracker, &info_hash).await?;
+    }
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -3251,29 +3295,6 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
     });
 }
 
-pub fn spawn_download_indexer(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut tick = 0_u64;
-        loop {
-            interval.tick().await;
-            if tick.is_multiple_of(5)
-                && let Err(error) = scan_download_clients(&state).await
-            {
-                tracing::warn!(%error, "download release index scan failed");
-            }
-            if let Err(error) = enrich_library_artist_credits(&state).await {
-                tracing::warn!(%error, "library artist enrichment pass failed");
-            }
-            if let Err(error) = resolve_due_links(&state).await {
-                tracing::warn!(%error, "download release resolution pass failed");
-            }
-            tick = tick.wrapping_add(1);
-        }
-    });
-}
-
 pub fn spawn_channel_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -3308,22 +3329,6 @@ pub fn spawn_channel_scheduler(state: Arc<AppState>) {
                         "scheduled channel refresh could not start"
                     );
                 }
-            }
-        }
-    });
-}
-
-pub fn spawn_deduplication_indexer(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Err(error) = resolve_due_track_indexes(&state).await {
-                tracing::warn!(%error, "single deduplication indexing pass failed");
-            }
-            if let Err(error) = recompute_single_coverages(&state).await {
-                tracing::warn!(%error, "single album coverage recomputation failed");
             }
         }
     });
@@ -3371,238 +3376,14 @@ async fn seed_catalog_deduplication(
                 .await?;
         }
     }
+    state.background_jobs.wake();
     Ok(())
 }
 
 async fn seed_single_deduplication(state: &AppState, tracker: &str, group_id: i64) -> Result<()> {
     state.db.enqueue_track_index(tracker, group_id).await?;
-    state.db.ensure_single_coverage(tracker, group_id).await
-}
-
-async fn resolve_due_track_indexes(state: &Arc<AppState>) -> Result<()> {
-    for job in state.db.due_track_indexes(1).await? {
-        let Some(tracker) = state.trackers.get(&job.tracker) else {
-            continue;
-        };
-        state
-            .db
-            .set_track_index_resolving(&job.tracker, job.group_id)
-            .await?;
-        let result: Result<()> = async {
-            let (detail, raw) = tracker
-                .group_with_class(job.group_id, RequestClass::Background)
-                .await?;
-            let index = track_index_from_group(&job.tracker, &detail, &raw);
-            cache_release_detail(&state.db, &detail).await?;
-            let now = Utc::now();
-            state
-                .db
-                .put_snapshot(
-                    &job.tracker,
-                    "group",
-                    &job.group_id.to_string(),
-                    &detail,
-                    &raw,
-                    now,
-                    now + ChronoDuration::hours(24),
-                )
-                .await?;
-            state.db.put_track_index(&index).await?;
-
-            if detail
-                .release
-                .release_type
-                .as_deref()
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
-            {
-                state
-                    .db
-                    .ensure_single_coverage(&job.tracker, job.group_id)
-                    .await?;
-                let artist_ids = detail
-                    .release
-                    .artists
-                    .iter()
-                    .filter(|artist| artist.role == ArtistRole::Primary)
-                    .filter_map(|artist| artist.artist_id)
-                    .collect::<HashSet<_>>();
-                for artist_id in artist_ids {
-                    let key = artist_id.to_string();
-                    let catalog = if let Some(cached) = state
-                        .db
-                        .get_snapshot::<ArtistCatalogPage>(&job.tracker, "artist", &key)
-                        .await?
-                        .filter(|cached| cached.expires_at > Utc::now())
-                    {
-                        cached.value
-                    } else {
-                        let (catalog, raw) = tracker
-                            .artist_catalog_with_class(artist_id, RequestClass::Background)
-                            .await?;
-                        cache_artist_catalog(&state.db, &catalog).await?;
-                        let now = Utc::now();
-                        state
-                            .db
-                            .put_snapshot(
-                                &job.tracker,
-                                "artist",
-                                &key,
-                                &catalog,
-                                &raw,
-                                now,
-                                now + ChronoDuration::hours(24),
-                            )
-                            .await?;
-                        catalog
-                    };
-                    seed_catalog_deduplication(state, &job.tracker, &catalog).await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            state
-                .db
-                .fail_track_index(&job.tracker, job.group_id, &error.to_string())
-                .await?;
-            tracing::warn!(
-                tracker = %job.tracker,
-                group_id = job.group_id,
-                %error,
-                "release track indexing failed"
-            );
-            if is_provider_unavailable(&error) {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn recompute_single_coverages(state: &Arc<AppState>) -> Result<()> {
-    let memberships = state.db.list_catalog_memberships().await?;
-    let indexes = state
-        .db
-        .list_track_indexes()
-        .await?
-        .into_iter()
-        .map(|index| ((index.tracker.clone(), index.group_id), index))
-        .collect::<HashMap<_, _>>();
-    let mut groups: HashMap<(String, i64), (ArtistCatalogRelease, HashSet<i64>)> = HashMap::new();
-    for membership in memberships
-        .into_iter()
-        .filter(|membership| membership.group.roles.contains(&ArtistCatalogRole::Primary))
-    {
-        let key = (
-            membership.group.release.tracker.clone(),
-            membership.group.release.group_id,
-        );
-        let entry = groups
-            .entry(key)
-            .or_insert_with(|| (membership.group.clone(), HashSet::new()));
-        entry.1.insert(membership.artist_id);
-    }
-    let albums = groups
-        .iter()
-        .filter(|(_, (group, _))| {
-            group.listed_on_tracker
-                && !group.variants.is_empty()
-                && group
-                    .release
-                    .release_type
-                    .as_deref()
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("album"))
-        })
-        .collect::<Vec<_>>();
-    for ((tracker, group_id), (_single, single_artists)) in
-        groups.iter().filter(|(_, (group, _))| {
-            group.listed_on_tracker
-                && group
-                    .release
-                    .release_type
-                    .as_deref()
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
-        })
-    {
-        state.db.ensure_single_coverage(tracker, *group_id).await?;
-        let candidates = albums
-            .iter()
-            .filter(|((album_tracker, _), (_, artists))| {
-                album_tracker.eq_ignore_ascii_case(tracker) && !single_artists.is_disjoint(artists)
-            })
-            .collect::<Vec<_>>();
-        let required = std::iter::once((tracker.clone(), *group_id))
-            .chain(candidates.iter().map(|(key, _)| (*key).clone()))
-            .collect::<Vec<_>>();
-        let states = required
-            .iter()
-            .filter_map(|key| indexes.get(key))
-            .map(|index| index.state.as_str())
-            .collect::<Vec<_>>();
-        if states.len() != required.len()
-            || states
-                .iter()
-                .any(|state| matches!(*state, "pending" | "resolving"))
-        {
-            state
-                .db
-                .put_single_coverage(tracker, *group_id, "pending", None)
-                .await?;
-            continue;
-        }
-        if states.contains(&"failed") {
-            state
-                .db
-                .put_single_coverage(tracker, *group_id, "failed", None)
-                .await?;
-            continue;
-        }
-        let Some(single_index) = indexes
-            .get(&(tracker.clone(), *group_id))
-            .and_then(|index| index.index.as_ref())
-        else {
-            continue;
-        };
-        let album_indexes = candidates
-            .iter()
-            .filter_map(|(key, (group, _))| {
-                indexes
-                    .get(*key)
-                    .and_then(|index| index.index.clone())
-                    .map(|index| (index, group.clone()))
-            })
-            .collect::<Vec<_>>();
-        let coverage = compute_raw_coverage(single_index, &album_indexes);
-        state
-            .db
-            .put_single_coverage(tracker, *group_id, "ready", Some(&coverage))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn scan_download_clients(state: &Arc<AppState>) -> Result<()> {
-    const PAGE_SIZE: u32 = 200;
-    for (name, client) in &state.download_clients {
-        let scan_started_at = Utc::now();
-        let mut offset = 0;
-        loop {
-            let downloads = client
-                .downloads_with_class(PAGE_SIZE, offset, RequestClass::Background)
-                .await?;
-            let count = downloads.len();
-            for download in &downloads {
-                observe_download(state, download).await?;
-            }
-            if count < PAGE_SIZE as usize || offset >= 100_000 {
-                break;
-            }
-            offset += PAGE_SIZE;
-        }
-        state.db.complete_client_scan(name, scan_started_at).await?;
-        tracing::debug!(client = %name, indexed = offset, "scanned download client");
-    }
+    state.db.ensure_single_coverage(tracker, group_id).await?;
+    state.background_jobs.wake();
     Ok(())
 }
 
@@ -3622,89 +3403,8 @@ async fn observe_download(
             tracker.map(String::as_str),
         )
         .await?;
+    state.background_jobs.wake();
     Ok(())
-}
-
-async fn resolve_due_links(state: &Arc<AppState>) -> Result<()> {
-    let mut batches = HashMap::new();
-    for link in state.db.due_links(100).await? {
-        let Some(tracker_name) = link.tracker.clone() else {
-            continue;
-        };
-        batches
-            .entry((tracker_name, link.info_hash.clone()))
-            .or_insert_with(Vec::new)
-            .push(link);
-    }
-    for ((tracker_name, info_hash), links) in batches.into_iter().take(5) {
-        let Some(tracker) = state.trackers.get(&tracker_name) else {
-            continue;
-        };
-        for link in &links {
-            state
-                .db
-                .set_link_resolving(&link.client, &link.info_hash)
-                .await?;
-        }
-        match tracker
-            .torrent_by_hash_with_class(&info_hash, RequestClass::Background)
-            .await
-        {
-            Ok((canonical, _raw)) => {
-                let now = Utc::now();
-                state
-                    .db
-                    .put_canonical(&canonical, now, now + ChronoDuration::hours(24))
-                    .await?;
-                for link in &links {
-                    state
-                        .db
-                        .set_linked(&link.client, &link.info_hash, &canonical)
-                        .await?;
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                let normalized = message.to_ascii_lowercase();
-                let not_found = normalized.contains("not found")
-                    || normalized.contains("does not exist")
-                    || normalized.contains("bad hash");
-                for link in &links {
-                    state
-                        .db
-                        .set_link_failure(&link.client, &link.info_hash, not_found, &message)
-                        .await?;
-                }
-                tracing::warn!(
-                    clients = links.len(),
-                    tracker = %tracker_name,
-                    info_hash = %info_hash,
-                    %error,
-                    "tracker hash resolution failed"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn refresh_canonical_by_hash(
-    state: Arc<AppState>,
-    tracker_name: String,
-    info_hash: String,
-) -> Result<()> {
-    let tracker = state
-        .trackers
-        .get(&tracker_name)
-        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
-    let (canonical, _) = tracker
-        .torrent_by_hash_with_class(&info_hash, RequestClass::Background)
-        .await?;
-    let now = Utc::now();
-    state
-        .db
-        .put_canonical(&canonical, now, now + ChronoDuration::hours(24))
-        .await
 }
 
 async fn seed_existing_job_links(state: &Arc<AppState>) -> Result<()> {
@@ -4341,7 +4041,7 @@ async fn enrich_variant_library(
     Ok(())
 }
 
-async fn enrich_library_artist_credits(state: &Arc<AppState>) -> Result<()> {
+pub(crate) async fn enrich_library_artist_credits(state: &Arc<AppState>) -> Result<()> {
     let mut groups = HashSet::new();
     for record in state.db.list_library_records().await? {
         if record
@@ -5160,7 +4860,9 @@ fn truncate(value: &str, max: usize) -> String {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        live, ready, preferences, update_preferences, providers, pause_provider, resume_provider, account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
+        live, ready, preferences, update_preferences, providers, pause_provider, resume_provider,
+        background_jobs, cancel_background_job, retry_background_job,
+        account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
         download_job,
         library_artists, library_artist, artist_catalog, channels, update_channel, refresh_channel,
         channel_run, channel_packs, channel_pack, replan_channel_pack, attach_channel_pack_item,
@@ -5170,6 +4872,8 @@ fn truncate(value: &str, max: usize) -> String {
         Health, Account, crate::model::TrackerAccount, Provenance, RuntimePreferences,
         crate::model::ApiPreferences, crate::model::ProviderPolicyOverride,
         crate::model::ProviderCircuitState, crate::model::ProviderQueueCounts, ProviderStatus,
+        crate::model::BackgroundJobState, crate::model::BackgroundJobStatus,
+        crate::model::BackgroundJobCounts, BackgroundJobsOverview,
         crate::model::ReleasePreferences, crate::model::TrackerPreference,
         crate::model::TrackerDownloadMode, crate::model::LeechStatus,
         crate::model::DownloadEligibility, crate::model::DownloadEligibilityReason,
