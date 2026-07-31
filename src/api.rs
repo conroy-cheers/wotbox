@@ -4695,16 +4695,7 @@ async fn ui(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Respons
     let is_index = asset.path() == std::path::Path::new("index.html");
     let body = if is_index {
         let index = asset.contents_utf8().unwrap_or_default();
-        let base = if state.base_path == "/" {
-            "/".to_owned()
-        } else {
-            format!("{}/", state.base_path)
-        };
-        let injection = format!(
-            r#"<base href="{base}"><script>window.__WOTBOX_CONFIG__={};</script></head>"#,
-            json!({ "basePath": state.base_path }),
-        );
-        Body::from(index.replace("</head>", &injection))
+        Body::from(render_ui_index(index, &state.base_path))
     } else {
         Body::from(asset.contents().to_vec())
     };
@@ -4737,6 +4728,19 @@ async fn ui(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Respons
         );
     }
     response
+}
+
+fn render_ui_index(index: &str, base_path: &str) -> String {
+    let base = if base_path == "/" {
+        "/".to_owned()
+    } else {
+        format!("{base_path}/")
+    };
+    let injection = format!(
+        r#"<head><base href="{base}"><script>window.__WOTBOX_CONFIG__={};</script>"#,
+        json!({ "basePath": base_path }),
+    );
+    index.replacen("<head>", &injection, 1)
 }
 
 fn is_ui_route(path: &str) -> bool {
@@ -5048,6 +5052,28 @@ mod tests {
         ] {
             assert!(!is_ui_route(path), "{path} should not be a UI route");
         }
+    }
+
+    #[test]
+    fn ui_base_precedes_relative_assets_for_deep_links() {
+        let index = r#"<html><head><script src="./assets/app.js"></script><link href="./assets/app.css"></head><body></body></html>"#;
+        let rendered = render_ui_index(index, "/media/music/wotbox");
+
+        let base_position = rendered
+            .find(r#"<base href="/media/music/wotbox/">"#)
+            .expect("base element");
+        let script_position = rendered
+            .find(r#"src="./assets/app.js""#)
+            .expect("relative script");
+        let stylesheet_position = rendered
+            .find(r#"href="./assets/app.css""#)
+            .expect("relative stylesheet");
+
+        assert!(base_position < script_position);
+        assert!(base_position < stylesheet_position);
+        assert!(
+            rendered.contains(r#"window.__WOTBOX_CONFIG__={"basePath":"/media/music/wotbox"};"#)
+        );
     }
 
     #[test]
