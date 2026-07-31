@@ -7,6 +7,7 @@ mod dedupe;
 mod entity;
 mod migration;
 mod model;
+mod plex;
 mod provider;
 mod qbittorrent;
 mod release_matcher;

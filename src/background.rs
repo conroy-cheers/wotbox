@@ -20,7 +20,8 @@ use crate::{
     db::{EnqueueBackgroundJob, StoredBackgroundJob},
     dedupe::{compute_raw_coverage, track_index_from_group},
     model::CanonicalTorrent,
-    provider::{ProviderRequestError, RequestClass},
+    plex::PlexScanTarget,
+    provider::{ProviderFailureKind, ProviderRequestError, RequestClass},
 };
 
 pub const RESOLVE_DOWNLOAD_HASH: &str = "resolve_download_hash";
@@ -29,6 +30,7 @@ pub const COMPUTE_SINGLE_COVERAGE: &str = "compute_single_coverage";
 pub const SCAN_DOWNLOAD_CLIENT: &str = "scan_download_client";
 pub const CANONICAL_BACKFILL: &str = "canonical_backfill";
 pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
+pub const NOTIFY_PLEX: &str = "notify_plex";
 
 const WORKER_COUNT: usize = 2;
 const LEASE_DURATION: Duration = Duration::from_secs(120);
@@ -80,6 +82,10 @@ impl BackgroundRuntime {
 
 enum JobOutcome {
     Complete,
+    Fail {
+        code: &'static str,
+        message: String,
+    },
     Retry {
         delay: Duration,
         increment_attempt: bool,
@@ -344,6 +350,12 @@ async fn run_claimed_job(
     };
     let result = match outcome {
         JobOutcome::Complete => state.db.complete_background_job(job.id, owner).await,
+        JobOutcome::Fail { code, message } => {
+            state
+                .db
+                .fail_background_job(job.id, owner, code, &message)
+                .await
+        }
         JobOutcome::Retry {
             delay,
             increment_attempt,
@@ -372,8 +384,39 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
             enrich_library_artist_credits(state).await?;
             Ok(JobOutcome::Complete)
         }
+        NOTIFY_PLEX => notify_plex(state, &job.payload).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlexScanPayload {
+    section_id: u32,
+    root: String,
+}
+
+async fn notify_plex(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+    let payload: PlexScanPayload = serde_json::from_value(payload.clone())?;
+    let target = PlexScanTarget {
+        section_id: payload.section_id,
+        root: payload.root,
+    };
+    let Some(plex) = state.plex.as_ref() else {
+        return Ok(JobOutcome::Fail {
+            code: "plex_unconfigured",
+            message: "Plex is not configured".into(),
+        });
+    };
+    if !plex.allows(&target) {
+        return Ok(JobOutcome::Fail {
+            code: "plex_target_unconfigured",
+            message: "Plex scan target is no longer configured".into(),
+        });
+    }
+    plex.scan(&state.source_client, &state.providers, &target)
+        .await?;
+    Ok(JobOutcome::Complete)
 }
 
 #[derive(Deserialize)]
@@ -658,6 +701,10 @@ async fn scan_download_client(state: &Arc<AppState>, payload: &Value) -> Result<
             .await?;
         let count = downloads.len();
         for download in &downloads {
+            let plex_target = state
+                .plex
+                .as_ref()
+                .and_then(|plex| plex.target_for_path(&download.live.save_path));
             state
                 .db
                 .observe_download(
@@ -668,6 +715,7 @@ async fn scan_download_client(state: &Arc<AppState>, payload: &Value) -> Result<
                         .as_ref()
                         .and_then(|host| state.announce_hosts.get(host))
                         .map(String::as_str),
+                    plex_target.as_ref(),
                 )
                 .await?;
             state.background_jobs.wake();
@@ -701,6 +749,19 @@ async fn classify_error(
     job: &StoredBackgroundJob,
     error: anyhow::Error,
 ) -> JobOutcome {
+    if let Some(ProviderRequestError::Upstream {
+        failure,
+        kind: ProviderFailureKind::Permanent,
+        ..
+    }) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())
+    {
+        return JobOutcome::Fail {
+            code: "permanent_provider_failure",
+            message: failure.clone(),
+        };
+    }
     let provider = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())

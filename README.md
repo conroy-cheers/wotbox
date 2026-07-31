@@ -48,6 +48,12 @@ only affected Single-to-Album coverage. Preferences → Background work exposes
 the live queue, failures, cancellation, and manual retry. Completed task history
 is retained for 30 days.
 
+An optional Plex integration watches the same reconciled qBittorrent completion
+transitions. The first completed observation queues a durable, debounced partial
+scan for the matching configured music root; nearby completions coalesce, retries
+survive restarts, and no Plex token is exposed through the API or UI. Preferences
+shows the configured section and roots and can queue a manual scan of every root.
+
 The download API exposes `GET /api/v1/downloads` as `{ items, index }`, where
 each visible item combines a canonical release, its matched torrent variant,
 and live client state. Pending, failed, and unconfigured torrents remain
@@ -225,6 +231,15 @@ and do not use a Last.fm shared secret. A source request is attempted once;
 provider cooldowns and the channel scheduler own any later retry so nested
 backoff loops cannot amplify traffic. Failed scheduled refreshes receive an
 exponential scheduler retry and remain visible on the Channels page.
+Last.fm API error bodies are interpreted even when the HTTP status is non-success,
+so a missing account reports the configured username and points back to
+Preferences instead of surfacing an opaque HTTP 404.
+
+Plex is configured with the optional `[plex]` block: `base_url`, file-based
+`token_file`, numeric `section_id`, and one or more absolute `library_roots`.
+Wotbox calls Plex's partial refresh endpoint only for those allowlisted roots;
+environment-based development can instead use `PLEX_TOKEN`, `PLEX_SECTION_ID`,
+`PLEX_LIBRARY_ROOTS`, and optionally `PLEX_URL`.
 
 `flake.nix` exports the packaged service, the separately buildable frontend,
 the development shell, and `nixosModules.default`. See

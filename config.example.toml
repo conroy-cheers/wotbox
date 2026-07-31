@@ -5,6 +5,16 @@ database_path = "./wotbox.sqlite"
 # Optional. Required only when the Last.fm channel is enabled.
 lastfm_api_key_file = "./lastfm-api-key"
 
+# Optional. Wotbox queues a partial scan when a music download completes.
+[plex]
+base_url = "http://127.0.0.1:32400"
+token_file = "./plex-token"
+section_id = 4
+library_roots = [
+  "/mnt/media/Downloads/torrent/complete/ops",
+  "/mnt/media/Downloads/torrent/complete/red",
+]
+
 [trackers.ops]
 kind = "ops"
 base_url = "https://orpheus.network"

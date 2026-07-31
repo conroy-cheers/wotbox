@@ -1,10 +1,12 @@
 <script lang="ts">
   import { createQuery, useQueryClient } from "@tanstack/svelte-query";
-  import { ArrowDown, ArrowUp, CirclePause, GripVertical, Play, Radio, RotateCcw, Save } from "@lucide/svelte";
+  import { ArrowDown, ArrowUp, CirclePause, GripVertical, Library, Play, Radio, RefreshCw, RotateCcw, Save } from "@lucide/svelte";
   import {
     api,
     type ChannelConfig,
     type ChannelOverview,
+    type PlexIntegrationStatus,
+    type PlexScanQueued,
     type PublicConfig,
     type ProviderPolicyOverride,
     type ProviderStatus,
@@ -39,6 +41,11 @@
     queryFn: () => api<ProviderStatus[]>("/api/v1/providers"),
     refetchInterval: 10_000
   });
+  const plex = createQuery({
+    queryKey: ["plex-integration"],
+    queryFn: () => api<PlexIntegrationStatus>("/api/v1/integrations/plex"),
+    refetchInterval: 5_000
+  });
   let qualityTiers = $state<QualityPreference[][]>(
     structuredClone(defaultReleasePreferences.qualityTiers)
   );
@@ -63,6 +70,9 @@
   let apiPolicies = $state<Record<string, ProviderPolicyOverride>>({});
   let providerAction = $state("");
   let providerError = $state("");
+  let plexScanning = $state(false);
+  let plexMessage = $state("");
+  let plexError = $state("");
 
   const criterionLabels: Record<VariantSortCriterion, string> = {
     quality: "Quality",
@@ -225,6 +235,26 @@
     }
   }
 
+  async function scanPlex() {
+    plexScanning = true;
+    plexMessage = "";
+    plexError = "";
+    try {
+      const queued = await api<PlexScanQueued>("/api/v1/integrations/plex", { method: "POST" });
+      plexMessage = queued.jobIds.length === 1
+        ? "Plex library scan queued."
+        : `${queued.jobIds.length} Plex library scans queued.`;
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["plex-integration"] }),
+        queryClient.invalidateQueries({ queryKey: ["background-jobs"] })
+      ]);
+    } catch (cause) {
+      plexError = cause instanceof Error ? cause.message : "Unable to notify Plex";
+    } finally {
+      plexScanning = false;
+    }
+  }
+
   function channelLabel(id: string): string {
     return id === "country_chart" ? "Country Top 100" : "Last.fm Discovery";
   }
@@ -264,6 +294,7 @@
   <a href="#download-planning"><strong>Download planning</strong><span>Trackers, cost, and profiles</span></a>
   <a href="#quality-media"><strong>Quality &amp; media</strong><span>Cutoff and format ranking</span></a>
   <a href="#api-safety"><strong>API safety</strong><span>Limits and circuit state</span></a>
+  <a href="#plex"><strong>Plex</strong><span>Library scan notifications</span></a>
   <a href="#background-work"><strong>Background work</strong><span>Progress, retries, and failures</span></a>
   <a href="#channels"><strong>Channels</strong><span>Sources and schedules</span></a>
 </nav>
@@ -505,6 +536,47 @@
         <Save size={16} /> {saving ? "Saving…" : saved ? "Saved" : "Save API limits"}
       </button>
     </div>
+  </section>
+
+  <section class="preferences-panel plex-preferences" id="plex">
+    <div class="section-heading">
+      <div><p class="eyebrow">Media server</p><h2>Plex library updates</h2></div>
+      <Library size={22} />
+    </div>
+    <p class="settings-help">
+      Wotbox queues a partial Plex scan after a music torrent first completes. Completions close
+      together are combined, and failed notifications survive restarts and retry safely.
+    </p>
+    {#if $plex.isPending}
+      <div class="skeleton-card"></div>
+    {:else if $plex.isError}
+      <div class="error-panel compact">{$plex.error.message}</div>
+    {:else if !$plex.data?.configured}
+      <div class="integration-empty">
+        <strong>Plex is not configured</strong>
+        <span>Add the server URL, token file, music section, and library roots to the server configuration.</span>
+      </div>
+    {:else}
+      <div class="plex-status-grid">
+        <div><span>Connection</span><strong class="status-good">Configured</strong></div>
+        <div><span>Music section</span><strong>#{$plex.data.sectionId}</strong></div>
+        <div><span>Queued scans</span><strong>{$plex.data.pendingScans}</strong></div>
+      </div>
+      <div class="plex-library-roots">
+        <span>Partial-scan roots</span>
+        {#each $plex.data.libraryRoots as root}
+          <code>{root}</code>
+        {/each}
+      </div>
+      <div class="integration-actions">
+        <span>Queue a partial scan for every configured music root.</span>
+        <button class="secondary-button" disabled={plexScanning} onclick={scanPlex}>
+          <RefreshCw size={15} class={plexScanning ? "spin" : ""} /> {plexScanning ? "Queueing…" : "Scan now"}
+        </button>
+      </div>
+    {/if}
+    {#if plexMessage}<div class="success-panel compact">{plexMessage}</div>{/if}
+    {#if plexError}<div class="error-panel compact">{plexError}</div>{/if}
   </section>
 
   <BackgroundJobsPanel />

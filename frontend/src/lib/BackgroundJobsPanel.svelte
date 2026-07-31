@@ -23,7 +23,8 @@
     compute_single_coverage: "Match Single to Album",
     scan_download_client: "Scan download client",
     canonical_backfill: "Update library identities",
-    enrich_library_artists: "Enrich library artists"
+    enrich_library_artists: "Enrich library artists",
+    notify_plex: "Notify Plex"
   };
   const stateOrder: BackgroundJobState[] = [
     "running",
@@ -52,6 +53,9 @@
     }
     if (job.kind === "scan_download_client") {
       return parts.slice(1).join(":");
+    }
+    if (job.kind === "notify_plex") {
+      return "Partial music library scan";
     }
     return "";
   }

@@ -26,6 +26,7 @@ pub struct Config {
     pub download_clients: BTreeMap<String, DownloadClientConfig>,
     pub download_profiles: BTreeMap<String, DownloadProfileConfig>,
     pub lastfm_api_key_file: Option<PathBuf>,
+    pub plex: Option<PlexConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +67,14 @@ pub struct DownloadProfileConfig {
     pub start_paused: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlexConfig {
+    pub base_url: String,
+    pub token_file: PathBuf,
+    pub section_id: u32,
+    pub library_roots: Vec<PathBuf>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -77,6 +86,7 @@ impl Default for Config {
             download_clients: BTreeMap::new(),
             download_profiles: BTreeMap::new(),
             lastfm_api_key_file: None,
+            plex: None,
         }
     }
 }
@@ -105,6 +115,31 @@ impl Config {
                     "download profile {name} references unknown client {}",
                     profile.client
                 );
+            }
+        }
+        if let Some(plex) = &config.plex {
+            let url = url::Url::parse(&plex.base_url).context("parse Plex base_url")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                bail!("Plex base_url must be an HTTP(S) origin without a query or fragment");
+            }
+            if plex.section_id == 0 {
+                bail!("Plex section_id must be greater than zero");
+            }
+            if plex.library_roots.is_empty() {
+                bail!("Plex library_roots must contain at least one path");
+            }
+            if plex.library_roots.iter().any(|root| !root.is_absolute()) {
+                bail!("Plex library_roots must be absolute paths");
+            }
+            if plex.library_roots.iter().any(|root| root == Path::new("/")) {
+                bail!("Plex library_roots must not scan the filesystem root");
             }
         }
         Ok(config)
@@ -150,6 +185,31 @@ impl Config {
             let lastfm_path = secret_dir.join("lastfm-api-key");
             write_secret(&lastfm_path, &lastfm_key)?;
             config.lastfm_api_key_file = Some(lastfm_path);
+        }
+        let plex_token = std::env::var("PLEX_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if let Some(token) = plex_token {
+            let section_id = std::env::var("PLEX_SECTION_ID")
+                .context("PLEX_SECTION_ID is required when PLEX_TOKEN is set")?
+                .parse()
+                .context("parse PLEX_SECTION_ID")?;
+            let library_roots = std::env::var("PLEX_LIBRARY_ROOTS")
+                .context("PLEX_LIBRARY_ROOTS is required when PLEX_TOKEN is set")?
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            let token_file = secret_dir.join("plex-token");
+            write_secret(&token_file, &token)?;
+            config.plex = Some(PlexConfig {
+                base_url: std::env::var("PLEX_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:32400".into()),
+                token_file,
+                section_id,
+                library_roots,
+            });
         }
 
         config.trackers.insert(

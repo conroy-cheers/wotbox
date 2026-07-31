@@ -32,6 +32,7 @@ use crate::{
         LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseSummary,
         RuntimePreferences,
     },
+    plex::PlexScanTarget,
 };
 
 #[derive(Clone)]
@@ -230,6 +231,47 @@ impl Database {
             .await?;
         transaction.commit().await?;
         Ok(id)
+    }
+
+    pub async fn enqueue_plex_scan(
+        &self,
+        target: &PlexScanTarget,
+        detected_at: DateTime<Utc>,
+    ) -> Result<Uuid> {
+        let transaction = self.begin_write().await?;
+        let id = self
+            .enqueue_plex_scan_on(&transaction, target, detected_at)
+            .await?;
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    async fn enqueue_plex_scan_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        target: &PlexScanTarget,
+        detected_at: DateTime<Utc>,
+    ) -> Result<Uuid> {
+        let bucket = detected_at.timestamp().div_euclid(60);
+        let run_at = DateTime::from_timestamp((bucket + 1) * 60 + 15, 0)
+            .context("calculate Plex scan debounce")?;
+        self.enqueue_background_job_on(
+            connection,
+            EnqueueBackgroundJob {
+                deduplication_key: &target.key_for_bucket(bucket),
+                kind: "notify_plex",
+                payload: serde_json::json!({
+                    "sectionId": target.section_id,
+                    "root": target.root,
+                }),
+                priority: 30,
+                max_attempts: 10,
+                next_run_at: Some(run_at),
+                parent_id: None,
+                recurring_interval_seconds: None,
+            },
+        )
+        .await
     }
 
     async fn enqueue_background_job_on<C: ConnectionTrait>(
@@ -521,6 +563,45 @@ impl Database {
         active.updated_at = Set(now.to_rfc3339());
         active.update(&self.connection).await?;
         Ok(())
+    }
+
+    pub async fn fail_background_job(
+        &self,
+        id: Uuid,
+        owner: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<()> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(());
+        };
+        if model.state == "cancelled" {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut active = model.into_active_model();
+        active.state = Set("failed".into());
+        active.next_run_at = Set(None);
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.last_error_code = Set(Some(code.chars().take(100).collect()));
+        active.last_error_message = Set(Some(message.chars().take(500).collect()));
+        active.finished_at = Set(Some(now.clone()));
+        active.updated_at = Set(now);
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
+    pub async fn active_background_jobs_by_kind(&self, kind: &str) -> Result<u64> {
+        Ok(background_job::Entity::find()
+            .filter(background_job::Column::Kind.eq(kind))
+            .filter(background_job::Column::State.is_in(["pending", "running", "retrying"]))
+            .count(&self.connection)
+            .await?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3327,6 +3408,7 @@ impl Database {
         live: &LiveDownloadStatus,
         announce_host: Option<&str>,
         tracker: Option<&str>,
+        plex_target: Option<&PlexScanTarget>,
     ) -> Result<()> {
         let transaction = self.begin_write().await?;
         let now_value = Utc::now();
@@ -3340,6 +3422,7 @@ impl Database {
             "unconfigured"
         };
         let should_resolve;
+        let newly_completed;
         if let Some(model) =
             download_release_link::Entity::find_by_id((live.client.clone(), hash.clone()))
                 .one(&transaction)
@@ -3350,6 +3433,7 @@ impl Database {
             should_resolve = tracker.is_some() && (!linked || tracker_changed);
             let has_library_added_at = model.library_added_at.is_some();
             let has_completed_at = model.completed_at.is_some();
+            newly_completed = !has_completed_at && completed_at.is_some();
             let mut active = model.into_active_model();
             active.announce_host = Set(announce_host.map(str::to_owned));
             if !linked {
@@ -3370,6 +3454,7 @@ impl Database {
             }
             active.update(&transaction).await?;
         } else {
+            newly_completed = completed_at.is_some();
             should_resolve = tracker.is_some();
             download_release_link::ActiveModel {
                 client: Set(live.client.clone()),
@@ -3413,6 +3498,10 @@ impl Database {
                 },
             )
             .await?;
+        }
+        if newly_completed && let Some(target) = plex_target {
+            self.enqueue_plex_scan_on(&transaction, target, now_value)
+                .await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -4236,6 +4325,7 @@ mod tests {
             ClientDownloadState, LiveDownloadStatus, PackItemPlanState, RecommendationMatchState,
             RecommendationSource, ReleaseSummary, TorrentVariant,
         },
+        plex::PlexScanTarget,
         tracker::fallback_artist_credit,
     };
 
@@ -4403,6 +4493,67 @@ mod tests {
                 .iter()
                 .any(|job| job.kind == "compute_single_coverage")
         );
+    }
+
+    #[tokio::test]
+    async fn first_download_completion_enqueues_one_debounced_plex_scan() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("plex-jobs.sqlite"))
+            .await
+            .expect("database");
+        let target = PlexScanTarget {
+            section_id: 4,
+            root: "/downloads/ops".into(),
+        };
+        let mut live = LiveDownloadStatus {
+            client: "music".into(),
+            info_hash: "abcdef0123456789abcdef0123456789abcdef01".into(),
+            state: ClientDownloadState::Downloading,
+            client_state: "downloading".into(),
+            diagnostic: None,
+            progress: 0.5,
+            size: 100,
+            downloaded: 50,
+            uploaded: 0,
+            download_speed: 1,
+            upload_speed: 0,
+            eta: Some(60),
+            ratio: 0.0,
+            save_path: "/downloads/ops/Artist/Album".into(),
+            added_at: None,
+            completed_at: None,
+        };
+
+        db.observe_download(&live, None, None, Some(&target))
+            .await
+            .expect("observe incomplete");
+        assert_eq!(
+            db.active_background_jobs_by_kind("notify_plex")
+                .await
+                .expect("active jobs"),
+            0
+        );
+
+        live.state = ClientDownloadState::Seeding;
+        live.client_state = "stalledUP".into();
+        live.progress = 1.0;
+        live.downloaded = 100;
+        live.completed_at = Some(Utc::now());
+        db.observe_download(&live, None, None, Some(&target))
+            .await
+            .expect("observe completion");
+        db.observe_download(&live, None, None, Some(&target))
+            .await
+            .expect("observe repeated completion");
+
+        let overview = db.background_jobs_overview(10).await.expect("overview");
+        let jobs = overview
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "notify_plex")
+            .collect::<Vec<_>>();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].next_run_at.is_some());
     }
 
     #[tokio::test]
@@ -4735,6 +4886,7 @@ mod tests {
             },
             Some("home.opsfet.ch"),
             Some("ops"),
+            None,
         )
         .await
         .expect("observe complete");

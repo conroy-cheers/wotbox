@@ -83,6 +83,16 @@ impl ProviderDefinition {
         }
     }
 
+    pub fn plex() -> Self {
+        Self {
+            id: "plex".into(),
+            display_name: "Plex".into(),
+            kind: "media_server".into(),
+            safe_minimum_interval: Duration::from_secs(5),
+            safe_max_concurrency: 1,
+        }
+    }
+
     pub fn qbittorrent(name: &str) -> Self {
         Self {
             id: format!("qbittorrent:{name}"),

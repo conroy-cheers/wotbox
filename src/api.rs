@@ -39,9 +39,11 @@ use crate::{
         CreateDownload, DecideChannelPack, DeduplicationIndexStatus, DownloadJob, DownloadProfile,
         DownloadState, DownloadsPage, LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage,
         LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState,
-        LiveDownloadStatus, Provenance, ProviderStatus, PublicConfig, ReleaseDetail,
-        ReleaseSummary, RuntimePreferences, SearchPage, TorrentMetadata, TorrentVariant, value_i64,
+        LiveDownloadStatus, PlexIntegrationStatus, PlexScanQueued, Provenance, ProviderStatus,
+        PublicConfig, ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage,
+        TorrentMetadata, TorrentVariant, value_i64,
     },
+    plex::PlexIntegration,
     provider::{
         ProviderDefinition, ProviderGovernor, ProviderRequestError, RequestClass,
         is_provider_unavailable,
@@ -66,6 +68,7 @@ pub struct AppState {
     pub source_client: reqwest::Client,
     pub providers: ProviderGovernor,
     pub lastfm_api_key: Option<String>,
+    pub plex: Option<PlexIntegration>,
     pub background_jobs: BackgroundJobNotifier,
     download_slots: Arc<Semaphore>,
     _instance_lock: Arc<File>,
@@ -89,6 +92,9 @@ impl AppState {
         );
         definitions.push(ProviderDefinition::lastfm());
         definitions.push(ProviderDefinition::apple());
+        if config.plex.is_some() {
+            definitions.push(ProviderDefinition::plex());
+        }
         let providers = ProviderGovernor::new(db.clone(), definitions, &preferences.api).await?;
         let mut trackers: HashMap<String, Arc<dyn TrackerClient>> = HashMap::new();
         let mut announce_hosts = HashMap::new();
@@ -159,6 +165,7 @@ impl AppState {
                 .as_deref()
                 .map(read_secret)
                 .transpose()?,
+            plex: config.plex.as_ref().map(PlexIntegration::new).transpose()?,
             background_jobs: BackgroundJobNotifier::new(),
             download_slots: Arc::new(Semaphore::new(2)),
             _instance_lock: Arc::new(instance_lock),
@@ -206,6 +213,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(preferences).put(update_preferences),
         )
         .route("/api/v1/providers", get(providers))
+        .route(
+            "/api/v1/integrations/plex",
+            get(plex_status).post(scan_plex),
+        )
         .route("/api/v1/background-jobs", get(background_jobs))
         .route(
             "/api/v1/background-jobs/{id}/cancel",
@@ -352,6 +363,47 @@ async fn update_preferences(
 #[utoipa::path(get, path = "/api/v1/providers", responses((status = 200, body = [ProviderStatus])))]
 async fn providers(State(state): State<Arc<AppState>>) -> Json<Vec<ProviderStatus>> {
     Json(state.providers.statuses().await)
+}
+
+#[utoipa::path(get, path = "/api/v1/integrations/plex", responses((status = 200, body = PlexIntegrationStatus)))]
+async fn plex_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<PlexIntegrationStatus>, AppError> {
+    let pending_scans = state
+        .db
+        .active_background_jobs_by_kind(background::NOTIFY_PLEX)
+        .await?;
+    Ok(Json(match state.plex.as_ref() {
+        Some(plex) => PlexIntegrationStatus {
+            configured: true,
+            section_id: Some(plex.section_id()),
+            library_roots: plex.library_roots().to_vec(),
+            pending_scans,
+        },
+        None => PlexIntegrationStatus {
+            configured: false,
+            section_id: None,
+            library_roots: Vec::new(),
+            pending_scans,
+        },
+    }))
+}
+
+#[utoipa::path(post, path = "/api/v1/integrations/plex", responses((status = 202, body = PlexScanQueued)))]
+async fn scan_plex(
+    State(state): State<Arc<AppState>>,
+) -> Result<(StatusCode, Json<PlexScanQueued>), AppError> {
+    let plex = state
+        .plex
+        .as_ref()
+        .ok_or_else(|| AppError::unavailable("plex_unconfigured", "Plex is not configured"))?;
+    let mut job_ids = Vec::new();
+    let detected_at = Utc::now();
+    for target in plex.targets() {
+        job_ids.push(state.db.enqueue_plex_scan(&target, detected_at).await?);
+    }
+    state.background_jobs.wake();
+    Ok((StatusCode::ACCEPTED, Json(PlexScanQueued { job_ids })))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -512,10 +564,25 @@ async fn update_channel(
     };
     requested.credential_configured =
         state.lastfm_api_key.is_some() || matches!(requested.kind, ChannelKind::CountryChart);
+    let lastfm_username_changed = requested.kind == ChannelKind::Lastfm
+        && requested
+            .lastfm
+            .as_ref()
+            .map(|settings| settings.username.trim())
+            != existing
+                .lastfm
+                .as_ref()
+                .map(|settings| settings.username.trim());
     requested.last_successful_at = existing.last_successful_at;
     requested.last_attempt_at = existing.last_attempt_at;
-    requested.last_error = existing.last_error;
-    requested.failure_count = existing.failure_count;
+    requested.last_error = (!lastfm_username_changed)
+        .then_some(existing.last_error)
+        .flatten();
+    requested.failure_count = if lastfm_username_changed {
+        0
+    } else {
+        existing.failure_count
+    };
     requested.next_refresh_at = None;
     requested.updated_at = Utc::now();
     channel::validate_channel(&requested, state.lastfm_api_key.is_some())
@@ -3395,12 +3462,17 @@ async fn observe_download(
         .announce_host
         .as_ref()
         .and_then(|host| state.announce_hosts.get(host));
+    let plex_target = state
+        .plex
+        .as_ref()
+        .and_then(|plex| plex.target_for_path(&download.live.save_path));
     state
         .db
         .observe_download(
             &download.live,
             download.announce_host.as_deref(),
             tracker.map(String::as_str),
+            plex_target.as_ref(),
         )
         .await?;
     state.background_jobs.wake();
@@ -4865,6 +4937,7 @@ fn truncate(value: &str, max: usize) -> String {
 #[openapi(
     paths(
         live, ready, preferences, update_preferences, providers, pause_provider, resume_provider,
+        plex_status, scan_plex,
         background_jobs, cancel_background_job, retry_background_job,
         account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
         download_job,
@@ -4878,6 +4951,7 @@ fn truncate(value: &str, max: usize) -> String {
         crate::model::ProviderCircuitState, crate::model::ProviderQueueCounts, ProviderStatus,
         crate::model::BackgroundJobState, crate::model::BackgroundJobStatus,
         crate::model::BackgroundJobCounts, BackgroundJobsOverview,
+        PlexIntegrationStatus, PlexScanQueued,
         crate::model::ReleasePreferences, crate::model::TrackerPreference,
         crate::model::TrackerDownloadMode, crate::model::LeechStatus,
         crate::model::DownloadEligibility, crate::model::DownloadEligibilityReason,

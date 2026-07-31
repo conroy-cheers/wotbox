@@ -16,6 +16,17 @@ export type PublicConfig = {
   downloadProfiles: string[];
 };
 
+export type PlexIntegrationStatus = {
+  configured: boolean;
+  sectionId?: number;
+  libraryRoots: string[];
+  pendingScans: number;
+};
+
+export type PlexScanQueued = {
+  jobIds: string[];
+};
+
 export type CanonicalBackfillProgress = {
   state: "pending" | "running" | "complete";
   processed: number;

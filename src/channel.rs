@@ -589,50 +589,81 @@ async fn lastfm_call(
                 .json()
                 .await
                 .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(ProviderFailure::new(
-                    ProviderFailureKind::RateLimited,
-                    "Last.fm rate limit exceeded",
-                )
-                .retry_after(retry));
-            }
-            if !status.is_success() {
-                let kind = if status.is_server_error() {
-                    ProviderFailureKind::Transient
-                } else if matches!(
-                    status,
-                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-                ) {
-                    ProviderFailureKind::Authentication
-                } else {
-                    ProviderFailureKind::Permanent
-                };
-                return Err(ProviderFailure::new(
-                    kind,
-                    format!("Last.fm returned HTTP {status}"),
-                ));
-            }
-            if let Some(error) = value.get("error") {
-                let code = error.as_i64().unwrap_or_default();
-                let message = value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("request failed");
-                let kind = match code {
-                    29 => ProviderFailureKind::RateLimited,
-                    10 | 26 => ProviderFailureKind::Authentication,
-                    11 | 16 => ProviderFailureKind::Transient,
-                    _ => ProviderFailureKind::Permanent,
-                };
-                return Err(ProviderFailure::new(
-                    kind,
-                    format!("Last.fm error {code}: {message}"),
-                ));
+            if let Some(failure) = lastfm_failure(method, params, status, retry, &value) {
+                return Err(failure);
             }
             Ok(value)
         })
         .await
         .map_err(Into::into)
+}
+
+fn lastfm_failure(
+    method: &str,
+    params: &[(&str, &str)],
+    status: reqwest::StatusCode,
+    retry: Option<std::time::Duration>,
+    value: &Value,
+) -> Option<ProviderFailure> {
+    if let Some(error) = value.get("error") {
+        let code = error.as_i64().unwrap_or_default();
+        let api_message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("request failed");
+        let kind = match code {
+            29 => ProviderFailureKind::RateLimited,
+            10 | 26 => ProviderFailureKind::Authentication,
+            11 | 16 => ProviderFailureKind::Transient,
+            _ => ProviderFailureKind::Permanent,
+        };
+        let message = if code == 6 && method.starts_with("user.") {
+            params
+                .iter()
+                .find_map(|(name, value)| (*name == "user").then_some(value.trim()))
+                .filter(|username| !username.is_empty())
+                .map(|username| {
+                    format!(
+                        "Last.fm user \u{201c}{username}\u{201d} was not found. Check the username in Preferences."
+                    )
+                })
+                .unwrap_or_else(|| format!("Last.fm error {code}: {api_message}"))
+        } else {
+            format!("Last.fm error {code}: {api_message}")
+        };
+        let failure = ProviderFailure::new(kind, message);
+        return Some(if kind == ProviderFailureKind::RateLimited {
+            failure.retry_after(retry)
+        } else {
+            failure
+        });
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Some(
+            ProviderFailure::new(
+                ProviderFailureKind::RateLimited,
+                "Last.fm rate limit exceeded",
+            )
+            .retry_after(retry),
+        );
+    }
+    if status.is_success() {
+        return None;
+    }
+    let kind = if status.is_server_error() {
+        ProviderFailureKind::Transient
+    } else if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        ProviderFailureKind::Authentication
+    } else {
+        ProviderFailureKind::Permanent
+    };
+    Some(ProviderFailure::new(
+        kind,
+        format!("Last.fm returned HTTP {status}"),
+    ))
 }
 
 #[cfg(test)]
@@ -1437,8 +1468,8 @@ mod tests {
 
     use super::{
         apple_sources_from_cache, apply_pack_constraints, base_edition_title, channel_is_due,
-        compare_variants, get_json_with_retry, next_occurrence, next_refresh_at, parse_apple_chart,
-        validate_channel, validate_channel_refresh,
+        compare_variants, get_json_with_retry, lastfm_failure, next_occurrence, next_refresh_at,
+        parse_apple_chart, validate_channel, validate_channel_refresh,
     };
 
     #[test]
@@ -1484,6 +1515,45 @@ mod tests {
         let error =
             validate_channel_refresh(&channel, true).expect_err("refresh requires username");
         assert!(error.to_string().contains("username"));
+    }
+
+    #[test]
+    fn lastfm_user_not_found_is_actionable_even_on_http_404() {
+        let failure = lastfm_failure(
+            "user.getTopArtists",
+            &[("user", "ccheers")],
+            reqwest::StatusCode::NOT_FOUND,
+            None,
+            &json!({ "error": 6, "message": "User not found" }),
+        )
+        .expect("failure");
+
+        assert_eq!(
+            failure.kind,
+            crate::provider::ProviderFailureKind::Permanent
+        );
+        assert_eq!(
+            failure.message,
+            "Last.fm user \u{201c}ccheers\u{201d} was not found. Check the username in Preferences."
+        );
+    }
+
+    #[test]
+    fn lastfm_http_errors_fall_back_when_the_body_has_no_api_error() {
+        let failure = lastfm_failure(
+            "artist.getTopAlbums",
+            &[("artist", "Example")],
+            reqwest::StatusCode::BAD_GATEWAY,
+            None,
+            &json!({}),
+        )
+        .expect("failure");
+
+        assert_eq!(
+            failure.kind,
+            crate::provider::ProviderFailureKind::Transient
+        );
+        assert_eq!(failure.message, "Last.fm returned HTTP 502 Bad Gateway");
     }
 
     #[tokio::test]

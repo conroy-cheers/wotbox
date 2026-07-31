@@ -1217,6 +1217,23 @@ pub struct PublicConfig {
     pub download_profiles: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexIntegrationStatus {
+    pub configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<u32>,
+    #[serde(default)]
+    pub library_roots: Vec<String>,
+    pub pending_scans: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexScanQueued {
+    pub job_ids: Vec<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelKind {

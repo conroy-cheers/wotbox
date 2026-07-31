@@ -190,10 +190,16 @@
                       savePath = "/downloads/ops";
                       tag = "ops";
                     };
+                    plex = {
+                      tokenFile = "/etc/wotbox-test/plex";
+                      sectionId = 4;
+                      libraryRoots = [ "/downloads/ops" ];
+                    };
                   };
                   environment.etc = {
                     "wotbox-test/ops".text = "test-token";
                     "wotbox-test/qbit".text = "qbt_0123456789abcdefghijklmnopqr";
+                    "wotbox-test/plex".text = "test-token";
                   };
                 };
               testScript = ''

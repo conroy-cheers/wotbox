@@ -46,6 +46,21 @@ let
     };
   };
 
+  plexType = lib.types.submodule {
+    options = {
+      baseUrl = mkOption {
+        type = lib.types.str;
+        default = "http://127.0.0.1:32400";
+      };
+      tokenFile = mkOption { type = lib.types.str; };
+      sectionId = mkOption { type = lib.types.ints.positive; };
+      libraryRoots = mkOption {
+        type = lib.types.nonEmptyListOf lib.types.str;
+        description = "Absolute music library paths accepted for Plex partial scans.";
+      };
+    };
+  };
+
   settings = {
     listen_address = cfg.listenAddress;
     inherit (cfg) port;
@@ -67,8 +82,17 @@ let
       save_path = profile.savePath;
       start_paused = profile.startPaused;
     }) cfg.downloadProfiles;
-  } // lib.optionalAttrs (cfg.lastfmApiKeyFile != null) {
+  }
+  // lib.optionalAttrs (cfg.lastfmApiKeyFile != null) {
     lastfm_api_key_file = cfg.lastfmApiKeyFile;
+  }
+  // lib.optionalAttrs (cfg.plex != null) {
+    plex = {
+      base_url = cfg.plex.baseUrl;
+      token_file = cfg.plex.tokenFile;
+      section_id = cfg.plex.sectionId;
+      library_roots = cfg.plex.libraryRoots;
+    };
   };
   configFile = toml.generate "wotbox.toml" settings;
 in
@@ -121,6 +145,11 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = "Path to the Last.fm API key used by the optional discovery channel.";
+    };
+    plex = mkOption {
+      type = lib.types.nullOr plexType;
+      default = null;
+      description = "Optional Plex server notified when music downloads complete.";
     };
   };
 
