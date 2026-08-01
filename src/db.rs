@@ -906,7 +906,19 @@ impl Database {
             .rows_affected)
     }
 
-    pub async fn resume_waiting_jobs_by_kind(&self, kind: &str) -> Result<u64> {
+    async fn resume_waiting_single_coverages(
+        &self,
+        tracker: &str,
+        group_ids: &[i64],
+    ) -> Result<u64> {
+        if group_ids.is_empty() {
+            return Ok(0);
+        }
+        let tracker = tracker.to_ascii_lowercase();
+        let keys = group_ids
+            .iter()
+            .map(|group_id| format!("single-coverage:{tracker}:{group_id}:v2"))
+            .collect::<Vec<_>>();
         let now = Utc::now().to_rfc3339();
         Ok(background_job::Entity::update_many()
             .col_expr(background_job::Column::State, Expr::value("pending"))
@@ -916,7 +928,7 @@ impl Database {
             )
             .col_expr(background_job::Column::UpdatedAt, Expr::value(now))
             .filter(background_job::Column::State.eq("waiting"))
-            .filter(background_job::Column::Kind.eq(kind))
+            .filter(background_job::Column::DeduplicationKey.is_in(keys))
             .exec(&self.connection)
             .await?
             .rows_affected)
@@ -1606,17 +1618,21 @@ impl Database {
             active.update(&transaction).await?;
         }
         transaction.commit().await?;
-        self.resume_waiting_jobs_by_kind("compute_single_coverage")
-            .await?;
+        let mut coverage_groups = vec![index.group_id];
         if changed {
-            for group_id in self
+            let affected = self
                 .affected_single_groups_on(&self.connection, &index.tracker, index.group_id)
-                .await?
-            {
-                self.invalidate_single_coverage(&index.tracker, group_id, parent_id)
+                .await?;
+            for group_id in &affected {
+                self.invalidate_single_coverage(&index.tracker, *group_id, parent_id)
                     .await?;
             }
+            coverage_groups.extend(affected);
         }
+        coverage_groups.sort_unstable();
+        coverage_groups.dedup();
+        self.resume_waiting_single_coverages(&index.tracker, &coverage_groups)
+            .await?;
         Ok(())
     }
 
@@ -1789,15 +1805,16 @@ impl Database {
             dirty_singles.extend(old_singles);
             dirty_singles.extend(new_singles);
         }
-        for group_id in dirty_singles {
-            if single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+        let dirty_singles = dirty_singles.into_iter().collect::<Vec<_>>();
+        for group_id in &dirty_singles {
+            if single_album_coverage::Entity::find_by_id((tracker.to_owned(), *group_id))
                 .one(&transaction)
                 .await?
                 .is_none()
             {
                 single_album_coverage::ActiveModel {
                     tracker: Set(tracker.into()),
-                    single_group_id: Set(group_id),
+                    single_group_id: Set(*group_id),
                     state: Set("pending".into()),
                     coverage_json: Set(None),
                     updated_at: Set(now.clone()),
@@ -1805,7 +1822,7 @@ impl Database {
                 .insert(&transaction)
                 .await?;
             } else if let Some(model) =
-                single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
+                single_album_coverage::Entity::find_by_id((tracker.to_owned(), *group_id))
                     .one(&transaction)
                     .await?
             {
@@ -1825,7 +1842,7 @@ impl Database {
                 EnqueueBackgroundJob {
                     deduplication_key: &key,
                     kind: "compute_single_coverage",
-                    payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    payload: serde_json::json!({ "tracker": tracker, "groupId": *group_id }),
                     provider_id: None,
                     lane: "sync",
                     priority: 5,
@@ -1838,7 +1855,7 @@ impl Database {
             .await?;
         }
         transaction.commit().await?;
-        self.resume_waiting_jobs_by_kind("compute_single_coverage")
+        self.resume_waiting_single_coverages(tracker, &dirty_singles)
             .await?;
         Ok(())
     }
@@ -4604,11 +4621,13 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, IntoActiveModel};
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+    };
     use tempfile::tempdir;
 
     use crate::{
-        entity::download_release_link,
+        entity::{background_job, download_release_link},
         model::{
             CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
             ClientDownloadState, LiveDownloadStatus, PackItemPlanState, ProviderCircuitState,
@@ -4619,6 +4638,50 @@ mod tests {
     };
 
     use super::{Database, EnqueueBackgroundJob, StoredProviderState};
+
+    #[tokio::test]
+    async fn dependency_events_resume_only_affected_coverage_jobs() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("targeted-resume.sqlite"))
+            .await
+            .expect("database");
+        db.ensure_single_coverage("ops", 1)
+            .await
+            .expect("first coverage");
+        db.ensure_single_coverage("ops", 2)
+            .await
+            .expect("second coverage");
+        background_job::Entity::update_many()
+            .col_expr(
+                background_job::Column::State,
+                sea_orm::sea_query::Expr::value("waiting"),
+            )
+            .filter(background_job::Column::Kind.eq("compute_single_coverage"))
+            .exec(&db.connection)
+            .await
+            .expect("park coverage jobs");
+
+        assert_eq!(
+            db.resume_waiting_single_coverages("ops", &[1])
+                .await
+                .expect("targeted resume"),
+            1
+        );
+        let first = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq("single-coverage:ops:1:v2"))
+            .one(&db.connection)
+            .await
+            .expect("first query")
+            .expect("first job");
+        let second = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq("single-coverage:ops:2:v2"))
+            .one(&db.connection)
+            .await
+            .expect("second query")
+            .expect("second job");
+        assert_eq!(first.state, "pending");
+        assert_eq!(second.state, "waiting");
+    }
 
     #[tokio::test]
     async fn job_claims_respect_provider_windows_and_in_flight_work() {
