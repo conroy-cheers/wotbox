@@ -26,7 +26,41 @@ impl MigratorTrait for Migrator {
             Box::new(ProviderSafetySchema),
             Box::new(BackgroundJobSchema),
             Box::new(BackgroundRetryRepairSchema),
+            Box::new(BackgroundTerminalNormalizationSchema),
         ]
+    }
+}
+
+struct BackgroundTerminalNormalizationSchema;
+
+impl MigrationName for BackgroundTerminalNormalizationSchema {
+    fn name(&self) -> &str {
+        "m20260801_000008_background_terminal_normalization"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for BackgroundTerminalNormalizationSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                UPDATE background_jobs
+                   SET last_error_code = 'not_found',
+                       last_error_message = 'OPS did not recognize this torrent hash; manual retry is available',
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE kind = 'resolve_download_hash'
+                   AND state = 'failed'
+                   AND lower(COALESCE(last_error_message, '')) LIKE '%bad parameters%';
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 
