@@ -159,6 +159,10 @@ pub mod download_release_link {
         pub missing_since: Option<String>,
         pub library_added_at: Option<String>,
         pub completed_at: Option<String>,
+        #[sea_orm(column_type = "Json")]
+        pub observed_json: Option<Json>,
+        pub observed_at: Option<String>,
+        pub client_added_at: Option<String>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

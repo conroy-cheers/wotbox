@@ -193,6 +193,17 @@ pub enum ProviderRequestError {
 }
 
 impl ProviderRequestError {
+    pub fn provider_id(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { provider, .. }
+            | Self::Busy { provider }
+            | Self::Deferred { provider, .. }
+            | Self::Upstream { provider, .. }
+            | Self::Unknown(provider)
+            | Self::Stopped(provider) => Some(provider),
+        }
+    }
+
     pub fn is_unavailable(&self) -> bool {
         matches!(
             self,

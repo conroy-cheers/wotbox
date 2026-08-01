@@ -27,7 +27,81 @@ impl MigratorTrait for Migrator {
             Box::new(BackgroundJobSchema),
             Box::new(BackgroundRetryRepairSchema),
             Box::new(BackgroundTerminalNormalizationSchema),
+            Box::new(QueryPerformanceSchema),
         ]
+    }
+}
+
+struct QueryPerformanceSchema;
+
+impl MigrationName for QueryPerformanceSchema {
+    fn name(&self) -> &str {
+        "m20260801_000009_query_performance"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for QueryPerformanceSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        for column in [
+            download_release_link::Column::ObservedJson,
+            download_release_link::Column::ObservedAt,
+            download_release_link::Column::ClientAddedAt,
+        ] {
+            add_column_if_missing(manager, &schema, download_release_link::Entity, column).await?;
+        }
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                UPDATE download_release_links
+                   SET client_added_at = first_seen_at
+                 WHERE client_added_at IS NULL;
+                "#,
+            )
+            .await?;
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .name("idx_download_links_page")
+                .table(download_release_link::Entity)
+                .col(download_release_link::Column::ResolutionState)
+                .col(download_release_link::Column::Present)
+                .col(download_release_link::Column::ClientAddedAt)
+                .col(download_release_link::Column::Client)
+                .col(download_release_link::Column::InfoHash)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_download_links_library_release")
+                .table(download_release_link::Entity)
+                .col(download_release_link::Column::ResolutionState)
+                .col(download_release_link::Column::ReleaseId)
+                .col(download_release_link::Column::LibraryAddedAt)
+                .col(download_release_link::Column::Present)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_canonical_torrents_release")
+                .table(canonical_torrent::Entity)
+                .col(canonical_torrent::Column::ReleaseId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_release_credits_artist")
+                .table(canonical_release_credit::Entity)
+                .col(canonical_release_credit::Column::ArtistId)
+                .col(canonical_release_credit::Column::ReleaseId)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

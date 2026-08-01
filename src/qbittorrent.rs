@@ -17,7 +17,6 @@ use crate::{
 
 #[async_trait]
 pub trait DownloadClient: Send + Sync {
-    async fn health(&self) -> Result<String>;
     async fn free_space(&self) -> Result<i64>;
     async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>>;
     async fn downloads_with_class(
@@ -37,6 +36,13 @@ pub trait DownloadClient: Send + Sync {
         self.download(info_hash).await
     }
     async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>>;
+    async fn downloads_by_hashes_with_class(
+        &self,
+        info_hashes: &[String],
+        _class: RequestClass,
+    ) -> Result<Vec<ObservedDownload>> {
+        self.downloads_by_hashes(info_hashes).await
+    }
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>>;
     async fn add_torrent(
         &self,
@@ -302,23 +308,6 @@ fn unix_timestamp(value: i64) -> Option<DateTime<Utc>> {
 
 #[async_trait]
 impl DownloadClient for QbittorrentClient {
-    async fn health(&self) -> Result<String> {
-        self.execute(RequestClass::Background, || async {
-            let response = self
-                .request(reqwest::Method::GET, "/api/v2/app/version")
-                .send()
-                .await
-                .map_err(transient)?;
-            let response = successful(response, "qBittorrent health").await?;
-            response
-                .text()
-                .await
-                .map(|value| value.trim().to_owned())
-                .map_err(transient)
-        })
-        .await
-    }
-
     async fn free_space(&self) -> Result<i64> {
         self.execute(RequestClass::Manual, || async {
             let response = self
@@ -370,16 +359,20 @@ impl DownloadClient for QbittorrentClient {
     }
 
     async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>> {
+        self.downloads_by_hashes_with_class(info_hashes, RequestClass::Background)
+            .await
+    }
+
+    async fn downloads_by_hashes_with_class(
+        &self,
+        info_hashes: &[String],
+        class: RequestClass,
+    ) -> Result<Vec<ObservedDownload>> {
         if info_hashes.is_empty() {
             return Ok(Vec::new());
         }
-        self.fetch_downloads(
-            Some(&info_hashes.join("|")),
-            None,
-            None,
-            RequestClass::Background,
-        )
-        .await
+        self.fetch_downloads(Some(&info_hashes.join("|")), None, None, class)
+            .await
     }
 
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>> {

@@ -16,8 +16,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    api::{AppState, enrich_library_artist_credits},
-    db::{EnqueueBackgroundJob, StoredBackgroundJob},
+    api::{AppState, cleanup_download_stage, enrich_library_artist_credits, process_download},
+    db::{DownloadObservation, EnqueueBackgroundJob, StoredBackgroundJob},
     dedupe::{compute_raw_coverage, track_index_from_group},
     model::CanonicalTorrent,
     plex::PlexScanTarget,
@@ -31,10 +31,19 @@ pub const SCAN_DOWNLOAD_CLIENT: &str = "scan_download_client";
 pub const CANONICAL_BACKFILL: &str = "canonical_backfill";
 pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
 pub const NOTIFY_PLEX: &str = "notify_plex";
+pub const SUBMIT_DOWNLOAD: &str = "submit_download";
 
-const WORKER_LANES: [&str; 4] = ["event", "sync", "sync", "maintenance"];
+const WORKER_LANES: [&str; 6] = [
+    "event",
+    "sync",
+    "sync",
+    "maintenance",
+    "download",
+    "download",
+];
 const LEASE_DURATION: Duration = Duration::from_secs(120);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct BackgroundJobNotifier {
@@ -59,6 +68,16 @@ pub struct BackgroundRuntime {
     notifier: BackgroundJobNotifier,
     db: crate::db::Database,
     owners: Vec<String>,
+}
+
+struct AbortOnDrop<T> {
+    handle: JoinHandle<T>,
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl BackgroundRuntime {
@@ -253,6 +272,7 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
         .db
         .prune_background_jobs(ChronoDuration::days(30))
         .await?;
+    state.db.ensure_incomplete_download_submissions().await?;
     for name in state.download_clients.keys() {
         enqueue(
             state,
@@ -380,25 +400,40 @@ async fn run_claimed_job(
         provider = job.provider_id.as_deref().unwrap_or("local"),
         "running background job"
     );
-    let mut operation = Box::pin(execute_job(state, &job));
+    let operation_state = state.clone();
+    let operation_job = job.clone();
+    let mut operation = AbortOnDrop {
+        handle: tokio::spawn(async move { execute_job(&operation_state, &operation_job).await }),
+    };
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await;
     let mut stopping = false;
     let outcome = loop {
         tokio::select! {
-            outcome = &mut operation => break outcome,
+            outcome = &mut operation.handle => {
+                break outcome.unwrap_or_else(|error| Err(anyhow!("job operation task failed: {error}")));
+            }
             _ = heartbeat.tick() => {
-                match state.db.heartbeat_background_job(
-                    job.id,
-                    owner,
-                    LEASE_DURATION,
-                    0,
-                    None,
-                    Some("Working"),
+                match tokio::time::timeout(
+                    HEARTBEAT_TIMEOUT,
+                    state.db.heartbeat_background_job(
+                        job.id,
+                        owner,
+                        LEASE_DURATION,
+                        0,
+                        None,
+                        Some("Working"),
+                    ),
                 ).await {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(error) => tracing::warn!(job_id = %job.id, %error, "job heartbeat failed"),
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        operation.handle.abort();
+                        let _ = (&mut operation.handle).await;
+                        return;
+                    }
+                    Ok(Err(error)) => tracing::warn!(job_id = %job.id, %error, "job heartbeat failed"),
+                    Err(_) => tracing::warn!(job_id = %job.id, "job heartbeat timed out"),
                 }
             }
             changed = stop.changed(), if !stopping => {
@@ -413,6 +448,34 @@ async fn run_claimed_job(
         Ok(outcome) => outcome,
         Err(error) => classify_error(state, &job, error).await,
     };
+    let terminal_download_failure = match &outcome {
+        JobOutcome::Fail { code, message } => Some((*code, message.as_str())),
+        JobOutcome::Retry {
+            increment_attempt: true,
+            code,
+            message,
+            ..
+        } if job.attempts.saturating_add(1) >= job.max_attempts => Some((*code, message.as_str())),
+        _ => None,
+    };
+    if job.kind == SUBMIT_DOWNLOAD
+        && let Some((code, message)) = terminal_download_failure
+        && let Ok(payload) =
+            serde_json::from_value::<DownloadSubmissionPayload>(job.payload.clone())
+    {
+        if let Err(error) = state
+            .db
+            .set_job_state(
+                payload.job_id,
+                crate::model::DownloadState::Failed,
+                Some((code, message)),
+            )
+            .await
+        {
+            tracing::error!(job_id = %payload.job_id, %error, "could not persist terminal download failure");
+        }
+        cleanup_download_stage(state, payload.job_id).await;
+    }
     let result = match outcome {
         JobOutcome::Complete => state.db.complete_background_job(job.id, owner).await,
         JobOutcome::Fail { code, message } => {
@@ -456,8 +519,36 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
             Ok(JobOutcome::Complete)
         }
         NOTIFY_PLEX => notify_plex(state, &job.payload).await,
+        SUBMIT_DOWNLOAD => submit_download(state, &job.payload).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSubmissionPayload {
+    job_id: Uuid,
+}
+
+async fn submit_download(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+    let payload: DownloadSubmissionPayload = serde_json::from_value(payload.clone())?;
+    let Some(job) = state.db.get_job(payload.job_id).await? else {
+        return Ok(JobOutcome::Fail {
+            code: "download_job_missing",
+            message: "The durable download job no longer exists".into(),
+        });
+    };
+    if matches!(
+        job.state,
+        crate::model::DownloadState::Active
+            | crate::model::DownloadState::Complete
+            | crate::model::DownloadState::Unknown
+            | crate::model::DownloadState::Failed
+    ) {
+        return Ok(JobOutcome::Complete);
+    }
+    process_download(state.clone(), job).await?;
+    Ok(JobOutcome::Complete)
 }
 
 #[derive(Deserialize)]
@@ -774,26 +865,24 @@ async fn scan_download_client(state: &Arc<AppState>, payload: &Value) -> Result<
             .downloads_with_class(PAGE_SIZE, offset, RequestClass::Background)
             .await?;
         let count = downloads.len();
-        for download in &downloads {
-            let plex_target = state
-                .plex
-                .as_ref()
-                .and_then(|plex| plex.target_for_path(&download.live.save_path));
-            state
-                .db
-                .observe_download(
-                    &download.live,
-                    download.announce_host.as_deref(),
-                    download
-                        .announce_host
-                        .as_ref()
-                        .and_then(|host| state.announce_hosts.get(host))
-                        .map(String::as_str),
-                    plex_target.as_ref(),
-                )
-                .await?;
-            state.background_jobs.wake();
-        }
+        let observations = downloads
+            .iter()
+            .map(|download| DownloadObservation {
+                live: download.live.clone(),
+                announce_host: download.announce_host.clone(),
+                tracker: download
+                    .announce_host
+                    .as_ref()
+                    .and_then(|host| state.announce_hosts.get(host))
+                    .cloned(),
+                plex_target: state
+                    .plex
+                    .as_ref()
+                    .and_then(|plex| plex.target_for_path(&download.live.save_path)),
+            })
+            .collect::<Vec<_>>();
+        state.db.observe_downloads(&observations).await?;
+        state.background_jobs.wake();
         offset += count as u32;
         if count < PAGE_SIZE as usize || offset >= 100_000 {
             break;
@@ -827,6 +916,14 @@ async fn classify_error(
         .chain()
         .find_map(|cause| cause.downcast_ref::<ProviderRequestError>());
     if let Some(provider_error) = provider_error {
+        if let Some(provider_id) = provider_error.provider_id()
+            && let Err(error) = state
+                .db
+                .set_background_job_provider(job.id, provider_id)
+                .await
+        {
+            tracing::warn!(job_id = %job.id, %error, "could not update job provider attribution");
+        }
         let message = provider_error.to_string();
         match provider_error {
             ProviderRequestError::Unavailable {

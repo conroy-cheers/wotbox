@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::Write,
-    path::Path as StdPath,
+    path::{Path as StdPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -20,7 +20,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::{sync::Semaphore, time::MissedTickBehavior};
+use tokio::{sync::RwLock, time::MissedTickBehavior};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -28,7 +28,7 @@ use crate::{
     background::{self, BackgroundJobNotifier},
     channel,
     config::{Config, DownloadClientKind, TrackerKind, read_secret},
-    db::{Cached, Database},
+    db::{Cached, Database, DownloadObservation},
     dedupe::track_index_from_group,
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
@@ -57,6 +57,11 @@ use crate::{
 
 static UI: Dir<'_> = include_dir!("$OUT_DIR/ui");
 
+struct LibraryCache {
+    loaded_at: std::time::Instant,
+    releases: Vec<LibraryRelease>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
@@ -70,13 +75,26 @@ pub struct AppState {
     pub lastfm_api_key: Option<String>,
     pub plex: Option<PlexIntegration>,
     pub background_jobs: BackgroundJobNotifier,
-    download_slots: Arc<Semaphore>,
+    download_staging_dir: PathBuf,
+    library_cache: Arc<RwLock<Option<LibraryCache>>>,
     _instance_lock: Arc<File>,
 }
 
 impl AppState {
     pub async fn new(config: &Config) -> Result<Arc<Self>> {
         let instance_lock = acquire_database_lock(&config.database_path)?;
+        let download_staging_dir = config
+            .database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| StdPath::new("."))
+            .join("download-staging");
+        std::fs::create_dir_all(&download_staging_dir).with_context(|| {
+            format!(
+                "create download staging directory {}",
+                download_staging_dir.display()
+            )
+        })?;
         let db = Database::open(&config.database_path).await?;
         let preferences = db.get_runtime_preferences().await?;
         let mut definitions = config
@@ -167,7 +185,8 @@ impl AppState {
                 .transpose()?,
             plex: config.plex.as_ref().map(PlexIntegration::new).transpose()?,
             background_jobs: BackgroundJobNotifier::new(),
-            download_slots: Arc::new(Semaphore::new(2)),
+            download_staging_dir,
+            library_cache: Arc::new(RwLock::new(None)),
             _instance_lock: Arc::new(instance_lock),
         });
         state.db.ensure_default_channels().await?;
@@ -175,6 +194,7 @@ impl AppState {
         state.db.recover_resolving_links().await?;
         state.db.recover_track_indexes().await?;
         seed_existing_job_links(&state).await?;
+        cleanup_orphaned_download_stages(&state).await?;
         Ok(state)
     }
 }
@@ -488,19 +508,13 @@ async fn resume_provider(
 
 #[utoipa::path(get, path = "/health/ready", responses((status = 200, body = Health)))]
 async fn ready(State(state): State<Arc<AppState>>) -> Result<Json<Health>, AppError> {
-    let client = state.download_clients.values().next().ok_or_else(|| {
-        AppError::unavailable(
-            "download_client_unconfigured",
-            "No download client is configured",
-        )
-    })?;
-    let version = client
-        .health()
+    tokio::time::timeout(Duration::from_millis(500), state.db.ping())
         .await
-        .map_err(|error| AppError::unavailable("qbittorrent_unavailable", error))?;
+        .map_err(|_| AppError::unavailable("database_timeout", "Database readiness timed out"))?
+        .map_err(|error| AppError::unavailable("database_unavailable", error))?;
     Ok(Json(Health {
         status: "ok",
-        qbittorrent: Some(version),
+        qbittorrent: None,
     }))
 }
 
@@ -2277,6 +2291,20 @@ struct LibraryReleaseBuild {
 }
 
 async fn load_library_releases(state: &AppState) -> Result<Vec<LibraryRelease>, AppError> {
+    {
+        let cache = state.library_cache.read().await;
+        if let Some(cache) = cache.as_ref()
+            && cache.loaded_at.elapsed() < Duration::from_secs(30)
+        {
+            return Ok(cache.releases.clone());
+        }
+    }
+    let mut cache = state.library_cache.write().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.loaded_at.elapsed() < Duration::from_secs(30)
+    {
+        return Ok(cached.releases.clone());
+    }
     let records = state.db.list_library_records().await?;
     let mut releases = build_library_releases(records);
     let release_ids = releases
@@ -2294,6 +2322,10 @@ async fn load_library_releases(state: &AppState) -> Result<Vec<LibraryRelease>, 
     }
     enrich_release_coverages(state, &mut releases).await?;
     sort_library_releases(&mut releases, "year_desc");
+    *cache = Some(LibraryCache {
+        loaded_at: std::time::Instant::now(),
+        releases: releases.clone(),
+    });
     Ok(releases)
 }
 
@@ -2634,6 +2666,18 @@ async fn library_index_status(
     releases: &[LibraryRelease],
 ) -> Result<LibraryIndexStatus, AppError> {
     let mut deduplication = DeduplicationIndexStatus::default();
+    let single_keys = releases
+        .iter()
+        .filter(|release| {
+            release
+                .release
+                .release_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        })
+        .map(|release| (release.release.tracker.clone(), release.release.group_id))
+        .collect::<Vec<_>>();
+    let coverages = state.db.get_single_coverages(&single_keys).await?;
     for release in releases.iter().filter(|release| {
         release
             .release
@@ -2647,12 +2691,9 @@ async fn library_index_status(
             deduplication.hidden += 1;
             continue;
         }
-        match state
-            .db
-            .get_single_coverage(&release.release.tracker, release.release.group_id)
-            .await?
-            .map(|stored| stored.state)
-            .as_deref()
+        match coverages
+            .get(&(release.release.tracker.clone(), release.release.group_id))
+            .map(|stored| stored.state.as_str())
         {
             Some("ready") => deduplication.checked += 1,
             Some("resolving") => deduplication.resolving += 1,
@@ -2817,103 +2858,125 @@ async fn downloads(
 ) -> Result<Json<DownloadsPage>, AppError> {
     let limit = query.limit.clamp(1, 500);
     let offset = query.offset.min(10_000);
-    let clients: Vec<_> = if let Some(name) = query.client {
-        vec![(
-            name.clone(),
-            state
-                .download_clients
-                .get(&name)
-                .ok_or_else(|| {
-                    AppError::bad_request("unknown_download_client", "Unknown download client")
-                })?
-                .clone(),
-        )]
-    } else {
-        state
-            .download_clients
-            .iter()
-            .map(|(name, client)| (name.clone(), client.clone()))
-            .collect()
-    };
-    let mut observed = Vec::new();
-    let desired_per_client = offset.saturating_add(limit).min(10_500);
-    for (name, client) in clients {
-        let mut client_offset = 0;
-        loop {
-            let page_limit = desired_per_client
-                .saturating_sub(client_offset)
-                .clamp(1, 500);
-            let mut page = client
-                .downloads(page_limit, client_offset)
-                .await
-                .map_err(|error| {
-                    AppError::unavailable("download_client_unavailable", format!("{name}: {error}"))
-                })?;
-            let count = page.len();
-            for download in &page {
-                observe_download(&state, download).await?;
+    if let Some(name) = query.client.as_deref()
+        && !state.download_clients.contains_key(name)
+    {
+        return Err(AppError::bad_request(
+            "unknown_download_client",
+            "Unknown download client",
+        ));
+    }
+    let (indexed, total) = state
+        .db
+        .list_indexed_downloads(query.client.as_deref(), u64::from(limit), u64::from(offset))
+        .await?;
+    let mut hashes_by_client: HashMap<String, Vec<String>> = HashMap::new();
+    for download in &indexed {
+        hashes_by_client
+            .entry(download.client.clone())
+            .or_default()
+            .push(download.info_hash.clone());
+    }
+    let mut refreshed = HashMap::new();
+    let mut observations = Vec::new();
+    for (name, hashes) in hashes_by_client {
+        let Some(client) = state.download_clients.get(&name) else {
+            continue;
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            client.downloads_by_hashes_with_class(&hashes, RequestClass::Interactive),
+        )
+        .await
+        {
+            Ok(Ok(downloads)) => {
+                for download in downloads {
+                    observations.push(DownloadObservation {
+                        live: download.live.clone(),
+                        announce_host: download.announce_host.clone(),
+                        tracker: download
+                            .announce_host
+                            .as_ref()
+                            .and_then(|host| state.announce_hosts.get(host))
+                            .cloned(),
+                        plex_target: state
+                            .plex
+                            .as_ref()
+                            .and_then(|plex| plex.target_for_path(&download.live.save_path)),
+                    });
+                    refreshed.insert(
+                        (name.clone(), download.live.info_hash.clone()),
+                        download.live,
+                    );
+                }
             }
-            observed.append(&mut page);
-            if count < page_limit as usize || client_offset + page_limit >= desired_per_client {
-                break;
+            Ok(Err(error)) => {
+                tracing::warn!(client = %name, %error, "using cached download status");
             }
-            client_offset += page_limit;
+            Err(_) => {
+                tracing::warn!(client = %name, "download status refresh timed out; using cache")
+            }
         }
     }
-    observed.sort_by(|left, right| {
-        right
-            .live
-            .added_at
-            .cmp(&left.live.added_at)
-            .then_with(|| left.live.info_hash.cmp(&right.live.info_hash))
-    });
-    let mut items = Vec::new();
-    for download in observed {
-        let Some(link) = state
-            .db
-            .get_link(&download.live.client, &download.live.info_hash)
-            .await?
-        else {
-            continue;
-        };
-        if link.resolution_state != "linked" {
-            continue;
+    for chunk in observations.chunks(100) {
+        if let Err(error) = state.db.observe_downloads(chunk).await {
+            tracing::warn!(%error, "could not persist refreshed download page");
+            break;
         }
-        let (Some(tracker), Some(torrent_id)) = (link.tracker.as_deref(), link.torrent_id) else {
+    }
+    if !observations.is_empty() {
+        state.background_jobs.wake();
+    }
+    let release_ids = indexed
+        .iter()
+        .filter_map(|download| download.canonical.value.release.id)
+        .collect::<Vec<_>>();
+    let release_details = state.db.get_release_details(&release_ids).await?;
+    let mut items = Vec::new();
+    for indexed_download in indexed {
+        let refreshed_live = refreshed.remove(&(
+            indexed_download.client.clone(),
+            indexed_download.info_hash.clone(),
+        ));
+        let live_stale = refreshed_live.is_none();
+        let Some(live) = refreshed_live.or(indexed_download.live) else {
             continue;
         };
-        let Some(canonical) = state.db.get_canonical(tracker, torrent_id).await? else {
-            continue;
-        };
+        let canonical = indexed_download.canonical;
         let stale = canonical.expires_at <= Utc::now();
         if stale {
-            background::enqueue_hash_resolution(&state, tracker, &download.live.info_hash).await?;
+            background::enqueue_hash_resolution(
+                &state,
+                &canonical.value.release.tracker,
+                &indexed_download.info_hash,
+            )
+            .await?;
         }
         let mut variant = canonical.value.variant.clone();
-        variant.downloads = vec![download.live.clone()];
+        variant.downloads = vec![live.clone()];
         let release = match canonical.value.release.id {
-            Some(id) => state
-                .db
-                .get_release_detail(id)
-                .await?
-                .map(|detail| detail.release)
+            Some(id) => release_details
+                .get(&id)
+                .map(|detail| detail.release.clone())
                 .unwrap_or(canonical.value.release),
             None => canonical.value.release,
         };
         items.push(CanonicalDownload {
             release,
             variant,
-            download: download.live,
+            download: live,
             provenance: provenance("canonical", canonical.fetched_at, stale),
+            live_observed_at: if live_stale {
+                indexed_download.observed_at
+            } else {
+                Some(Utc::now())
+            },
+            live_stale,
         });
     }
-    let items = items
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
     Ok(Json(DownloadsPage {
         items,
+        total,
         index: state.db.index_counts().await?,
     }))
 }
@@ -3013,6 +3076,8 @@ async fn download_detail_compatibility(
             canonical.fetched_at,
             canonical.expires_at <= Utc::now(),
         ),
+        live_observed_at: Some(Utc::now()),
+        live_stale: false,
     }))
 }
 
@@ -3044,7 +3109,7 @@ async fn enqueue_download(
             "Unknown download profile",
         ));
     }
-    let (job, created) = state
+    let (job, _created) = state
         .db
         .create_job(
             &request.tracker,
@@ -3054,29 +3119,7 @@ async fn enqueue_download(
             idempotency_key,
         )
         .await?;
-    if created {
-        let task_state = state.clone();
-        let task_job = job.clone();
-        tokio::spawn(async move {
-            let permit = match task_state.download_slots.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => return,
-            };
-            if let Err(error) = process_download(task_state.clone(), task_job.clone()).await {
-                let message = truncate(&error.to_string(), 500);
-                tracing::error!(job_id = %task_job.id, error = %message, "download submission failed");
-                let _ = task_state
-                    .db
-                    .set_job_state(
-                        task_job.id,
-                        DownloadState::Failed,
-                        Some(("download_failed", &message)),
-                    )
-                    .await;
-            }
-            drop(permit);
-        });
-    }
+    state.background_jobs.wake();
     Ok(job)
 }
 
@@ -3097,15 +3140,71 @@ async fn download_job(
         .ok_or_else(|| AppError::not_found("download_job_not_found", "Download job not found"))
 }
 
-async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> {
-    state
+fn download_stage_path(state: &AppState, job_id: Uuid) -> PathBuf {
+    state.download_staging_dir.join(format!("{job_id}.torrent"))
+}
+
+fn write_staged_download(path: &StdPath, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("download staging path has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("persist staged torrent {}", path.display()))?;
+    Ok(())
+}
+
+pub(crate) async fn cleanup_download_stage(state: &AppState, job_id: Uuid) {
+    let path = download_stage_path(state, job_id);
+    if let Err(error) = tokio::fs::remove_file(&path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(job_id = %job_id, %error, path = %path.display(), "could not remove staged torrent");
+    }
+}
+
+async fn cleanup_orphaned_download_stages(state: &AppState) -> Result<()> {
+    let incomplete = state
         .db
-        .set_job_state(job.id, DownloadState::FetchingMetadata, None)
-        .await?;
-    let tracker = state
-        .trackers
-        .get(&job.tracker)
-        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
+        .list_jobs()
+        .await?
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.state,
+                DownloadState::Queued | DownloadState::FetchingMetadata | DownloadState::Submitting
+            )
+        })
+        .map(|job| job.id)
+        .collect::<HashSet<_>>();
+    let mut entries = tokio::fs::read_dir(&state.download_staging_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let job_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        if job_id.is_none_or(|job_id| !incomplete.contains(&job_id)) {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("remove orphaned download stage {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> {
     let profile = state
         .profiles
         .get(&job.profile)
@@ -3114,6 +3213,59 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .download_clients
         .get(&profile.client)
         .ok_or_else(|| anyhow!("download client disappeared from configuration"))?;
+    let stage_path = download_stage_path(&state, job.id);
+    let staged_payload = match tokio::fs::read(&stage_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("read staged torrent"),
+    };
+
+    if let Some(info_hash) = job.info_hash.as_deref() {
+        if let Some(existing) = client
+            .download_with_class(info_hash, RequestClass::Download)
+            .await?
+        {
+            let state_value = if existing.live.progress >= 1.0 {
+                DownloadState::Complete
+            } else {
+                DownloadState::Active
+            };
+            state
+                .db
+                .update_progress(
+                    job.id,
+                    state_value,
+                    existing.live.progress,
+                    existing.live.download_speed,
+                    existing.live.upload_speed,
+                    existing.live.eta,
+                )
+                .await?;
+            cleanup_download_stage(&state, job.id).await;
+            return Ok(());
+        }
+        if let Some(bytes) = staged_payload.as_ref() {
+            let file_name = format!("{}-{}.torrent", job.tracker, job.torrent_id);
+            client
+                .add_torrent(bytes.clone(), &file_name, profile)
+                .await?;
+            state
+                .db
+                .set_job_state(job.id, DownloadState::Active, None)
+                .await?;
+            cleanup_download_stage(&state, job.id).await;
+            return Ok(());
+        }
+    }
+
+    state
+        .db
+        .set_job_state(job.id, DownloadState::FetchingMetadata, None)
+        .await?;
+    let tracker = state
+        .trackers
+        .get(&job.tracker)
+        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
 
     let (mut metadata, mut canonical, raw) = tracker
         .torrent_with_class(job.torrent_id, RequestClass::Download)
@@ -3188,7 +3340,7 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
     if job.use_token && metadata.token_eligibility_known && !metadata.can_use_token {
         return Err(anyhow!("torrent is not eligible for a freeleech token"));
     }
-    let mut payload = None;
+    let mut payload = staged_payload;
     let mut submission_started = false;
     let info_hash = if let Some(info_hash) = metadata
         .info_hash
@@ -3196,6 +3348,8 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
         .or_else(|| canonical.variant.info_hash.clone())
     {
         info_hash.to_ascii_lowercase()
+    } else if let Some(bytes) = payload.as_ref() {
+        torrent_info_hash(bytes)?
     } else {
         state
             .db
@@ -3267,6 +3421,7 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
                 existing.live.eta,
             )
             .await?;
+        cleanup_download_stage(&state, job.id).await;
         return Ok(());
     }
 
@@ -3283,16 +3438,16 @@ async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> 
             .download_torrent(job.torrent_id, job.use_token)
             .await?
     };
-    let mut temporary = tempfile::NamedTempFile::new()?;
-    temporary.write_all(&bytes)?;
-    temporary.flush()?;
-    let payload = tokio::fs::read(temporary.path()).await?;
+    if !stage_path.exists() {
+        write_staged_download(&stage_path, &bytes)?;
+    }
     let file_name = format!("{}-{}.torrent", job.tracker, job.torrent_id);
-    client.add_torrent(payload, &file_name, profile).await?;
+    client.add_torrent(bytes, &file_name, profile).await?;
     state
         .db
         .set_job_state(job.id, DownloadState::Active, None)
         .await?;
+    cleanup_download_stage(&state, job.id).await;
     Ok(())
 }
 
@@ -3790,7 +3945,18 @@ async fn enrich_release_coverages(
     releases: &mut [LibraryRelease],
 ) -> Result<(), AppError> {
     let preferences = state.db.get_runtime_preferences().await?;
-    let mut ignored = DeduplicationIndexStatus::default();
+    let single_keys = releases
+        .iter()
+        .filter(|release| {
+            release
+                .release
+                .release_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
+        })
+        .map(|release| (release.release.tracker.clone(), release.release.group_id))
+        .collect::<Vec<_>>();
+    let coverages = state.db.get_single_coverages(&single_keys).await?;
     for release in releases {
         if release
             .release
@@ -3798,16 +3964,14 @@ async fn enrich_release_coverages(
             .as_deref()
             .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
         {
-            let tracker = release.release.tracker.clone();
-            annotate_single_coverage(
-                state,
-                &tracker,
-                release.release.group_id,
-                &preferences.release,
-                &mut release.release.album_coverage,
-                &mut ignored,
-            )
-            .await?;
+            release.release.album_coverage = coverages
+                .get(&(release.release.tracker.clone(), release.release.group_id))
+                .and_then(|stored| {
+                    (stored.state == "ready")
+                        .then(|| stored.coverage.clone())
+                        .flatten()
+                })
+                .and_then(|coverage| coverage.resolve(&preferences.release));
         }
     }
     Ok(())
@@ -4986,6 +5150,29 @@ struct ApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_torrents_are_persisted_privately() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("job.torrent");
+        write_staged_download(&path, b"torrent payload").expect("stage torrent");
+        assert_eq!(
+            std::fs::read(&path).expect("read stage"),
+            b"torrent payload"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("stage metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 
     fn credit(id: i64, name: &str, role: ArtistRole) -> ArtistCredit {
         ArtistCredit {

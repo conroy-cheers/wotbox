@@ -1010,6 +1010,9 @@ pub struct CanonicalDownload {
     pub variant: TorrentVariant,
     pub download: LiveDownloadStatus,
     pub provenance: Provenance,
+    pub live_observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub live_stale: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -1026,6 +1029,7 @@ pub struct DownloadIndexCounts {
 #[serde(rename_all = "camelCase")]
 pub struct DownloadsPage {
     pub items: Vec<CanonicalDownload>,
+    pub total: i64,
     pub index: DownloadIndexCounts,
 }
 

@@ -66,6 +66,21 @@ pub struct LibraryRecord {
     pub missing_since: Option<DateTime<Utc>>,
 }
 
+pub struct IndexedDownload {
+    pub canonical: Cached<CanonicalTorrent>,
+    pub client: String,
+    pub info_hash: String,
+    pub live: Option<LiveDownloadStatus>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+pub struct DownloadObservation {
+    pub live: LiveDownloadStatus,
+    pub announce_host: Option<String>,
+    pub tracker: Option<String>,
+    pub plex_target: Option<PlexScanTarget>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrackIndexJob {
     pub tracker: String,
@@ -119,6 +134,7 @@ pub struct StoredBackgroundJob {
     pub provider_id: Option<String>,
     pub lane: String,
     pub attempts: u32,
+    pub max_attempts: u32,
 }
 
 pub struct EnqueueBackgroundJob<'a> {
@@ -167,6 +183,11 @@ impl Database {
             .await
             .context("run database migrations")?;
         Ok(Self { connection })
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        self.connection.ping().await?;
+        Ok(())
     }
 
     async fn begin_write(&self) -> Result<DatabaseTransaction> {
@@ -573,6 +594,23 @@ impl Database {
         active.updated_at = Set(now.to_rfc3339());
         active.update(&self.connection).await?;
         Ok(true)
+    }
+
+    pub async fn set_background_job_provider(&self, id: Uuid, provider_id: &str) -> Result<()> {
+        background_job::Entity::update_many()
+            .col_expr(
+                background_job::Column::ProviderId,
+                Expr::value(Some(provider_id.to_owned())),
+            )
+            .col_expr(
+                background_job::Column::UpdatedAt,
+                Expr::value(Utc::now().to_rfc3339()),
+            )
+            .filter(background_job::Column::Id.eq(id.to_string()))
+            .filter(background_job::Column::State.eq("running"))
+            .exec(&self.connection)
+            .await?;
+        Ok(())
     }
 
     pub async fn complete_background_job(&self, id: Uuid, owner: &str) -> Result<()> {
@@ -2099,18 +2137,34 @@ impl Database {
         use_token: bool,
         idempotency_key: Option<&str>,
     ) -> Result<(DownloadJob, bool)> {
+        let transaction = self.begin_write().await?;
         if let Some(idempotency_key) = idempotency_key
-            && let Some(existing) = self.find_job_by_idempotency_key(idempotency_key).await?
+            && let Some(model) = download_job::Entity::find()
+                .filter(download_job::Column::IdempotencyKey.eq(idempotency_key))
+                .one(&transaction)
+                .await?
         {
+            let existing = job_from_model(model)?;
+            if matches!(
+                existing.state,
+                DownloadState::Queued | DownloadState::FetchingMetadata | DownloadState::Submitting
+            ) {
+                self.ensure_download_submission_on(&transaction, &existing, false)
+                    .await?;
+            }
+            transaction.commit().await?;
             return Ok((existing, false));
         }
-        if let Some(existing) = self.find_job(tracker, torrent_id, profile).await? {
+        if let Some(model) = download_job::Entity::find()
+            .filter(download_job::Column::Tracker.eq(tracker))
+            .filter(download_job::Column::TorrentId.eq(torrent_id))
+            .filter(download_job::Column::Profile.eq(profile))
+            .one(&transaction)
+            .await?
+        {
+            let existing = job_from_model(model.clone())?;
             if existing.state == DownloadState::Failed {
                 let now = Utc::now();
-                let model = download_job::Entity::find_by_id(existing.id.to_string())
-                    .one(&self.connection)
-                    .await?
-                    .context("download job disappeared while retrying")?;
                 let mut active = model.into_active_model();
                 active.idempotency_key = Set(idempotency_key.map(str::to_owned));
                 active.use_token = Set(use_token);
@@ -2125,28 +2179,37 @@ impl Database {
                 active.error_code = Set(None);
                 active.error_message = Set(None);
                 active.updated_at = Set(now.to_rfc3339());
-                active.update(&self.connection).await?;
-                self.add_event(existing.id, &DownloadState::Queued, None)
+                active.update(&transaction).await?;
+                self.add_event_on(&transaction, existing.id, &DownloadState::Queued, None)
                     .await?;
-                return Ok((
-                    DownloadJob {
-                        use_token,
-                        group_id: None,
-                        info_hash: None,
-                        name: None,
-                        state: DownloadState::Queued,
-                        progress: 0.0,
-                        download_speed: 0,
-                        upload_speed: 0,
-                        eta: None,
-                        error_code: None,
-                        error_message: None,
-                        updated_at: now,
-                        ..existing
-                    },
-                    true,
-                ));
+                let job = DownloadJob {
+                    use_token,
+                    group_id: None,
+                    info_hash: None,
+                    name: None,
+                    state: DownloadState::Queued,
+                    progress: 0.0,
+                    download_speed: 0,
+                    upload_speed: 0,
+                    eta: None,
+                    error_code: None,
+                    error_message: None,
+                    updated_at: now,
+                    ..existing
+                };
+                self.ensure_download_submission_on(&transaction, &job, true)
+                    .await?;
+                transaction.commit().await?;
+                return Ok((job, true));
             }
+            if matches!(
+                existing.state,
+                DownloadState::Queued | DownloadState::FetchingMetadata | DownloadState::Submitting
+            ) {
+                self.ensure_download_submission_on(&transaction, &existing, false)
+                    .await?;
+            }
+            transaction.commit().await?;
             return Ok((existing, false));
         }
         let now = Utc::now();
@@ -2189,10 +2252,88 @@ impl Database {
             created_at: Set(now.to_rfc3339()),
             updated_at: Set(now.to_rfc3339()),
         }
-        .insert(&self.connection)
+        .insert(&transaction)
         .await?;
-        self.add_event(job.id, &job.state, None).await?;
+        self.add_event_on(&transaction, job.id, &job.state, None)
+            .await?;
+        self.ensure_download_submission_on(&transaction, &job, true)
+            .await?;
+        transaction.commit().await?;
         Ok((job, true))
+    }
+
+    async fn ensure_download_submission_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        job: &DownloadJob,
+        rearm: bool,
+    ) -> Result<Uuid> {
+        let key = format!("submit-download:{}:v1", job.id);
+        if let Some(model) = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(&key))
+            .one(connection)
+            .await?
+        {
+            let id = Uuid::parse_str(&model.id)?;
+            let should_rearm =
+                rearm || matches!(model.state.as_str(), "completed" | "failed" | "cancelled");
+            let mut active = model.into_active_model();
+            active.provider_id = Set(Some(format!("tracker:{}", job.tracker)));
+            active.lane = Set("download".into());
+            active.priority = Set(100);
+            active.max_attempts = Set(20);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            if should_rearm {
+                active.state = Set("pending".into());
+                active.attempts = Set(0);
+                active.deferrals = Set(0);
+                active.next_run_at = Set(None);
+                active.lease_owner = Set(None);
+                active.lease_until = Set(None);
+                active.last_error_code = Set(None);
+                active.last_error_message = Set(None);
+                active.finished_at = Set(None);
+                active.cancelled_at = Set(None);
+            }
+            active.update(connection).await?;
+            return Ok(id);
+        }
+        self.enqueue_background_job_on(
+            connection,
+            EnqueueBackgroundJob {
+                deduplication_key: &key,
+                kind: "submit_download",
+                payload: serde_json::json!({ "jobId": job.id }),
+                provider_id: Some(format!("tracker:{}", job.tracker)),
+                lane: "download",
+                priority: 100,
+                max_attempts: 20,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn ensure_incomplete_download_submissions(&self) -> Result<u64> {
+        let transaction = self.begin_write().await?;
+        let models = download_job::Entity::find()
+            .filter(download_job::Column::State.is_in([
+                "queued",
+                "fetching_metadata",
+                "submitting",
+            ]))
+            .all(&transaction)
+            .await?;
+        let count = models.len() as u64;
+        for model in models {
+            let job = job_from_model(model)?;
+            self.ensure_download_submission_on(&transaction, &job, false)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(count)
     }
 
     pub async fn update_job_metadata(
@@ -3625,7 +3766,33 @@ impl Database {
         tracker: Option<&str>,
         plex_target: Option<&PlexScanTarget>,
     ) -> Result<()> {
+        self.observe_downloads(&[DownloadObservation {
+            live: live.clone(),
+            announce_host: announce_host.map(str::to_owned),
+            tracker: tracker.map(str::to_owned),
+            plex_target: plex_target.cloned(),
+        }])
+        .await
+    }
+
+    pub async fn observe_downloads(&self, observations: &[DownloadObservation]) -> Result<()> {
         let transaction = self.begin_write().await?;
+        for observation in observations {
+            self.observe_download_on(&transaction, observation).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn observe_download_on<C: ConnectionTrait>(
+        &self,
+        transaction: &C,
+        observation: &DownloadObservation,
+    ) -> Result<()> {
+        let live = &observation.live;
+        let announce_host = observation.announce_host.as_deref();
+        let tracker = observation.tracker.as_deref();
+        let plex_target = observation.plex_target.as_ref();
         let now_value = Utc::now();
         let now = now_value.to_rfc3339();
         let completed_at =
@@ -3640,7 +3807,7 @@ impl Database {
         let newly_completed;
         if let Some(model) =
             download_release_link::Entity::find_by_id((live.client.clone(), hash.clone()))
-                .one(&transaction)
+                .one(transaction)
                 .await?
         {
             let linked = model.resolution_state == "linked";
@@ -3654,6 +3821,10 @@ impl Database {
             let has_library_added_at = model.library_added_at.is_some();
             let has_completed_at = model.completed_at.is_some();
             newly_completed = !has_completed_at && completed_at.is_some();
+            let client_added_at = live
+                .added_at
+                .map(|value| value.to_rfc3339())
+                .or_else(|| model.client_added_at.clone());
             let mut active = model.into_active_model();
             active.announce_host = Set(announce_host.map(str::to_owned));
             if !linked {
@@ -3664,6 +3835,9 @@ impl Database {
                 active.updated_at = Set(now.clone());
             }
             active.last_seen_at = Set(now);
+            active.observed_json = Set(Some(serde_json::to_value(live)?));
+            active.observed_at = Set(Some(now_value.to_rfc3339()));
+            active.client_added_at = Set(client_added_at);
             active.present = Set(true);
             active.missing_since = Set(None);
             if !has_library_added_at && completed_at.is_some() {
@@ -3672,7 +3846,7 @@ impl Database {
             if !has_completed_at && completed_at.is_some() {
                 active.completed_at = Set(completed_at);
             }
-            active.update(&transaction).await?;
+            active.update(transaction).await?;
         } else {
             newly_completed = completed_at.is_some();
             should_resolve = tracker.is_some();
@@ -3696,13 +3870,16 @@ impl Database {
                 missing_since: Set(None),
                 library_added_at: Set(completed_at.clone()),
                 completed_at: Set(completed_at),
+                observed_json: Set(Some(serde_json::to_value(live)?)),
+                observed_at: Set(Some(now_value.to_rfc3339())),
+                client_added_at: Set(live.added_at.map(|value| value.to_rfc3339())),
             }
-            .insert(&transaction)
+            .insert(transaction)
             .await?;
         }
         if should_resolve && let Some(tracker) = tracker {
             self.enqueue_background_job_on(
-                &transaction,
+                transaction,
                 EnqueueBackgroundJob {
                     deduplication_key: &format!(
                         "resolve-hash:{}:{hash}:v2",
@@ -3722,10 +3899,9 @@ impl Database {
             .await?;
         }
         if newly_completed && let Some(target) = plex_target {
-            self.enqueue_plex_scan_on(&transaction, target, now_value)
+            self.enqueue_plex_scan_on(transaction, target, now_value)
                 .await?;
         }
-        transaction.commit().await?;
         Ok(())
     }
 
@@ -3785,6 +3961,9 @@ impl Database {
                 missing_since: Set(None),
                 library_added_at: Set(None),
                 completed_at: Set(None),
+                observed_json: Set(None),
+                observed_at: Set(None),
+                client_added_at: Set(None),
             }
             .insert(&self.connection)
             .await?;
@@ -4050,22 +4229,89 @@ impl Database {
     }
 
     pub async fn index_counts(&self) -> Result<DownloadIndexCounts> {
-        let mut counts = DownloadIndexCounts::default();
-        for model in download_release_link::Entity::find()
+        let count = |states: Vec<&'static str>| {
+            download_release_link::Entity::find()
+                .filter(download_release_link::Column::Present.eq(true))
+                .filter(download_release_link::Column::ResolutionState.is_in(states))
+                .count(&self.connection)
+        };
+        Ok(DownloadIndexCounts {
+            linked: i64::try_from(count(vec!["linked"]).await?).unwrap_or(i64::MAX),
+            pending: i64::try_from(count(vec!["pending"]).await?).unwrap_or(i64::MAX),
+            resolving: i64::try_from(count(vec!["resolving"]).await?).unwrap_or(i64::MAX),
+            failed: i64::try_from(count(vec!["failed", "not_found"]).await?).unwrap_or(i64::MAX),
+            unconfigured: i64::try_from(count(vec!["unconfigured"]).await?).unwrap_or(i64::MAX),
+        })
+    }
+
+    pub async fn list_indexed_downloads(
+        &self,
+        client: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<IndexedDownload>, i64)> {
+        let mut query = download_release_link::Entity::find()
             .filter(download_release_link::Column::Present.eq(true))
+            .filter(download_release_link::Column::ResolutionState.eq("linked"))
+            .filter(download_release_link::Column::Tracker.is_not_null())
+            .filter(download_release_link::Column::TorrentId.is_not_null());
+        if let Some(client) = client {
+            query = query.filter(download_release_link::Column::Client.eq(client));
+        }
+        let total = i64::try_from(query.clone().count(&self.connection).await?).unwrap_or(i64::MAX);
+        let links = query
+            .order_by_desc(download_release_link::Column::ClientAddedAt)
+            .order_by_asc(download_release_link::Column::Client)
+            .order_by_asc(download_release_link::Column::InfoHash)
+            .offset(offset)
+            .limit(limit)
             .all(&self.connection)
-            .await?
-        {
-            match model.resolution_state.as_str() {
-                "linked" => counts.linked += 1,
-                "pending" => counts.pending += 1,
-                "resolving" => counts.resolving += 1,
-                "unconfigured" => counts.unconfigured += 1,
-                "failed" | "not_found" => counts.failed += 1,
-                _ => {}
+            .await?;
+        let identities = links
+            .iter()
+            .filter_map(|link| Some((link.tracker.clone()?, link.torrent_id?)))
+            .collect::<Vec<_>>();
+        let mut canonical_by_identity = HashMap::new();
+        for chunk in identities.chunks(300) {
+            let condition =
+                chunk
+                    .iter()
+                    .fold(Condition::any(), |condition, (tracker, torrent_id)| {
+                        condition.add(
+                            Condition::all()
+                                .add(canonical_torrent::Column::Tracker.eq(tracker.clone()))
+                                .add(canonical_torrent::Column::TorrentId.eq(*torrent_id)),
+                        )
+                    });
+            for model in canonical_torrent::Entity::find()
+                .filter(condition)
+                .all(&self.connection)
+                .await?
+            {
+                canonical_by_identity.insert((model.tracker.clone(), model.torrent_id), model);
             }
         }
-        Ok(counts)
+        let mut indexed = Vec::with_capacity(links.len());
+        for link in links {
+            let (Some(tracker), Some(torrent_id)) = (link.tracker.clone(), link.torrent_id) else {
+                continue;
+            };
+            let Some(canonical) = canonical_by_identity.remove(&(tracker, torrent_id)) else {
+                continue;
+            };
+            indexed.push(IndexedDownload {
+                canonical: canonical_from_model(canonical)?,
+                client: link.client,
+                info_hash: link.info_hash,
+                live: link.observed_json.map(serde_json::from_value).transpose()?,
+                observed_at: link
+                    .observed_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?,
+            });
+        }
+        Ok((indexed, total))
     }
 
     pub async fn list_library_records(&self) -> Result<Vec<LibraryRecord>> {
@@ -4174,32 +4420,17 @@ impl Database {
             .transpose()
     }
 
-    async fn find_job(
-        &self,
-        tracker: &str,
-        torrent_id: i64,
-        profile: &str,
-    ) -> Result<Option<DownloadJob>> {
-        download_job::Entity::find()
-            .filter(download_job::Column::Tracker.eq(tracker))
-            .filter(download_job::Column::TorrentId.eq(torrent_id))
-            .filter(download_job::Column::Profile.eq(profile))
-            .one(&self.connection)
-            .await?
-            .map(job_from_model)
-            .transpose()
-    }
-
-    async fn find_job_by_idempotency_key(&self, key: &str) -> Result<Option<DownloadJob>> {
-        download_job::Entity::find()
-            .filter(download_job::Column::IdempotencyKey.eq(key))
-            .one(&self.connection)
-            .await?
-            .map(job_from_model)
-            .transpose()
-    }
-
     async fn add_event(&self, id: Uuid, state: &DownloadState, detail: Option<&str>) -> Result<()> {
+        self.add_event_on(&self.connection, id, state, detail).await
+    }
+
+    async fn add_event_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        id: Uuid,
+        state: &DownloadState,
+        detail: Option<&str>,
+    ) -> Result<()> {
         download_event::ActiveModel {
             id: Default::default(),
             job_id: Set(id.to_string()),
@@ -4207,7 +4438,7 @@ impl Database {
             detail: Set(detail.map(str::to_owned)),
             created_at: Set(Utc::now().to_rfc3339()),
         }
-        .insert(&self.connection)
+        .insert(connection)
         .await?;
         Ok(())
     }
@@ -4266,6 +4497,7 @@ fn stored_background_job(model: &background_job::Model) -> Result<StoredBackgrou
         provider_id: model.provider_id.clone(),
         lane: model.lane.clone(),
         attempts: u32::try_from(model.attempts).unwrap_or(u32::MAX),
+        max_attempts: u32::try_from(model.max_attempts).unwrap_or(u32::MAX),
     })
 }
 
@@ -5160,6 +5392,15 @@ mod tests {
             .await
             .expect("create job");
         assert!(created);
+        let submission_key = format!("submit-download:{}:v1", job.id);
+        let submission = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(&submission_key))
+            .one(&db.connection)
+            .await
+            .expect("submission lookup")
+            .expect("durable submission");
+        assert_eq!(submission.state, "pending");
+        assert_eq!(submission.lane, "download");
         db.set_job_state(
             job.id,
             crate::model::DownloadState::Failed,
@@ -5184,6 +5425,13 @@ mod tests {
         assert_eq!(retried.state, crate::model::DownloadState::Queued);
         assert!(retried.use_token);
         assert!(retried.error_message.is_none());
+        let submission = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(&submission_key))
+            .one(&db.connection)
+            .await
+            .expect("submission lookup")
+            .expect("durable submission");
+        assert_eq!(submission.state, "pending");
         assert_eq!(
             db.get_job(job.id)
                 .await
@@ -5192,6 +5440,125 @@ mod tests {
                 .state,
             crate::model::DownloadState::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn pages_only_linked_downloads_in_client_added_order() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        let canonical = CanonicalTorrent {
+            release: ReleaseSummary {
+                id: None,
+                tracker: "ops".into(),
+                group_id: 10,
+                title: "Indexed release".into(),
+                artist: Some("Artist".into()),
+                artists: vec![fallback_artist_credit("ops", "Artist")],
+                year: Some(2026),
+                artwork: None,
+                release_type: Some("Album".into()),
+                sources: vec![crate::model::ReleaseSource {
+                    tracker: "ops".into(),
+                    group_id: 10,
+                    match_score: 1.0,
+                }],
+                album_coverage: None,
+            },
+            variant: TorrentVariant {
+                tracker: "ops".into(),
+                torrent_id: 20,
+                group_id: 10,
+                info_hash: None,
+                format: Some("FLAC".into()),
+                encoding: Some("Lossless".into()),
+                media: Some("WEB".into()),
+                size: Some(100),
+                seeders: None,
+                leechers: None,
+                snatched: None,
+                freeleech: false,
+                leech_status: crate::model::LeechStatus::Regular,
+                can_use_token: false,
+                token_eligibility_known: false,
+                eligibility: None,
+                remaster_title: None,
+                downloads: Vec::new(),
+                library: None,
+            },
+            tags: Vec::new(),
+            description: None,
+            record_label: None,
+        };
+        db.put_canonical(&canonical, Utc::now(), Utc::now() + Duration::hours(1))
+            .await
+            .expect("canonical");
+        let base = Utc::now() - Duration::minutes(10);
+        for (index, hash) in ["aaa", "bbb", "ccc"].into_iter().enumerate() {
+            db.seed_download_link("music", hash, "ops", Some(10), 20, true)
+                .await
+                .expect("seed link");
+            db.observe_download(
+                &LiveDownloadStatus {
+                    client: "music".into(),
+                    info_hash: hash.into(),
+                    state: ClientDownloadState::Downloading,
+                    client_state: "downloading".into(),
+                    diagnostic: None,
+                    progress: 0.5,
+                    size: 100,
+                    downloaded: 50,
+                    uploaded: 0,
+                    download_speed: 1,
+                    upload_speed: 0,
+                    eta: Some(50),
+                    ratio: 0.0,
+                    save_path: "/downloads/ops".into(),
+                    added_at: Some(base + Duration::minutes(index as i64)),
+                    completed_at: None,
+                },
+                Some("home.opsfet.ch"),
+                Some("ops"),
+                None,
+            )
+            .await
+            .expect("observe link");
+        }
+        db.observe_download(
+            &LiveDownloadStatus {
+                client: "music".into(),
+                info_hash: "unconfigured".into(),
+                state: ClientDownloadState::Downloading,
+                client_state: "downloading".into(),
+                diagnostic: None,
+                progress: 0.1,
+                size: 100,
+                downloaded: 10,
+                uploaded: 0,
+                download_speed: 1,
+                upload_speed: 0,
+                eta: Some(90),
+                ratio: 0.0,
+                save_path: "/downloads/other".into(),
+                added_at: Some(Utc::now()),
+                completed_at: None,
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("observe unconfigured");
+
+        let (page, total) = db
+            .list_indexed_downloads(Some("music"), 1, 1)
+            .await
+            .expect("page");
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].info_hash, "bbb");
+        assert!(page[0].live.is_some());
     }
 
     #[tokio::test]
