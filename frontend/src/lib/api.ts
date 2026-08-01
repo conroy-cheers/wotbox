@@ -281,10 +281,13 @@ export type CanonicalDownload = {
   variant: TorrentVariant;
   download: LiveDownloadStatus;
   provenance: Provenance;
+  liveObservedAt?: string;
+  liveStale: boolean;
 };
 
 export type DownloadsPage = {
   items: CanonicalDownload[];
+  total: number;
   index: {
     linked: number;
     pending: number;

@@ -103,7 +103,7 @@
         {/if}
         <footer>
           <div class="download-card-meta">
-            <span>{item.provenance.stale ? "Tracker metadata stale · refreshing" : download.addedAt ? `Added ${relativeTime(download.addedAt)}` : download.clientState}</span>
+            <span>{item.liveStale ? `Live status cached${item.liveObservedAt ? ` · ${relativeTime(item.liveObservedAt)}` : ""}` : item.provenance.stale ? "Tracker metadata stale · refreshing" : download.addedAt ? `Added ${relativeTime(download.addedAt)}` : download.clientState}</span>
             <span>Ratio {download.ratio.toFixed(2)} · ↑ {formatSpeed(download.uploadSpeed)}</span>
           </div>
           <a class="download-release-link" href={releasePath(item)}>
@@ -113,12 +113,12 @@
       </article>
     {/each}
   </div>
-  {#if $downloads.data.items.length >= $limit && $limit < 500}
+  {#if $downloads.data.items.length < $downloads.data.total && $limit < 500}
     <div class="load-more">
       <button class="secondary-button" onclick={() => $limit = Math.min($limit + 100, 500)}>
         Load 100 more
       </button>
-      <span>Showing the {$limit} most recently added torrents</span>
+      <span>Showing {$downloads.data.items.length} of {$downloads.data.total} linked torrents</span>
     </div>
   {/if}
 {:else}

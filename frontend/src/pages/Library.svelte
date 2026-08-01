@@ -46,7 +46,7 @@
         queryKey: ["library", $search, $tracker, $format, $availability, $limit] as const,
         queryFn: () => api<LibraryArtistsPage>(`/api/v1/library/artists?${params}`),
         staleTime: 30_000,
-        refetchInterval: 5_000
+        refetchInterval: 30_000
       };
     }
   );

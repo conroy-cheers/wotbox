@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createQuery } from "@tanstack/svelte-query";
   import { ArrowDownToLine, Database, Gauge, HardDrive, RefreshCw } from "@lucide/svelte";
-  import { api, appPath, formatBytes, relativeTime, type DownloadsPage, type TrackerAccount } from "../lib/api";
+  import { api, appPath, formatBytes, relativeTime, type DownloadsPage, type ProviderStatus, type TrackerAccount } from "../lib/api";
   import StatusPill from "../lib/StatusPill.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
@@ -16,11 +16,12 @@
     queryFn: () => api<DownloadsPage>("/api/v1/downloads?limit=6"),
     refetchInterval: 15_000
   });
-  const health = createQuery({
-    queryKey: ["health"],
-    queryFn: () => api<{ status: string; qbittorrent?: string }>("/health/ready"),
-    retry: 1
+  const providers = createQuery({
+    queryKey: ["providers"],
+    queryFn: () => api<ProviderStatus[]>("/api/v1/providers"),
+    refetchInterval: 10_000
   });
+  const qbit = $derived(($providers.data ?? []).find((provider) => provider.kind === "download_client"));
 </script>
 
 <svelte:head><title>Dashboard · Wotbox</title></svelte:head>
@@ -34,7 +35,7 @@
   <button class="icon-button" aria-label="Refresh dashboard" onclick={() => {
     $accounts.refetch();
     $downloads.refetch();
-    $health.refetch();
+    $providers.refetch();
   }}><RefreshCw size={18} /></button>
 </header>
 
@@ -68,10 +69,10 @@
     <article class="metric-card">
       <span class="metric-icon"><HardDrive size={19} /></span>
       <p>qBittorrent</p>
-      <strong class:healthy={$health.data?.status === "ok"}>
-        {$health.isPending ? "Checking" : $health.isError ? "Offline" : "Connected"}
+      <strong class:healthy={qbit?.state === "available"}>
+        {$providers.isPending ? "Checking" : $providers.isError ? "Unknown" : qbit?.state === "available" ? "Connected" : qbit?.state ?? "Unconfigured"}
       </strong>
-      <small>{$health.data?.qbittorrent ?? "Music client"}</small>
+      <small>{qbit?.message ?? qbit?.displayName ?? "Music client"}</small>
     </article>
   </section>
 {/if}
