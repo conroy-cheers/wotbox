@@ -113,6 +113,9 @@
           packageTests = cargoNix.rootCrate.build.override {
             crateOverrides = crateOverridesFor rustTestSource;
             runTests = true;
+            testPreRun = ''
+              export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            '';
           };
           updateCargoNix = pkgs.writeShellApplication {
             name = "wotbox-update-cargo-nix";
@@ -204,6 +207,7 @@
                 };
               testScript = ''
                 machine.wait_for_unit("wotbox.service")
+                machine.succeed("systemctl show wotbox.service -p Environment | grep -F TOKIO_WORKER_THREADS=4")
               '';
             };
           };

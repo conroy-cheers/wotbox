@@ -129,6 +129,11 @@ in
       default = "/var/lib/wotbox";
       readOnly = true;
     };
+    workerThreads = mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = "Number of Tokio runtime worker threads used by Wotbox";
+    };
     trackers = mkOption {
       type = lib.types.attrsOf trackerType;
       default = { };
@@ -179,6 +184,7 @@ in
       restartTriggers = [ configFile ];
       environment = {
         RUST_LOG = "wotbox=info,tower_http=info";
+        TOKIO_WORKER_THREADS = toString cfg.workerThreads;
       };
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
