@@ -618,10 +618,13 @@ pub mod provider_state {
         pub last_success_at: Option<String>,
         pub last_failure_at: Option<String>,
         pub retry_at: Option<String>,
+        pub last_background_request_at: Option<String>,
         #[sea_orm(default_value = 0)]
         pub consecutive_failures: i64,
         #[sea_orm(default_value = 0)]
         pub minimum_interval_ms: i64,
+        #[sea_orm(default_value = 0)]
+        pub background_minimum_interval_ms: i64,
         #[sea_orm(default_value = 1)]
         pub max_concurrency: i64,
         pub updated_at: String,
@@ -647,10 +650,15 @@ pub mod background_job {
         #[sea_orm(column_type = "Json")]
         pub payload_json: Json,
         pub state: String,
+        pub provider_id: Option<String>,
+        #[sea_orm(default_value = "sync")]
+        pub lane: String,
         #[sea_orm(default_value = 0)]
         pub priority: i64,
         #[sea_orm(default_value = 0)]
         pub attempts: i64,
+        #[sea_orm(default_value = 0)]
+        pub deferrals: i64,
         #[sea_orm(default_value = 8)]
         pub max_attempts: i64,
         pub next_run_at: Option<String>,

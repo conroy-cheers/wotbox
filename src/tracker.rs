@@ -147,11 +147,21 @@ impl GazelleTrackerClient {
                 .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
             let status = response.status();
             let retry = retry_after(&response);
-            let body: Value = response
-                .json()
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown")
+                .to_owned();
+            let bytes = response
+                .bytes()
                 .await
                 .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
-            let message = tracker_error(&body);
+            let parsed = serde_json::from_slice::<Value>(&bytes);
+            let message = parsed
+                .as_ref()
+                .map(tracker_error)
+                .unwrap_or_else(|_| tracker_response_summary(status, &bytes));
             if status == StatusCode::TOO_MANY_REQUESTS {
                 return Err(
                     ProviderFailure::new(ProviderFailureKind::RateLimited, message)
@@ -166,7 +176,7 @@ impl GazelleTrackerClient {
                     failure.kind =
                         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
                             ProviderFailureKind::Authentication
-                        } else if status.is_server_error() {
+                        } else if status.is_server_error() && !tracker_semantic_failure(&message) {
                             ProviderFailureKind::Transient
                         } else {
                             ProviderFailureKind::Permanent
@@ -174,6 +184,14 @@ impl GazelleTrackerClient {
                 }
                 return Err(failure);
             }
+            let body = parsed.map_err(|error| {
+                ProviderFailure::new(
+                    ProviderFailureKind::Transient,
+                    format!(
+                        "tracker returned HTTP {status} with invalid JSON ({content_type}): {message}: {error}"
+                    ),
+                )
+            })?;
             if body.get("status").and_then(Value::as_str) != Some("success") {
                 return Err(ProviderFailure::from_message(format!(
                     "tracker rejected request: {message}"
@@ -406,7 +424,7 @@ impl TrackerClient for GazelleTrackerClient {
                 let message = serde_json::from_slice::<Value>(&bytes)
                     .ok()
                     .map(|body| tracker_error(&body))
-                    .unwrap_or_else(|| format!("tracker torrent download returned HTTP {status}"));
+                    .unwrap_or_else(|| tracker_response_summary(status, &bytes));
                 let kind = if status == StatusCode::TOO_MANY_REQUESTS {
                     ProviderFailureKind::RateLimited
                 } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -425,7 +443,10 @@ impl TrackerClient for GazelleTrackerClient {
                         tracker_error(&body)
                     )
                 } else {
-                    "tracker returned an invalid torrent payload".into()
+                    format!(
+                        "tracker returned an invalid torrent payload: {}",
+                        tracker_response_summary(status, &bytes)
+                    )
                 };
                 return Err(ProviderFailure::from_message(message));
             }
@@ -1045,6 +1066,46 @@ fn tracker_error(body: &Value) -> String {
         .unwrap_or_else(|| "unknown tracker error".into())
 }
 
+fn tracker_response_summary(status: StatusCode, bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut plain = String::with_capacity(text.len().min(512));
+    let mut in_tag = false;
+    let mut last_space = false;
+    for character in text.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if in_tag => {}
+            value if value.is_whitespace() => {
+                if !last_space && !plain.is_empty() {
+                    plain.push(' ');
+                    last_space = true;
+                }
+            }
+            value => {
+                plain.push(value);
+                last_space = false;
+            }
+        }
+        if plain.chars().count() >= 240 {
+            break;
+        }
+    }
+    let plain = plain.trim();
+    if plain.is_empty() {
+        format!("tracker returned HTTP {status} with an empty non-JSON response")
+    } else {
+        format!("tracker returned HTTP {status}: {plain}")
+    }
+}
+
+fn tracker_semantic_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["bad parameters", "not found", "does not exist", "bad hash"]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
 pub fn search_cache_key(request: &SearchRequest) -> String {
     let mut values = BTreeMap::new();
     values.insert("query", request.query.clone().unwrap_or_default());
@@ -1436,6 +1497,31 @@ mod tests {
             error.to_string(),
             "tracker rejected torrent download: already freeleech"
         );
+    }
+
+    #[tokio::test]
+    async fn surfaces_bounded_html_errors_before_attempting_json_decode() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ajax.php"))
+            .and(query_param("action", "torrent"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(
+                        "<html><head><title>Orpheus error</title></head><body>Bad parameters</body></html>",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = test_tracker_client(&server);
+
+        let error = client
+            .torrent_by_hash("abcdef0123456789abcdef0123456789abcdef01")
+            .await
+            .expect_err("tracker failure");
+        assert!(error.to_string().contains("Orpheus errorBad parameters"));
+        assert!(!error.to_string().contains("expected value"));
     }
 
     fn test_tracker_client(server: &MockServer) -> GazelleTrackerClient {

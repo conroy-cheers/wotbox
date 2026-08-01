@@ -104,8 +104,10 @@ pub struct StoredProviderState {
     pub last_success_at: Option<DateTime<Utc>>,
     pub last_failure_at: Option<DateTime<Utc>>,
     pub retry_at: Option<DateTime<Utc>>,
+    pub last_background_request_at: Option<DateTime<Utc>>,
     pub consecutive_failures: u32,
     pub minimum_interval_ms: u64,
+    pub background_minimum_interval_ms: u64,
     pub max_concurrency: u32,
 }
 
@@ -114,6 +116,8 @@ pub struct StoredBackgroundJob {
     pub id: Uuid,
     pub kind: String,
     pub payload: Value,
+    pub provider_id: Option<String>,
+    pub lane: String,
     pub attempts: u32,
 }
 
@@ -121,6 +125,8 @@ pub struct EnqueueBackgroundJob<'a> {
     pub deduplication_key: &'a str,
     pub kind: &'a str,
     pub payload: Value,
+    pub provider_id: Option<String>,
+    pub lane: &'a str,
     pub priority: i64,
     pub max_attempts: u32,
     pub next_run_at: Option<DateTime<Utc>>,
@@ -264,6 +270,8 @@ impl Database {
                     "sectionId": target.section_id,
                     "root": target.root,
                 }),
+                provider_id: Some("plex".into()),
+                lane: "event",
                 priority: 30,
                 max_attempts: 10,
                 next_run_at: Some(run_at),
@@ -293,23 +301,8 @@ impl Database {
             active.recurring_interval_seconds = Set(request
                 .recurring_interval_seconds
                 .map(|value| i64::try_from(value).unwrap_or(i64::MAX)));
-            if matches!(model.state.as_str(), "completed" | "failed" | "cancelled") {
-                active.kind = Set(request.kind.into());
-                active.payload_json = Set(request.payload);
-                active.state = Set("pending".into());
-                active.attempts = Set(0);
-                active.next_run_at = Set(request.next_run_at.map(|value| value.to_rfc3339()));
-                active.lease_owner = Set(None);
-                active.lease_until = Set(None);
-                active.progress_completed = Set(0);
-                active.progress_total = Set(None);
-                active.progress_message = Set(None);
-                active.last_error_code = Set(None);
-                active.last_error_message = Set(None);
-                active.started_at = Set(None);
-                active.finished_at = Set(None);
-                active.cancelled_at = Set(None);
-            }
+            active.provider_id = Set(request.provider_id);
+            active.lane = Set(request.lane.into());
             active.updated_at = Set(now.to_rfc3339());
             active.update(connection).await?;
             return Ok(id);
@@ -321,8 +314,11 @@ impl Database {
             kind: Set(request.kind.into()),
             payload_json: Set(request.payload),
             state: Set("pending".into()),
+            provider_id: Set(request.provider_id),
+            lane: Set(request.lane.into()),
             priority: Set(request.priority),
             attempts: Set(0),
+            deferrals: Set(0),
             max_attempts: Set(i64::from(request.max_attempts.max(1))),
             next_run_at: Set(request.next_run_at.map(|value| value.to_rfc3339())),
             lease_owner: Set(None),
@@ -345,6 +341,35 @@ impl Database {
         .insert(connection)
         .await?;
         Ok(id)
+    }
+
+    async fn reactivate_completed_background_job_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        key: &str,
+    ) -> Result<()> {
+        let Some(model) = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(key))
+            .filter(background_job::Column::State.eq("completed"))
+            .one(connection)
+            .await?
+        else {
+            return Ok(());
+        };
+        let mut active = model.into_active_model();
+        active.state = Set("pending".into());
+        active.attempts = Set(0);
+        active.deferrals = Set(0);
+        active.next_run_at = Set(None);
+        active.progress_completed = Set(0);
+        active.progress_total = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(None);
+        active.last_error_message = Set(None);
+        active.finished_at = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(connection).await?;
+        Ok(())
     }
 
     pub async fn recover_expired_background_jobs(&self) -> Result<u64> {
@@ -449,12 +474,14 @@ impl Database {
     pub async fn claim_background_job(
         &self,
         owner: &str,
+        lane: &str,
         lease_duration: std::time::Duration,
     ) -> Result<Option<StoredBackgroundJob>> {
         loop {
             let now = Utc::now();
-            let Some(model) = background_job::Entity::find()
+            let candidates = background_job::Entity::find()
                 .filter(background_job::Column::State.is_in(["pending", "retrying"]))
+                .filter(background_job::Column::Lane.eq(lane))
                 .filter(
                     Condition::any()
                         .add(background_job::Column::NextRunAt.is_null())
@@ -462,9 +489,29 @@ impl Database {
                 )
                 .order_by_desc(background_job::Column::Priority)
                 .order_by_asc(background_job::Column::CreatedAt)
-                .one(&self.connection)
+                .limit(2_000)
+                .all(&self.connection)
+                .await?;
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            let running_providers = background_job::Entity::find()
+                .filter(background_job::Column::State.eq("running"))
+                .filter(background_job::Column::ProviderId.is_not_null())
+                .all(&self.connection)
                 .await?
-            else {
+                .into_iter()
+                .filter_map(|job| job.provider_id)
+                .collect::<std::collections::HashSet<_>>();
+            let provider_states = provider_state::Entity::find()
+                .all(&self.connection)
+                .await?
+                .into_iter()
+                .map(|state| (state.id.clone(), state))
+                .collect::<std::collections::HashMap<_, _>>();
+            let Some(model) = candidates.into_iter().find(|job| {
+                background_provider_is_due(job, &provider_states, &running_providers, now)
+            }) else {
                 return Ok(None);
             };
             let stored = stored_background_job(&model)?;
@@ -596,10 +643,46 @@ impl Database {
         Ok(())
     }
 
+    pub async fn wait_background_job(
+        &self,
+        id: Uuid,
+        owner: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<()> {
+        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(());
+        };
+        if model.state == "cancelled" {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let deferrals = model.deferrals.saturating_add(1);
+        let mut active = model.into_active_model();
+        active.state = Set("waiting".into());
+        active.deferrals = Set(deferrals);
+        active.next_run_at = Set(None);
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(Some(code.chars().take(100).collect()));
+        active.last_error_message = Set(Some(message.chars().take(500).collect()));
+        active.finished_at = Set(None);
+        active.updated_at = Set(now);
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
     pub async fn active_background_jobs_by_kind(&self, kind: &str) -> Result<u64> {
         Ok(background_job::Entity::find()
             .filter(background_job::Column::Kind.eq(kind))
-            .filter(background_job::Column::State.is_in(["pending", "running", "retrying"]))
+            .filter(
+                background_job::Column::State.is_in(["pending", "running", "retrying", "waiting"]),
+            )
             .count(&self.connection)
             .await?)
     }
@@ -625,11 +708,13 @@ impl Database {
             return Ok(());
         }
         let attempts = model.attempts + i64::from(increment_attempt);
+        let deferrals = model.deferrals + i64::from(!increment_attempt);
         let terminal = increment_attempt && attempts >= model.max_attempts;
         let now = Utc::now();
         let mut active = model.into_active_model();
         active.state = Set(if terminal { "failed" } else { "retrying" }.into());
         active.attempts = Set(attempts);
+        active.deferrals = Set(deferrals);
         active.next_run_at = Set((!terminal).then(|| {
             (now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1)))
                 .to_rfc3339()
@@ -651,6 +736,7 @@ impl Database {
             ("pending", &mut counts.pending),
             ("running", &mut counts.running),
             ("retrying", &mut counts.retrying),
+            ("waiting", &mut counts.waiting),
             ("completed", &mut counts.completed),
             ("failed", &mut counts.failed),
             ("cancelled", &mut counts.cancelled),
@@ -665,6 +751,7 @@ impl Database {
         for state in [
             "running",
             "retrying",
+            "waiting",
             "failed",
             "pending",
             "completed",
@@ -758,6 +845,83 @@ impl Database {
         Ok(true)
     }
 
+    pub async fn retry_background_job_by_key(&self, key: &str) -> Result<bool> {
+        let Some(model) = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(key))
+            .filter(background_job::Column::State.is_in(["failed", "cancelled", "completed"]))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut active = model.into_active_model();
+        active.state = Set("pending".into());
+        active.attempts = Set(0);
+        active.deferrals = Set(0);
+        active.next_run_at = Set(None);
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_completed = Set(0);
+        active.progress_total = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(None);
+        active.last_error_message = Set(None);
+        active.finished_at = Set(None);
+        active.cancelled_at = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(true)
+    }
+
+    pub async fn background_job_id_by_key(&self, key: &str) -> Result<Option<Uuid>> {
+        background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(key))
+            .one(&self.connection)
+            .await?
+            .map(|model| Uuid::parse_str(&model.id).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn resume_waiting_jobs_for_provider(&self, provider_id: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        Ok(background_job::Entity::update_many()
+            .col_expr(background_job::Column::State, Expr::value("pending"))
+            .col_expr(
+                background_job::Column::NextRunAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(
+                background_job::Column::LastErrorCode,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                background_job::Column::LastErrorMessage,
+                Expr::value(None::<String>),
+            )
+            .col_expr(background_job::Column::UpdatedAt, Expr::value(now))
+            .filter(background_job::Column::State.eq("waiting"))
+            .filter(background_job::Column::ProviderId.eq(provider_id))
+            .exec(&self.connection)
+            .await?
+            .rows_affected)
+    }
+
+    pub async fn resume_waiting_jobs_by_kind(&self, kind: &str) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        Ok(background_job::Entity::update_many()
+            .col_expr(background_job::Column::State, Expr::value("pending"))
+            .col_expr(
+                background_job::Column::NextRunAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(background_job::Column::UpdatedAt, Expr::value(now))
+            .filter(background_job::Column::State.eq("waiting"))
+            .filter(background_job::Column::Kind.eq(kind))
+            .exec(&self.connection)
+            .await?
+            .rows_affected)
+    }
+
     pub async fn provider_state(&self, id: &str) -> Result<Option<StoredProviderState>> {
         provider_state::Entity::find_by_id(id)
             .one(&self.connection)
@@ -782,9 +946,14 @@ impl Database {
             active.last_success_at = Set(state.last_success_at.map(|value| value.to_rfc3339()));
             active.last_failure_at = Set(state.last_failure_at.map(|value| value.to_rfc3339()));
             active.retry_at = Set(state.retry_at.map(|value| value.to_rfc3339()));
+            active.last_background_request_at = Set(state
+                .last_background_request_at
+                .map(|value| value.to_rfc3339()));
             active.consecutive_failures = Set(i64::from(state.consecutive_failures));
             active.minimum_interval_ms =
                 Set(i64::try_from(state.minimum_interval_ms).unwrap_or(i64::MAX));
+            active.background_minimum_interval_ms =
+                Set(i64::try_from(state.background_minimum_interval_ms).unwrap_or(i64::MAX));
             active.max_concurrency = Set(i64::from(state.max_concurrency));
             active.updated_at = Set(updated_at);
             active.update(&self.connection).await?;
@@ -800,10 +969,17 @@ impl Database {
                 last_success_at: Set(state.last_success_at.map(|value| value.to_rfc3339())),
                 last_failure_at: Set(state.last_failure_at.map(|value| value.to_rfc3339())),
                 retry_at: Set(state.retry_at.map(|value| value.to_rfc3339())),
+                last_background_request_at: Set(state
+                    .last_background_request_at
+                    .map(|value| value.to_rfc3339())),
                 consecutive_failures: Set(i64::from(state.consecutive_failures)),
                 minimum_interval_ms: Set(
                     i64::try_from(state.minimum_interval_ms).unwrap_or(i64::MAX)
                 ),
+                background_minimum_interval_ms: Set(i64::try_from(
+                    state.background_minimum_interval_ms,
+                )
+                .unwrap_or(i64::MAX)),
                 max_concurrency: Set(i64::from(state.max_concurrency)),
                 updated_at: Set(updated_at),
             }
@@ -1253,6 +1429,7 @@ impl Database {
     ) -> Result<()> {
         let now = Utc::now();
         let mut should_enqueue = false;
+        let mut refresh_completed = false;
         if let Some(model) = release_track_index::Entity::find_by_id((tracker.to_owned(), group_id))
             .one(connection)
             .await?
@@ -1272,6 +1449,7 @@ impl Database {
                 active.next_retry_at = Set(None);
                 active.updated_at = Set(now.to_rfc3339());
                 should_enqueue = true;
+                refresh_completed = current_state == "indexed";
             }
             should_enqueue |= current_state != "indexed";
             active.update(connection).await?;
@@ -1294,15 +1472,19 @@ impl Database {
             .await?;
         }
         if should_enqueue {
+            let key = format!("track-index:{}:{group_id}:v2", tracker.to_ascii_lowercase());
+            if refresh_completed {
+                self.reactivate_completed_background_job_on(connection, &key)
+                    .await?;
+            }
             self.enqueue_background_job_on(
                 connection,
                 EnqueueBackgroundJob {
-                    deduplication_key: &format!(
-                        "track-index:{}:{group_id}:v1",
-                        tracker.to_ascii_lowercase()
-                    ),
+                    deduplication_key: &key,
                     kind: "index_tracklist",
                     payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    provider_id: Some(format!("tracker:{tracker}")),
+                    lane: "sync",
                     priority,
                     max_attempts: 12,
                     next_run_at: None,
@@ -1337,11 +1519,13 @@ impl Database {
                 &transaction,
                 EnqueueBackgroundJob {
                     deduplication_key: &format!(
-                        "single-coverage:{}:{group_id}:v1",
+                        "single-coverage:{}:{group_id}:v2",
                         tracker.to_ascii_lowercase()
                     ),
                     kind: "compute_single_coverage",
                     payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    provider_id: None,
+                    lane: "sync",
                     priority: 5,
                     max_attempts: 20,
                     next_run_at: None,
@@ -1358,7 +1542,7 @@ impl Database {
     pub async fn due_track_indexes(&self, limit: i64) -> Result<Vec<TrackIndexJob>> {
         let now = Utc::now().to_rfc3339();
         let models = release_track_index::Entity::find()
-            .filter(release_track_index::Column::State.is_in(["pending", "failed"]))
+            .filter(release_track_index::Column::State.eq("pending"))
             .filter(
                 Condition::any()
                     .add(release_track_index::Column::NextRetryAt.is_null())
@@ -1422,6 +1606,8 @@ impl Database {
             active.update(&transaction).await?;
         }
         transaction.commit().await?;
+        self.resume_waiting_jobs_by_kind("compute_single_coverage")
+            .await?;
         if changed {
             for group_id in self
                 .affected_single_groups_on(&self.connection, &index.tracker, index.group_id)
@@ -1462,15 +1648,20 @@ impl Database {
             .insert(&transaction)
             .await?;
         }
+        let key = format!(
+            "single-coverage:{}:{group_id}:v2",
+            tracker.to_ascii_lowercase()
+        );
+        self.reactivate_completed_background_job_on(&transaction, &key)
+            .await?;
         self.enqueue_background_job_on(
             &transaction,
             EnqueueBackgroundJob {
-                deduplication_key: &format!(
-                    "single-coverage:{}:{group_id}:v1",
-                    tracker.to_ascii_lowercase()
-                ),
+                deduplication_key: &key,
                 kind: "compute_single_coverage",
                 payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                provider_id: None,
+                lane: "sync",
                 priority: 5,
                 max_attempts: 20,
                 next_run_at: None,
@@ -1623,15 +1814,20 @@ impl Database {
                 active.updated_at = Set(now.clone());
                 active.update(&transaction).await?;
             }
+            let key = format!(
+                "single-coverage:{}:{group_id}:v2",
+                tracker.to_ascii_lowercase()
+            );
+            self.reactivate_completed_background_job_on(&transaction, &key)
+                .await?;
             self.enqueue_background_job_on(
                 &transaction,
                 EnqueueBackgroundJob {
-                    deduplication_key: &format!(
-                        "single-coverage:{}:{group_id}:v1",
-                        tracker.to_ascii_lowercase()
-                    ),
+                    deduplication_key: &key,
                     kind: "compute_single_coverage",
                     payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
+                    provider_id: None,
+                    lane: "sync",
                     priority: 5,
                     max_attempts: 20,
                     next_run_at: None,
@@ -1642,6 +1838,8 @@ impl Database {
             .await?;
         }
         transaction.commit().await?;
+        self.resume_waiting_jobs_by_kind("compute_single_coverage")
+            .await?;
         Ok(())
     }
 
@@ -3430,7 +3628,12 @@ impl Database {
         {
             let linked = model.resolution_state == "linked";
             let tracker_changed = model.tracker.as_deref() != tracker;
-            should_resolve = tracker.is_some() && (!linked || tracker_changed);
+            let retry_due = model
+                .next_retry_at
+                .as_deref()
+                .is_none_or(|value| parse_timestamp(value).is_ok_and(|value| value <= now_value));
+            should_resolve = tracker.is_some()
+                && (tracker_changed || (model.resolution_state == "pending" && retry_due));
             let has_library_added_at = model.library_added_at.is_some();
             let has_completed_at = model.completed_at.is_some();
             newly_completed = !has_completed_at && completed_at.is_some();
@@ -3485,13 +3688,15 @@ impl Database {
                 &transaction,
                 EnqueueBackgroundJob {
                     deduplication_key: &format!(
-                        "resolve-hash:{}:{hash}",
+                        "resolve-hash:{}:{hash}:v2",
                         tracker.to_ascii_lowercase()
                     ),
                     kind: "resolve_download_hash",
                     payload: serde_json::json!({ "tracker": tracker, "infoHash": hash }),
+                    provider_id: Some(format!("tracker:{tracker}")),
+                    lane: "sync",
                     priority: 20,
-                    max_attempts: 30,
+                    max_attempts: 8,
                     next_run_at: None,
                     parent_id: None,
                     recurring_interval_seconds: None,
@@ -3574,7 +3779,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let models = download_release_link::Entity::find()
             .filter(download_release_link::Column::Tracker.is_not_null())
-            .filter(download_release_link::Column::ResolutionState.is_in(["pending", "failed"]))
+            .filter(download_release_link::Column::ResolutionState.eq("pending"))
             .filter(
                 Condition::any()
                     .add(download_release_link::Column::NextRetryAt.is_null())
@@ -3726,24 +3931,13 @@ impl Database {
                 .one(&self.connection)
                 .await?
                 .context("download release link disappeared while recording failure")?;
-        let first_seen = parse_timestamp(&model.first_seen_at)?;
-        let old_enough = Utc::now() - first_seen >= chrono::Duration::hours(24);
-        let delay = if not_found {
-            chrono::Duration::hours(1)
-        } else {
-            chrono::Duration::seconds((30_i64 * (1_i64 << model.attempts.min(7))).min(3600))
-        };
+        let delay =
+            chrono::Duration::seconds((30_i64 * (1_i64 << model.attempts.min(7))).min(3600));
         let attempts = model.attempts;
         let mut active = model.into_active_model();
-        active.resolution_state = Set(if not_found && old_enough {
-            "not_found"
-        } else {
-            "failed"
-        }
-        .into());
-        active.attempts = Set(attempts + 1);
-        active.next_retry_at =
-            Set((!not_found || !old_enough).then(|| (Utc::now() + delay).to_rfc3339()));
+        active.resolution_state = Set(if not_found { "not_found" } else { "failed" }.into());
+        active.attempts = Set(if not_found { attempts } else { attempts + 1 });
+        active.next_retry_at = Set((!not_found).then(|| (Utc::now() + delay).to_rfc3339()));
         active.error_code = Set(Some(
             if not_found {
                 "not_found"
@@ -3755,6 +3949,49 @@ impl Database {
         active.error_message = Set(Some(message.chars().take(500).collect()));
         active.updated_at = Set(Utc::now().to_rfc3339());
         active.update(&self.connection).await?;
+        Ok(())
+    }
+
+    pub async fn defer_link_resolution(
+        &self,
+        client: &str,
+        info_hash: &str,
+        message: &str,
+    ) -> Result<()> {
+        if let Some(model) =
+            download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
+                .one(&self.connection)
+                .await?
+            && model.resolution_state != "linked"
+        {
+            let mut active = model.into_active_model();
+            active.resolution_state = Set("pending".into());
+            active.next_retry_at = Set(None);
+            active.error_code = Set(Some("provider_wait".into()));
+            active.error_message = Set(Some(message.chars().take(500).collect()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn defer_track_index(
+        &self,
+        tracker: &str,
+        group_id: i64,
+        message: &str,
+    ) -> Result<()> {
+        if let Some(model) = release_track_index::Entity::find_by_id((tracker.to_owned(), group_id))
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set("pending".into());
+            active.next_retry_at = Set(None);
+            active.error_message = Set(Some(message.chars().take(500).collect()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
         Ok(())
     }
 
@@ -3991,8 +4228,15 @@ fn provider_state_from_model(model: provider_state::Model) -> Result<StoredProvi
             .map(parse_timestamp)
             .transpose()?,
         retry_at: model.retry_at.as_deref().map(parse_timestamp).transpose()?,
+        last_background_request_at: model
+            .last_background_request_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
         consecutive_failures: u32::try_from(model.consecutive_failures).unwrap_or(u32::MAX),
         minimum_interval_ms: u64::try_from(model.minimum_interval_ms).unwrap_or_default(),
+        background_minimum_interval_ms: u64::try_from(model.background_minimum_interval_ms)
+            .unwrap_or_default(),
         max_concurrency: u32::try_from(model.max_concurrency).unwrap_or(1).max(1),
     })
 }
@@ -4002,8 +4246,49 @@ fn stored_background_job(model: &background_job::Model) -> Result<StoredBackgrou
         id: Uuid::parse_str(&model.id)?,
         kind: model.kind.clone(),
         payload: model.payload_json.clone(),
+        provider_id: model.provider_id.clone(),
+        lane: model.lane.clone(),
         attempts: u32::try_from(model.attempts).unwrap_or(u32::MAX),
     })
+}
+
+fn background_provider_is_due(
+    job: &background_job::Model,
+    states: &std::collections::HashMap<String, provider_state::Model>,
+    running: &std::collections::HashSet<String>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(provider_id) = job.provider_id.as_deref() else {
+        return true;
+    };
+    if running.contains(provider_id) {
+        return false;
+    }
+    let Some(state) = states.get(provider_id) else {
+        return true;
+    };
+    if state.state == "cooldown"
+        && state
+            .retry_at
+            .as_deref()
+            .and_then(|value| parse_timestamp(value).ok())
+            .is_some_and(|retry_at| retry_at > now)
+    {
+        return false;
+    }
+    if matches!(state.state.as_str(), "blocked" | "paused") {
+        return true;
+    }
+    state
+        .last_background_request_at
+        .as_deref()
+        .and_then(|value| parse_timestamp(value).ok())
+        .map(|last| {
+            let interval =
+                chrono::Duration::milliseconds(state.background_minimum_interval_ms.max(0));
+            last + interval <= now
+        })
+        .unwrap_or(true)
 }
 
 fn background_job_status(model: background_job::Model) -> Result<BackgroundJobStatus> {
@@ -4013,8 +4298,11 @@ fn background_job_status(model: background_job::Model) -> Result<BackgroundJobSt
         deduplication_key: model.deduplication_key,
         kind: model.kind,
         state,
+        provider_id: model.provider_id,
+        lane: model.lane,
         priority: model.priority,
         attempts: u32::try_from(model.attempts).unwrap_or(u32::MAX),
+        deferrals: u64::try_from(model.deferrals).unwrap_or(u64::MAX),
         max_attempts: u32::try_from(model.max_attempts).unwrap_or(u32::MAX),
         next_run_at: model
             .next_run_at
@@ -4050,6 +4338,7 @@ fn background_job_status(model: background_job::Model) -> Result<BackgroundJobSt
             BackgroundJobState::Pending
                 | BackgroundJobState::Running
                 | BackgroundJobState::Retrying
+                | BackgroundJobState::Waiting
         ),
         can_retry: matches!(
             state,
@@ -4322,14 +4611,110 @@ mod tests {
         entity::download_release_link,
         model::{
             CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
-            ClientDownloadState, LiveDownloadStatus, PackItemPlanState, RecommendationMatchState,
-            RecommendationSource, ReleaseSummary, TorrentVariant,
+            ClientDownloadState, LiveDownloadStatus, PackItemPlanState, ProviderCircuitState,
+            RecommendationMatchState, RecommendationSource, ReleaseSummary, TorrentVariant,
         },
         plex::PlexScanTarget,
         tracker::fallback_artist_credit,
     };
 
-    use super::{Database, EnqueueBackgroundJob};
+    use super::{Database, EnqueueBackgroundJob, StoredProviderState};
+
+    #[tokio::test]
+    async fn job_claims_respect_provider_windows_and_in_flight_work() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("provider-claims.sqlite"))
+            .await
+            .expect("database");
+        let mut provider = StoredProviderState {
+            id: "tracker:ops".into(),
+            display_name: "OPS".into(),
+            kind: "tracker".into(),
+            state: ProviderCircuitState::Available,
+            reason_code: None,
+            message: None,
+            last_request_at: Some(Utc::now()),
+            last_success_at: None,
+            last_failure_at: None,
+            retry_at: None,
+            last_background_request_at: Some(Utc::now()),
+            consecutive_failures: 0,
+            minimum_interval_ms: 0,
+            background_minimum_interval_ms: 60_000,
+            max_concurrency: 1,
+        };
+        db.put_provider_state(&provider)
+            .await
+            .expect("provider state");
+        for key in ["provider:first", "provider:second"] {
+            db.enqueue_background_job(EnqueueBackgroundJob {
+                deduplication_key: key,
+                kind: "provider_job",
+                payload: serde_json::json!({}),
+                provider_id: Some("tracker:ops".into()),
+                lane: "sync",
+                priority: 100,
+                max_attempts: 3,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            })
+            .await
+            .expect("provider job");
+        }
+        let local_id = db
+            .enqueue_background_job(EnqueueBackgroundJob {
+                deduplication_key: "local:first",
+                kind: "local_job",
+                payload: serde_json::json!({}),
+                provider_id: None,
+                lane: "sync",
+                priority: 1,
+                max_attempts: 3,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            })
+            .await
+            .expect("local job");
+
+        let local = db
+            .claim_background_job("local-worker", "sync", std::time::Duration::from_secs(60))
+            .await
+            .expect("claim")
+            .expect("local job is eligible");
+        assert_eq!(local.id, local_id);
+        db.complete_background_job(local.id, "local-worker")
+            .await
+            .expect("complete local");
+        assert!(
+            db.claim_background_job("early-worker", "sync", std::time::Duration::from_secs(60))
+                .await
+                .expect("early claim")
+                .is_none()
+        );
+
+        provider.last_background_request_at = Some(Utc::now() - Duration::minutes(2));
+        db.put_provider_state(&provider)
+            .await
+            .expect("provider due");
+        let claimed = db
+            .claim_background_job(
+                "provider-worker",
+                "sync",
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("provider claim")
+            .expect("provider job due");
+        assert_eq!(claimed.provider_id.as_deref(), Some("tracker:ops"));
+        assert!(
+            db.claim_background_job("other-worker", "sync", std::time::Duration::from_secs(60))
+                .await
+                .expect("concurrent claim")
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn background_jobs_are_deduplicated_leased_recovered_and_controllable() {
@@ -4341,6 +4726,8 @@ mod tests {
             deduplication_key: "test:durable-job",
             kind: "test_job",
             payload: serde_json::json!({ "value": 1 }),
+            provider_id: None,
+            lane: "sync",
             priority: 10,
             max_attempts: 3,
             next_run_at: None,
@@ -4365,7 +4752,7 @@ mod tests {
         );
 
         let claimed = db
-            .claim_background_job("worker-one", std::time::Duration::ZERO)
+            .claim_background_job("worker-one", "sync", std::time::Duration::ZERO)
             .await
             .expect("claim")
             .expect("claimed job");
@@ -4375,7 +4762,7 @@ mod tests {
             1
         );
         let claimed = db
-            .claim_background_job("worker-two", std::time::Duration::from_secs(60))
+            .claim_background_job("worker-two", "sync", std::time::Duration::from_secs(60))
             .await
             .expect("second claim")
             .expect("recovered job");
@@ -4387,7 +4774,7 @@ mod tests {
             1
         );
         let claimed = db
-            .claim_background_job("worker-three", std::time::Duration::from_secs(60))
+            .claim_background_job("worker-three", "sync", std::time::Duration::from_secs(60))
             .await
             .expect("third claim")
             .expect("released job");
@@ -4411,7 +4798,7 @@ mod tests {
                 .expect("manual retry")
         );
         let claimed = db
-            .claim_background_job("worker-four", std::time::Duration::from_secs(60))
+            .claim_background_job("worker-four", "sync", std::time::Duration::from_secs(60))
             .await
             .expect("fourth claim")
             .expect("retried job");
@@ -4442,6 +4829,8 @@ mod tests {
                     deduplication_key: "test:concurrent-job",
                     kind: "test_job",
                     payload: serde_json::json!({ "value": 1 }),
+                    provider_id: None,
+                    lane: "sync",
                     priority: 10,
                     max_attempts: 3,
                     next_run_at: None,

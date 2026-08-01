@@ -497,6 +497,18 @@
                 <small>Safe minimum: {provider.safeMinimumIntervalMs.toLocaleString()} ms</small>
               </label>
               <label class="dialog-field">
+                <span>Background interval (ms)</span>
+                <input
+                  type="number"
+                  min={provider.safeBackgroundMinimumIntervalMs}
+                  step="100"
+                  value={policy.backgroundMinimumIntervalMs ?? provider.backgroundMinimumIntervalMs}
+                  onchange={(event) =>
+                    setProviderPolicy(provider, "backgroundMinimumIntervalMs", event.currentTarget.value)}
+                />
+                <small>Safe background minimum: {provider.safeBackgroundMinimumIntervalMs.toLocaleString()} ms</small>
+              </label>
+              <label class="dialog-field">
                 <span>Maximum concurrency</span>
                 <input
                   type="number"

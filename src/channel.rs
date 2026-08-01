@@ -585,14 +585,31 @@ async fn lastfm_call(
                 .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
             let status = response.status();
             let retry = retry_after(&response);
-            let value: Value = response
-                .json()
+            let bytes = response
+                .bytes()
                 .await
                 .map_err(|error| ProviderFailure::new(ProviderFailureKind::Transient, error))?;
-            if let Some(failure) = lastfm_failure(method, params, status, retry, &value) {
-                return Err(failure);
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(failure) = lastfm_failure(method, params, status, retry, &value) {
+                    return Err(failure);
+                }
+                return Ok(value);
             }
-            Ok(value)
+            let kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                ProviderFailureKind::RateLimited
+            } else if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                ProviderFailureKind::Authentication
+            } else {
+                ProviderFailureKind::Transient
+            };
+            Err(ProviderFailure::new(
+                kind,
+                format!("Last.fm returned HTTP {status} with a non-JSON response"),
+            )
+            .retry_after(retry))
         })
         .await
         .map_err(Into::into)
@@ -744,7 +761,7 @@ async fn resolve_tracker_source(
     for (name, tracker) in &state.trackers {
         for query in &queries {
             let request = SearchRequest {
-                query: Some(query.clone()),
+                query: tracker_query_title(query),
                 artist: Some(source.artist.clone()),
                 release_type: None,
                 year: source.year,
@@ -815,6 +832,14 @@ async fn resolve_tracker_source(
     resolve_release(state, source, release_id, preferences)
         .await
         .map(Some)
+}
+
+fn tracker_query_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    value
+        .chars()
+        .any(char::is_alphanumeric)
+        .then(|| value.to_owned())
 }
 
 fn base_edition_title(title: &str) -> Option<String> {
@@ -1469,8 +1494,17 @@ mod tests {
     use super::{
         apple_sources_from_cache, apply_pack_constraints, base_edition_title, channel_is_due,
         compare_variants, get_json_with_retry, lastfm_failure, next_occurrence, next_refresh_at,
-        parse_apple_chart, validate_channel, validate_channel_refresh,
+        parse_apple_chart, tracker_query_title, validate_channel, validate_channel_refresh,
     };
+
+    #[test]
+    fn omits_symbol_only_titles_from_tracker_searches() {
+        assert_eq!(tracker_query_title("÷"), None);
+        assert_eq!(
+            tracker_query_title(" 1989 (Taylor's Version) "),
+            Some("1989 (Taylor's Version)".into())
+        );
+    }
 
     #[test]
     fn weekly_schedule_is_dst_aware() {

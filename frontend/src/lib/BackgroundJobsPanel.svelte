@@ -30,6 +30,7 @@
     "running",
     "pending",
     "retrying",
+    "waiting",
     "failed",
     "completed",
     "cancelled"
@@ -66,6 +67,9 @@
     }
     if (job.state === "running" && job.leaseUntil) {
       return `Lease healthy until ${new Date(job.leaseUntil).toLocaleTimeString()}`;
+    }
+    if (job.state === "waiting") {
+      return `Waiting for ${job.providerId ?? "a dependency"}`;
     }
     return `Updated ${new Date(job.updatedAt).toLocaleString()}`;
   }
@@ -119,8 +123,8 @@
               <strong>{displayName(job)}</strong>
               <span class={`job-state ${job.state}`}>{job.state}</span>
             </header>
-            <span>{[context(job), job.progressMessage ?? when(job)].filter(Boolean).join(" · ")}</span>
-            {#if job.lastErrorMessage && ["failed", "retrying"].includes(job.state)}
+            <span>{[context(job), job.providerId, `${job.lane} lane`, job.progressMessage ?? when(job)].filter(Boolean).join(" · ")}</span>
+            {#if job.lastErrorMessage && ["failed", "retrying", "waiting"].includes(job.state)}
               <small>{job.lastErrorMessage}</small>
             {/if}
             {#if job.progressTotal}

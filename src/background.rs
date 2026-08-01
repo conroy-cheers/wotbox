@@ -32,7 +32,7 @@ pub const CANONICAL_BACKFILL: &str = "canonical_backfill";
 pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
 pub const NOTIFY_PLEX: &str = "notify_plex";
 
-const WORKER_COUNT: usize = 2;
+const WORKER_LANES: [&str; 4] = ["event", "sync", "sync", "maintenance"];
 const LEASE_DURATION: Duration = Duration::from_secs(120);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -92,6 +92,10 @@ enum JobOutcome {
         code: &'static str,
         message: String,
     },
+    Wait {
+        code: &'static str,
+        message: String,
+    },
 }
 
 pub async fn spawn_background_workers(state: Arc<AppState>) -> Result<BackgroundRuntime> {
@@ -101,7 +105,7 @@ pub async fn spawn_background_workers(state: Arc<AppState>) -> Result<Background
     let claim_lock = Arc::new(Mutex::new(()));
     let mut handles = Vec::new();
     let mut owners = Vec::new();
-    for index in 0..WORKER_COUNT {
+    for (index, lane) in WORKER_LANES.into_iter().enumerate() {
         let worker_state = state.clone();
         let worker_stop = stop_receiver.clone();
         let worker_claim_lock = claim_lock.clone();
@@ -110,6 +114,7 @@ pub async fn spawn_background_workers(state: Arc<AppState>) -> Result<Background
         handles.push(tokio::spawn(worker_loop(
             worker_state,
             owner,
+            lane.to_owned(),
             worker_claim_lock,
             worker_stop,
         )));
@@ -135,19 +140,51 @@ pub async fn enqueue_hash_resolution(
     tracker: &str,
     info_hash: &str,
 ) -> Result<Uuid> {
+    enqueue_hash_resolution_at(state, tracker, info_hash, None).await
+}
+
+pub async fn retry_hash_resolution(
+    state: &AppState,
+    tracker: &str,
+    info_hash: &str,
+) -> Result<Uuid> {
+    let key = format!(
+        "resolve-hash:{}:{}:v2",
+        tracker.to_ascii_lowercase(),
+        info_hash.to_ascii_lowercase()
+    );
+    if state.db.retry_background_job_by_key(&key).await? {
+        state.background_jobs.wake();
+        return state
+            .db
+            .background_job_id_by_key(&key)
+            .await?
+            .context("retried background job disappeared");
+    }
+    enqueue_hash_resolution(state, tracker, info_hash).await
+}
+
+async fn enqueue_hash_resolution_at(
+    state: &AppState,
+    tracker: &str,
+    info_hash: &str,
+    next_run_at: Option<chrono::DateTime<Utc>>,
+) -> Result<Uuid> {
     enqueue(
         state,
         EnqueueBackgroundJob {
             deduplication_key: &format!(
-                "resolve-hash:{}:{}",
+                "resolve-hash:{}:{}:v2",
                 tracker.to_ascii_lowercase(),
                 info_hash.to_ascii_lowercase()
             ),
             kind: RESOLVE_DOWNLOAD_HASH,
             payload: json!({ "tracker": tracker, "infoHash": info_hash.to_ascii_lowercase() }),
+            provider_id: Some(format!("tracker:{tracker}")),
+            lane: "sync",
             priority: 20,
-            max_attempts: 30,
-            next_run_at: None,
+            max_attempts: 8,
+            next_run_at,
             parent_id: None,
             recurring_interval_seconds: None,
         },
@@ -165,12 +202,14 @@ pub async fn enqueue_track_index(
         state,
         EnqueueBackgroundJob {
             deduplication_key: &format!(
-                "track-index:{}:{}:v1",
+                "track-index:{}:{}:v2",
                 tracker.to_ascii_lowercase(),
                 group_id
             ),
             kind: INDEX_TRACKLIST,
             payload: json!({ "tracker": tracker, "groupId": group_id }),
+            provider_id: Some(format!("tracker:{tracker}")),
+            lane: "sync",
             priority,
             max_attempts: 12,
             next_run_at: None,
@@ -191,12 +230,14 @@ pub async fn enqueue_single_coverage(
         state,
         EnqueueBackgroundJob {
             deduplication_key: &format!(
-                "single-coverage:{}:{}:v1",
+                "single-coverage:{}:{}:v2",
                 tracker.to_ascii_lowercase(),
                 group_id
             ),
             kind: COMPUTE_SINGLE_COVERAGE,
             payload: json!({ "tracker": tracker, "groupId": group_id }),
+            provider_id: None,
+            lane: "sync",
             priority: 5,
             max_attempts: 20,
             next_run_at: None,
@@ -219,7 +260,9 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
                 deduplication_key: &format!("scan-download-client:{name}"),
                 kind: SCAN_DOWNLOAD_CLIENT,
                 payload: json!({ "client": name }),
-                priority: -10,
+                provider_id: Some(format!("qbittorrent:{name}")),
+                lane: "maintenance",
+                priority: 50,
                 max_attempts: 20,
                 next_run_at: None,
                 parent_id: None,
@@ -234,6 +277,8 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
             deduplication_key: "canonical-backfill:v1",
             kind: CANONICAL_BACKFILL,
             payload: json!({}),
+            provider_id: None,
+            lane: "maintenance",
             priority: -20,
             max_attempts: 20,
             next_run_at: None,
@@ -248,6 +293,8 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
             deduplication_key: "enrich-library-artists:v1",
             kind: ENRICH_LIBRARY_ARTISTS,
             payload: json!({}),
+            provider_id: None,
+            lane: "maintenance",
             priority: -15,
             max_attempts: 20,
             next_run_at: None,
@@ -256,9 +303,15 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
         },
     )
     .await?;
+    let mut ops_offset = 0_i64;
     for link in state.db.due_links(100_000).await? {
         if let Some(tracker) = link.tracker {
-            enqueue_hash_resolution(state, &tracker, &link.info_hash).await?;
+            let next_run_at = tracker.eq_ignore_ascii_case("ops").then(|| {
+                let value = Utc::now() + ChronoDuration::seconds(ops_offset * 5);
+                ops_offset += 1;
+                value
+            });
+            enqueue_hash_resolution_at(state, &tracker, &link.info_hash, next_run_at).await?;
         }
     }
     for job in state.db.due_track_indexes(100_000).await? {
@@ -273,6 +326,7 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
 async fn worker_loop(
     state: Arc<AppState>,
     owner: String,
+    lane: String,
     claim_lock: Arc<Mutex<()>>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -285,7 +339,11 @@ async fn worker_loop(
             if let Err(error) = state.db.recover_expired_background_jobs().await {
                 tracing::warn!(%error, "background worker could not recover expired leases");
             }
-            match state.db.claim_background_job(&owner, LEASE_DURATION).await {
+            match state
+                .db
+                .claim_background_job(&owner, &lane, LEASE_DURATION)
+                .await
+            {
                 Ok(job) => job,
                 Err(error) => {
                     tracing::error!(%error, "background worker could not claim a job");
@@ -315,6 +373,13 @@ async fn run_claimed_job(
     job: StoredBackgroundJob,
     stop: &mut watch::Receiver<bool>,
 ) {
+    tracing::debug!(
+        job_id = %job.id,
+        kind = %job.kind,
+        lane = %job.lane,
+        provider = job.provider_id.as_deref().unwrap_or("local"),
+        "running background job"
+    );
     let mut operation = Box::pin(execute_job(state, &job));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.tick().await;
@@ -365,6 +430,12 @@ async fn run_claimed_job(
             state
                 .db
                 .retry_background_job(job.id, owner, delay, increment_attempt, code, &message)
+                .await
+        }
+        JobOutcome::Wait { code, message } => {
+            state
+                .db
+                .wait_background_job(job.id, owner, code, &message)
                 .await
         }
     };
@@ -468,17 +539,25 @@ async fn resolve_download_hash(state: &Arc<AppState>, payload: &Value) -> Result
             let normalized = message.to_ascii_lowercase();
             let not_found = normalized.contains("not found")
                 || normalized.contains("does not exist")
-                || normalized.contains("bad hash");
+                || normalized.contains("bad hash")
+                || (payload.tracker.eq_ignore_ascii_case("ops")
+                    && normalized.contains("bad parameters"));
+            let provider_wait = provider_error_is_admission_or_blocked(&error);
             for link in &links {
-                state
-                    .db
-                    .set_link_failure(&link.client, &link.info_hash, not_found, &message)
-                    .await?;
+                if provider_wait {
+                    state
+                        .db
+                        .defer_link_resolution(&link.client, &link.info_hash, &message)
+                        .await?;
+                } else {
+                    state
+                        .db
+                        .set_link_failure(&link.client, &link.info_hash, not_found, &message)
+                        .await?;
+                }
             }
             if not_found {
-                Ok(JobOutcome::Retry {
-                    delay: Duration::from_secs(3600),
-                    increment_attempt: true,
+                Ok(JobOutcome::Fail {
                     code: "not_found",
                     message,
                 })
@@ -566,10 +645,17 @@ async fn index_tracklist(
     match result {
         Ok(()) => Ok(JobOutcome::Complete),
         Err(error) => {
-            state
-                .db
-                .fail_track_index(&payload.tracker, payload.group_id, &error.to_string())
-                .await?;
+            if provider_error_is_admission_or_blocked(&error) {
+                state
+                    .db
+                    .defer_track_index(&payload.tracker, payload.group_id, &error.to_string())
+                    .await?;
+            } else {
+                state
+                    .db
+                    .fail_track_index(&payload.tracker, payload.group_id, &error.to_string())
+                    .await?;
+            }
             Err(error)
         }
     }
@@ -598,9 +684,7 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
         .map(|membership| membership.artist_id)
         .collect::<HashSet<_>>();
     if single_artists.is_empty() {
-        return Ok(JobOutcome::Retry {
-            delay: Duration::from_secs(30),
-            increment_attempt: false,
+        return Ok(JobOutcome::Wait {
             code: "dependencies_pending",
             message: "Waiting for artist catalog membership".into(),
         });
@@ -626,25 +710,19 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
         .collect::<Vec<_>>();
     let single_key = (payload.tracker.clone(), payload.group_id);
     let Some(single) = indexes.get(&single_key) else {
-        return Ok(JobOutcome::Retry {
-            delay: Duration::from_secs(15),
-            increment_attempt: false,
+        return Ok(JobOutcome::Wait {
             code: "dependencies_pending",
             message: "Waiting for the Single tracklist".into(),
         });
     };
     if single.state == "failed" {
-        return Ok(JobOutcome::Retry {
-            delay: Duration::from_secs(60),
-            increment_attempt: false,
+        return Ok(JobOutcome::Wait {
             code: "dependencies_pending",
             message: "Waiting for a failed Single tracklist retry".into(),
         });
     }
     let Some(single_index) = single.index.as_ref() else {
-        return Ok(JobOutcome::Retry {
-            delay: Duration::from_secs(15),
-            increment_attempt: false,
+        return Ok(JobOutcome::Wait {
             code: "dependencies_pending",
             message: "Waiting for the Single tracklist".into(),
         });
@@ -656,17 +734,13 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
             membership.group.release.group_id,
         );
         let Some(index) = indexes.get(&key) else {
-            return Ok(JobOutcome::Retry {
-                delay: Duration::from_secs(15),
-                increment_attempt: false,
+            return Ok(JobOutcome::Wait {
                 code: "dependencies_pending",
                 message: "Waiting for candidate Album tracklists".into(),
             });
         };
         let Some(index) = index.index.clone() else {
-            return Ok(JobOutcome::Retry {
-                delay: Duration::from_secs(30),
-                increment_attempt: false,
+            return Ok(JobOutcome::Wait {
                 code: "dependencies_pending",
                 message: "Waiting for candidate Album tracklists".into(),
             });
@@ -749,61 +823,91 @@ async fn classify_error(
     job: &StoredBackgroundJob,
     error: anyhow::Error,
 ) -> JobOutcome {
-    if let Some(ProviderRequestError::Upstream {
-        failure,
-        kind: ProviderFailureKind::Permanent,
-        ..
-    }) = error
+    let provider_error = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())
-    {
-        return JobOutcome::Fail {
-            code: "permanent_provider_failure",
-            message: failure.clone(),
-        };
-    }
-    let provider = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())
-        .map(|provider| match provider {
+        .find_map(|cause| cause.downcast_ref::<ProviderRequestError>());
+    if let Some(provider_error) = provider_error {
+        let message = provider_error.to_string();
+        match provider_error {
             ProviderRequestError::Unavailable {
-                provider, retry_at, ..
-            } => (Some(provider.clone()), *retry_at, provider.to_string()),
-            ProviderRequestError::Busy { provider }
-            | ProviderRequestError::Upstream { provider, .. } => {
-                (Some(provider.clone()), None, provider.to_string())
+                retry_at: Some(retry_at),
+                ..
             }
-            _ => (None, None, provider.to_string()),
-        });
-    if let Some((provider_id, mut retry_at, provider_message)) = provider {
-        if retry_at.is_none()
-            && let Some(id) = provider_id.as_deref()
-        {
-            retry_at = state
-                .providers
-                .statuses()
-                .await
-                .into_iter()
-                .find(|status| status.id == id)
-                .and_then(|status| status.retry_at);
+            | ProviderRequestError::Deferred { retry_at, .. } => {
+                return JobOutcome::Retry {
+                    delay: (*retry_at - Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::from_millis(1)),
+                    increment_attempt: false,
+                    code: "provider_deferred",
+                    message,
+                };
+            }
+            ProviderRequestError::Unavailable { .. } => {
+                return JobOutcome::Wait {
+                    code: "provider_wait",
+                    message,
+                };
+            }
+            ProviderRequestError::Busy { .. } | ProviderRequestError::Stopped(_) => {
+                return JobOutcome::Retry {
+                    delay: Duration::from_secs(5),
+                    increment_attempt: false,
+                    code: "provider_admission_deferred",
+                    message,
+                };
+            }
+            ProviderRequestError::Upstream {
+                failure,
+                kind: ProviderFailureKind::Permanent,
+                ..
+            } => {
+                return JobOutcome::Fail {
+                    code: "permanent_provider_failure",
+                    message: failure.clone(),
+                };
+            }
+            ProviderRequestError::Upstream {
+                kind: ProviderFailureKind::Authentication | ProviderFailureKind::HardBlocked,
+                ..
+            } => {
+                return JobOutcome::Wait {
+                    code: "provider_blocked",
+                    message,
+                };
+            }
+            ProviderRequestError::Upstream {
+                provider,
+                kind: ProviderFailureKind::RateLimited,
+                ..
+            } => {
+                let retry_at = state
+                    .providers
+                    .statuses()
+                    .await
+                    .into_iter()
+                    .find(|status| status.id == *provider)
+                    .and_then(|status| status.retry_at);
+                return JobOutcome::Retry {
+                    delay: retry_at
+                        .and_then(|value| (value - Utc::now()).to_std().ok())
+                        .unwrap_or(Duration::from_secs(60)),
+                    increment_attempt: false,
+                    code: "provider_rate_limited",
+                    message,
+                };
+            }
+            ProviderRequestError::Upstream {
+                kind: ProviderFailureKind::Transient,
+                ..
+            } => {}
+            ProviderRequestError::Unknown(_) => {
+                return JobOutcome::Fail {
+                    code: "unknown_provider",
+                    message,
+                };
+            }
         }
-        let delay = retry_at
-            .and_then(|value| (value - Utc::now()).to_std().ok())
-            .unwrap_or(Duration::from_secs(30));
-        return JobOutcome::Retry {
-            delay,
-            increment_attempt: false,
-            code: "provider_wait",
-            message: provider_id
-                .map(|id| {
-                    if provider_message == id {
-                        format!("Waiting for {id}")
-                    } else {
-                        format!("Waiting for {id}: {provider_message}")
-                    }
-                })
-                .unwrap_or(provider_message),
-        };
     }
     let exponent = job.attempts.min(7);
     let base = 30_u64.saturating_mul(1_u64 << exponent).min(3600);
@@ -814,4 +918,25 @@ async fn classify_error(
         code: "job_failed",
         message: error.to_string(),
     }
+}
+
+fn provider_error_is_admission_or_blocked(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                ProviderRequestError::Unavailable { .. }
+                    | ProviderRequestError::Busy { .. }
+                    | ProviderRequestError::Deferred { .. }
+                    | ProviderRequestError::Stopped(_)
+                    | ProviderRequestError::Upstream {
+                        kind: ProviderFailureKind::RateLimited
+                            | ProviderFailureKind::Authentication
+                            | ProviderFailureKind::HardBlocked,
+                        ..
+                    }
+            )
+        })
 }

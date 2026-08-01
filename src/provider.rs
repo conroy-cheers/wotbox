@@ -19,7 +19,7 @@ use crate::{
 };
 
 const MAX_QUEUE_DEPTH: usize = 1_000;
-const FOREGROUND_WAIT: Duration = Duration::from_secs(15);
+const FOREGROUND_WAIT: Duration = Duration::from_secs(40);
 const PRIORITY_COUNT: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,10 @@ impl RequestClass {
             Self::Background => 4,
         }
     }
+
+    fn is_background(self) -> bool {
+        self == Self::Background
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,7 @@ pub struct ProviderDefinition {
     pub display_name: String,
     pub kind: String,
     pub safe_minimum_interval: Duration,
+    pub safe_background_minimum_interval: Duration,
     pub safe_max_concurrency: u32,
 }
 
@@ -59,6 +64,7 @@ impl ProviderDefinition {
             display_name: name.to_ascii_uppercase(),
             kind: "tracker".into(),
             safe_minimum_interval: Duration::from_millis(2_500),
+            safe_background_minimum_interval: Duration::from_secs(5),
             safe_max_concurrency: 1,
         }
     }
@@ -69,6 +75,7 @@ impl ProviderDefinition {
             display_name: "Last.fm".into(),
             kind: "recommendation_source".into(),
             safe_minimum_interval: Duration::from_secs(1),
+            safe_background_minimum_interval: Duration::from_secs(1),
             safe_max_concurrency: 1,
         }
     }
@@ -79,6 +86,7 @@ impl ProviderDefinition {
             display_name: "Apple Music".into(),
             kind: "recommendation_source".into(),
             safe_minimum_interval: Duration::from_secs(4),
+            safe_background_minimum_interval: Duration::from_secs(4),
             safe_max_concurrency: 1,
         }
     }
@@ -89,6 +97,7 @@ impl ProviderDefinition {
             display_name: "Plex".into(),
             kind: "media_server".into(),
             safe_minimum_interval: Duration::from_secs(5),
+            safe_background_minimum_interval: Duration::from_secs(5),
             safe_max_concurrency: 1,
         }
     }
@@ -99,6 +108,7 @@ impl ProviderDefinition {
             display_name: format!("qBittorrent ({name})"),
             kind: "download_client".into(),
             safe_minimum_interval: Duration::from_millis(250),
+            safe_background_minimum_interval: Duration::from_millis(250),
             safe_max_concurrency: 2,
         }
     }
@@ -165,6 +175,11 @@ pub enum ProviderRequestError {
     },
     #[error("{provider} request queue is busy")]
     Busy { provider: String },
+    #[error("{provider} background request deferred until {retry_at}")]
+    Deferred {
+        provider: String,
+        retry_at: DateTime<Utc>,
+    },
     #[error("{provider}: {failure}")]
     Upstream {
         provider: String,
@@ -181,7 +196,7 @@ impl ProviderRequestError {
     pub fn is_unavailable(&self) -> bool {
         matches!(
             self,
-            Self::Unavailable { .. } | Self::Busy { .. } | Self::Stopped(_)
+            Self::Unavailable { .. } | Self::Busy { .. } | Self::Deferred { .. } | Self::Stopped(_)
         ) || matches!(
             self,
             Self::Upstream {
@@ -213,7 +228,6 @@ struct ProviderHandle {
 }
 
 struct Waiter {
-    enqueued_at: tokio::time::Instant,
     sender: oneshot::Sender<std::result::Result<(), ProviderRequestError>>,
 }
 
@@ -282,6 +296,9 @@ impl ProviderGovernor {
             let minimum_interval_ms = override_value
                 .minimum_interval_ms
                 .unwrap_or(definition.safe_minimum_interval.as_millis() as u64);
+            let background_minimum_interval_ms = override_value
+                .background_minimum_interval_ms
+                .unwrap_or(definition.safe_background_minimum_interval.as_millis() as u64);
             let max_concurrency = override_value
                 .max_concurrency
                 .unwrap_or(definition.safe_max_concurrency);
@@ -299,13 +316,16 @@ impl ProviderGovernor {
                         last_success_at: None,
                         last_failure_at: None,
                         retry_at: None,
+                        last_background_request_at: None,
                         consecutive_failures: 0,
                         minimum_interval_ms,
+                        background_minimum_interval_ms,
                         max_concurrency,
                     });
             stored.display_name.clone_from(&definition.display_name);
             stored.kind.clone_from(&definition.kind);
             stored.minimum_interval_ms = minimum_interval_ms;
+            stored.background_minimum_interval_ms = background_minimum_interval_ms;
             stored.max_concurrency = max_concurrency;
             db.put_provider_state(&stored).await?;
 
@@ -368,12 +388,18 @@ impl ProviderGovernor {
             .sender
             .send(Command::Acquire { class, sender })
             .map_err(|_| ProviderRequestError::Stopped(provider.into()))?;
-        let granted = tokio::time::timeout(FOREGROUND_WAIT, receiver)
-            .await
-            .map_err(|_| ProviderRequestError::Busy {
-                provider: provider.into(),
-            })?
-            .map_err(|_| ProviderRequestError::Stopped(provider.into()))?;
+        let granted = if class.is_background() {
+            receiver
+                .await
+                .map_err(|_| ProviderRequestError::Stopped(provider.into()))?
+        } else {
+            tokio::time::timeout(FOREGROUND_WAIT, receiver)
+                .await
+                .map_err(|_| ProviderRequestError::Busy {
+                    provider: provider.into(),
+                })?
+                .map_err(|_| ProviderRequestError::Stopped(provider.into()))?
+        };
         granted?;
         Ok(Permit {
             sender: handle.sender.clone(),
@@ -487,11 +513,15 @@ impl Actor {
                     let _ = sender.send(Err(ProviderRequestError::Busy {
                         provider: self.definition.id.clone(),
                     }));
+                } else if class.is_background()
+                    && let Some(retry_at) = self.background_defer_until()
+                {
+                    let _ = sender.send(Err(ProviderRequestError::Deferred {
+                        provider: self.definition.id.clone(),
+                        retry_at,
+                    }));
                 } else {
-                    self.queues[class.index()].push_back(Waiter {
-                        enqueued_at: tokio::time::Instant::now(),
-                        sender,
-                    });
+                    self.queues[class.index()].push_back(Waiter { sender });
                 }
             }
             Command::Complete(failure, sender) => {
@@ -549,6 +579,10 @@ impl Actor {
                     self.stored.minimum_interval_ms = value
                         .minimum_interval_ms
                         .unwrap_or(self.definition.safe_minimum_interval.as_millis() as u64);
+                    self.stored.background_minimum_interval_ms =
+                        value.background_minimum_interval_ms.unwrap_or(
+                            self.definition.safe_background_minimum_interval.as_millis() as u64,
+                        );
                     self.stored.max_concurrency = value
                         .max_concurrency
                         .unwrap_or(self.definition.safe_max_concurrency);
@@ -572,18 +606,15 @@ impl Actor {
             {
                 return;
             }
-            if let Some(last) = self.stored.last_request_at {
-                let next = last
-                    + chrono::Duration::milliseconds(
-                        i64::try_from(self.stored.minimum_interval_ms).unwrap_or(i64::MAX),
-                    );
-                if next > Utc::now() {
-                    return;
-                }
-            }
             let Some(queue) = self.best_queue() else {
                 return;
             };
+            if self
+                .next_eligible_at(queue)
+                .is_some_and(|next| next > Utc::now())
+            {
+                return;
+            }
             let Some(waiter) = self.queues[queue].pop_front() else {
                 continue;
             };
@@ -591,7 +622,11 @@ impl Actor {
                 continue;
             }
             self.active += 1;
-            self.stored.last_request_at = Some(Utc::now());
+            let granted_at = Utc::now();
+            self.stored.last_request_at = Some(granted_at);
+            if queue == RequestClass::Background.index() {
+                self.stored.last_background_request_at = Some(granted_at);
+            }
             if let Err(error) = self.persist().await {
                 self.active = self.active.saturating_sub(1);
                 let _ = waiter.sender.send(Err(ProviderRequestError::Stopped(
@@ -764,19 +799,10 @@ impl Actor {
     }
 
     fn best_queue(&self) -> Option<usize> {
-        let now = tokio::time::Instant::now();
         self.queues
             .iter()
             .enumerate()
-            .filter_map(|(index, queue)| {
-                queue.front().map(|waiter| {
-                    let age_steps = now.duration_since(waiter.enqueued_at).as_secs() / 30;
-                    let effective = index.saturating_sub(age_steps as usize);
-                    (index, effective, waiter.enqueued_at)
-                })
-            })
-            .min_by_key(|(_, effective, enqueued)| (*effective, *enqueued))
-            .map(|(index, _, _)| index)
+            .find_map(|(index, queue)| (!queue.is_empty()).then_some(index))
     }
 
     fn next_wait(&self) -> Option<Duration> {
@@ -789,13 +815,43 @@ impl Actor {
                 .retry_at
                 .and_then(|value| (value - Utc::now()).to_std().ok());
         }
-        self.stored.last_request_at.and_then(|last| {
-            let next = last
-                + chrono::Duration::milliseconds(
-                    i64::try_from(self.stored.minimum_interval_ms).unwrap_or(i64::MAX),
-                );
-            (next - Utc::now()).to_std().ok()
-        })
+        self.best_queue()
+            .and_then(|queue| self.next_eligible_at(queue))
+            .and_then(|next| (next - Utc::now()).to_std().ok())
+    }
+
+    fn next_eligible_at(&self, queue: usize) -> Option<DateTime<Utc>> {
+        let global = self.stored.last_request_at.map(|last| {
+            last + chrono::Duration::milliseconds(
+                i64::try_from(self.stored.minimum_interval_ms).unwrap_or(i64::MAX),
+            )
+        });
+        let background = (queue == RequestClass::Background.index())
+            .then(|| {
+                self.stored.last_background_request_at.map(|last| {
+                    last + chrono::Duration::milliseconds(
+                        i64::try_from(self.stored.background_minimum_interval_ms)
+                            .unwrap_or(i64::MAX),
+                    )
+                })
+            })
+            .flatten();
+        global.into_iter().chain(background).max()
+    }
+
+    fn background_defer_until(&self) -> Option<DateTime<Utc>> {
+        let foreground_waiting = self.queues[..RequestClass::Background.index()]
+            .iter()
+            .any(|queue| !queue.is_empty());
+        let eligible_at = self.next_eligible_at(RequestClass::Background.index());
+        if self.active >= self.stored.max_concurrency || foreground_waiting {
+            return Some(
+                eligible_at
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(1))
+                    .max(Utc::now() + chrono::Duration::seconds(1)),
+            );
+        }
+        eligible_at.filter(|next| *next > Utc::now())
     }
 
     fn queue_depth(&self) -> usize {
@@ -821,9 +877,15 @@ impl Actor {
             last_success_at: self.stored.last_success_at,
             last_failure_at: self.stored.last_failure_at,
             retry_at: self.stored.retry_at,
+            last_background_request_at: self.stored.last_background_request_at,
             consecutive_failures: self.stored.consecutive_failures,
             minimum_interval_ms: self.stored.minimum_interval_ms,
             safe_minimum_interval_ms: self.definition.safe_minimum_interval.as_millis() as u64,
+            background_minimum_interval_ms: self.stored.background_minimum_interval_ms,
+            safe_background_minimum_interval_ms: self
+                .definition
+                .safe_background_minimum_interval
+                .as_millis() as u64,
             max_concurrency: self.stored.max_concurrency,
             safe_max_concurrency: self.definition.safe_max_concurrency,
             queued,
@@ -854,6 +916,15 @@ fn validate_override(
             "{} minimumIntervalMs cannot be lower than {}",
             definition.id,
             definition.safe_minimum_interval.as_millis()
+        );
+    }
+    if let Some(interval) = value.background_minimum_interval_ms
+        && interval < definition.safe_background_minimum_interval.as_millis() as u64
+    {
+        anyhow::bail!(
+            "{} backgroundMinimumIntervalMs cannot be lower than {}",
+            definition.id,
+            definition.safe_background_minimum_interval.as_millis()
         );
     }
     if let Some(concurrency) = value.max_concurrency
@@ -900,6 +971,7 @@ mod tests {
                 &definition,
                 &ProviderPolicyOverride {
                     minimum_interval_ms: Some(2_000),
+                    background_minimum_interval_ms: None,
                     max_concurrency: None,
                 }
             )
@@ -910,6 +982,7 @@ mod tests {
                 &definition,
                 &ProviderPolicyOverride {
                     minimum_interval_ms: Some(3_000),
+                    background_minimum_interval_ms: Some(5_000),
                     max_concurrency: Some(1),
                 }
             )
@@ -942,6 +1015,7 @@ mod tests {
                 display_name: "Test".into(),
                 kind: "test".into(),
                 safe_minimum_interval: Duration::ZERO,
+                safe_background_minimum_interval: Duration::ZERO,
                 safe_max_concurrency: 1,
             }],
             &ApiPreferences::default(),
@@ -1003,6 +1077,7 @@ mod tests {
                 display_name: "Test".into(),
                 kind: "test".into(),
                 safe_minimum_interval: Duration::ZERO,
+                safe_background_minimum_interval: Duration::ZERO,
                 safe_max_concurrency: 1,
             }],
             &ApiPreferences::default(),
@@ -1032,5 +1107,47 @@ mod tests {
             governor.status("test").await.expect("status").state,
             ProviderCircuitState::Paused
         );
+    }
+
+    #[tokio::test]
+    async fn background_requests_defer_without_queueing_or_consuming_a_request() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("background-spacing.sqlite"))
+            .await
+            .expect("database");
+        let governor = ProviderGovernor::new(
+            db,
+            vec![ProviderDefinition {
+                id: "test".into(),
+                display_name: "Test".into(),
+                kind: "test".into(),
+                safe_minimum_interval: Duration::ZERO,
+                safe_background_minimum_interval: Duration::from_millis(100),
+                safe_max_concurrency: 1,
+            }],
+            &ApiPreferences::default(),
+        )
+        .await
+        .expect("governor");
+
+        governor
+            .execute("test", RequestClass::Background, || async {
+                Ok::<_, ProviderFailure>(())
+            })
+            .await
+            .expect("first request");
+        let deferred = governor
+            .execute("test", RequestClass::Background, || async {
+                Ok::<_, ProviderFailure>(())
+            })
+            .await;
+        assert!(matches!(
+            deferred,
+            Err(ProviderRequestError::Deferred { .. })
+        ));
+        let status = governor.status("test").await.expect("status");
+        assert_eq!(status.queued.background, 0);
+        assert_eq!(status.background_minimum_interval_ms, 100);
+        assert!(status.last_background_request_at.is_some());
     }
 }

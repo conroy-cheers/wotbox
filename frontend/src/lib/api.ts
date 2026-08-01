@@ -460,6 +460,7 @@ export type ApiPreferences = {
 
 export type ProviderPolicyOverride = {
   minimumIntervalMs?: number;
+  backgroundMinimumIntervalMs?: number;
   maxConcurrency?: number;
 };
 
@@ -481,9 +482,12 @@ export type ProviderStatus = {
   lastSuccessAt?: string;
   lastFailureAt?: string;
   retryAt?: string;
+  lastBackgroundRequestAt?: string;
   consecutiveFailures: number;
   minimumIntervalMs: number;
   safeMinimumIntervalMs: number;
+  backgroundMinimumIntervalMs: number;
+  safeBackgroundMinimumIntervalMs: number;
   maxConcurrency: number;
   safeMaxConcurrency: number;
   queued: {
@@ -501,6 +505,7 @@ export type BackgroundJobState =
   | "pending"
   | "running"
   | "retrying"
+  | "waiting"
   | "completed"
   | "failed"
   | "cancelled";
@@ -510,8 +515,11 @@ export type BackgroundJobStatus = {
   deduplicationKey: string;
   kind: string;
   state: BackgroundJobState;
+  providerId?: string;
+  lane: string;
   priority: number;
   attempts: number;
+  deferrals: number;
   maxAttempts: number;
   nextRunAt?: string;
   leaseUntil?: string;

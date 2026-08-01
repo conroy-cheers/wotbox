@@ -1,4 +1,4 @@
-use sea_orm::{DbErr, EntityTrait, Iden, Schema};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Iden, Schema};
 use sea_orm_migration::{
     MigrationName, MigrationTrait, MigratorTrait, SchemaManager, async_trait::async_trait,
     prelude::Index, sea_query::Table,
@@ -25,7 +25,109 @@ impl MigratorTrait for Migrator {
             Box::new(ChannelProgressSchema),
             Box::new(ProviderSafetySchema),
             Box::new(BackgroundJobSchema),
+            Box::new(BackgroundRetryRepairSchema),
         ]
+    }
+}
+
+struct BackgroundRetryRepairSchema;
+
+impl MigrationName for BackgroundRetryRepairSchema {
+    fn name(&self) -> &str {
+        "m20260801_000007_background_retry_repair"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for BackgroundRetryRepairSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        for column in [
+            background_job::Column::ProviderId,
+            background_job::Column::Lane,
+            background_job::Column::Deferrals,
+        ] {
+            add_column_if_missing(manager, &schema, background_job::Entity, column).await?;
+        }
+        for column in [
+            provider_state::Column::LastBackgroundRequestAt,
+            provider_state::Column::BackgroundMinimumIntervalMs,
+        ] {
+            add_column_if_missing(manager, &schema, provider_state::Entity, column).await?;
+        }
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .name("idx_background_jobs_lane_due")
+                .table(background_job::Entity)
+                .col(background_job::Column::Lane)
+                .col(background_job::Column::State)
+                .col(background_job::Column::NextRunAt)
+                .col(background_job::Column::Priority)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_background_jobs_provider")
+                .table(background_job::Entity)
+                .col(background_job::Column::ProviderId)
+                .col(background_job::Column::State)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+
+        // Retire jobs governed by the legacy retry loop before workers can see them.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                UPDATE background_jobs
+                   SET state = 'cancelled',
+                       lease_owner = NULL,
+                       lease_until = NULL,
+                       next_run_at = NULL,
+                       last_error_code = 'superseded_retry_model',
+                       last_error_message = 'Quarantined during background retry repair',
+                       cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE kind IN ('resolve_download_hash', 'index_tracklist', 'compute_single_coverage')
+                   AND state IN ('pending', 'running', 'retrying', 'waiting');
+
+                UPDATE download_release_links
+                   SET resolution_state = 'not_found',
+                       attempts = 0,
+                       next_retry_at = NULL,
+                       error_code = 'not_found',
+                       error_message = 'OPS did not recognize this torrent hash; manual retry is available',
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE lower(tracker) = 'ops'
+                   AND lower(COALESCE(error_message, '')) LIKE '%bad parameters%';
+
+                UPDATE download_release_links
+                   SET resolution_state = 'pending',
+                       attempts = 0,
+                       next_retry_at = NULL,
+                       error_code = NULL,
+                       error_message = NULL,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE resolution_state IN ('failed', 'resolving')
+                   AND COALESCE(error_code, '') != 'not_found';
+
+                UPDATE release_track_indexes
+                   SET state = 'pending',
+                       attempts = 0,
+                       next_retry_at = NULL,
+                       error_message = NULL,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE state IN ('failed', 'resolving');
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

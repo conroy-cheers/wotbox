@@ -476,9 +476,14 @@ async fn resume_provider(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ProviderStatus>, AppError> {
-    Ok(Json(state.providers.resume(&id).await.map_err(
-        |error| AppError::not_found("provider_not_found", error),
-    )?))
+    let status = state
+        .providers
+        .resume(&id)
+        .await
+        .map_err(|error| AppError::not_found("provider_not_found", error))?;
+    state.db.resume_waiting_jobs_for_provider(&id).await?;
+    state.background_jobs.wake();
+    Ok(Json(status))
 }
 
 #[utoipa::path(get, path = "/health/ready", responses((status = 200, body = Health)))]
@@ -2932,7 +2937,7 @@ async fn retry_download_link(
     if let Some(link) = state.db.get_link(&client_name, &info_hash).await?
         && let Some(tracker) = link.tracker
     {
-        background::enqueue_hash_resolution(&state, &tracker, &info_hash).await?;
+        background::retry_hash_resolution(&state, &tracker, &info_hash).await?;
     }
     Ok(StatusCode::ACCEPTED)
 }
