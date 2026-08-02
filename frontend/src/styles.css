@@ -969,7 +969,7 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
   }
   .mobile-nav a {
     flex: 1 1 0; min-width: 0; flex-direction: column; gap: 3px; padding: 7px 3px;
-    text-align: center; font-size: 9px;
+    text-align: center; font-size: 8px;
   }
   .mobile-nav a.active { color: var(--accent-strong); }
   .page-heading h1 { font-size: 34px; }
@@ -990,6 +990,14 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
   .token-policy > p { grid-column: 1; }
   .preference-reset-actions { align-items: stretch; flex-direction: column; }
   .plan-summary { grid-template-columns: repeat(2, 1fr); }
+  .pack-heading { flex-direction: column; gap: 14px; }
+  .pack-heading > div:first-child { width: 100%; min-width: 0; }
+  .pack-heading .heading-actions { width: 100%; }
+  .pack-heading .heading-actions button { flex: 1 1 0; justify-content: center; }
+  .pack-item > .cover { display: none; }
+  .pack-item .release-content { grid-template-columns: minmax(0, 1fr); }
+  .pack-item .release-content > * { grid-column: 1; }
+  .pack-item-state { align-items: flex-start; }
   .channel-setting-row { grid-template-columns: 1fr; }
   .criterion-list { grid-template-columns: 1fr; }
   .metric-grid { grid-template-columns: 1fr 1fr; gap: 9px; }

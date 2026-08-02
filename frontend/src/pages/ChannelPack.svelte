@@ -181,10 +181,7 @@
                   {item.source.title}
                 {/if}
               </h2>
-              <span>
-                {item.source.year ?? ""}
-                {#if item.plan}<span class="source-badges"><span>{item.plan.tracker.toUpperCase()}</span></span>{/if}
-              </span>
+              <span>{item.source.year ?? ""}</span>
               {#if item.release}
                 <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
               {/if}
