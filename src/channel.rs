@@ -16,15 +16,15 @@ use crate::{
     api::{AppState, assign_search_ids, cache_search_canonical},
     model::{
         ChannelConfig, ChannelKind, ChannelPackItem, ChannelRunPhase, ChannelRunStatus,
-        LastfmChannelSettings, PackItemPlanState, PlannedDownload, RecommendationMatchState,
-        RecommendationSource, RecommendationSubstitution, ReleasePreferences, RuntimePreferences,
-        TorrentVariant,
+        DownloadFile, LastfmChannelSettings, PackItemPlanState, PlannedDownload,
+        RecommendationMatchState, RecommendationSource, RecommendationSubstitution,
+        ReleasePreferences, RuntimePreferences, TorrentVariant, value_i64,
     },
     provider::{
         ProviderFailure, ProviderFailureKind, RequestClass, is_provider_unavailable, retry_after,
     },
     release_matcher::{AUTO_MERGE_THRESHOLD, external_score, normalized},
-    tracker::SearchRequest,
+    tracker::{SearchRequest, TrackerClient},
 };
 
 const APPLE_FEED_ROOT: &str = "https://rss.applemarketingtools.com/api/v2";
@@ -402,6 +402,7 @@ fn parse_apple_chart(body: &Value) -> Result<Vec<RecommendationSource>> {
                 score: None,
                 catalog_country: None,
                 substituted_from: None,
+                lookup_files: Vec::new(),
             })
         })
         .collect())
@@ -589,6 +590,7 @@ async fn fetch_lastfm_recommendations(
             score: Some(artist_score),
             catalog_country: Some(settings.catalog_country.to_ascii_uppercase()),
             substituted_from: None,
+            lookup_files: Vec::new(),
         });
     }
     if recommendations.len() < settings.pack_size as usize {
@@ -781,6 +783,25 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
             continue;
         }
         let digest = Sha256::digest(format!("{}\0{}", link.client, link.info_hash).as_bytes());
+        let lookup_files = if let Some(client) = state.download_clients.get(&link.client) {
+            match client.files(&link.info_hash).await {
+                Ok(files) => files,
+                Err(error) => {
+                    tracing::warn!(
+                        client = link.client,
+                        %error,
+                        "trumped download file list unavailable"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            tracing::warn!(
+                client = link.client,
+                "trumped download client is not configured"
+            );
+            Vec::new()
+        };
         sources.push(RecommendationSource {
             id: format!(
                 "trumped:{}:{}",
@@ -797,6 +818,7 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
             score: None,
             catalog_country: None,
             substituted_from: None,
+            lookup_files,
         });
     }
     Ok(sources)
@@ -1209,23 +1231,59 @@ async fn resolve_trumped_tracker_source(
             Ok((mut page, _)) => {
                 cache_search_canonical(&state.db, tracker_name, &page).await?;
                 assign_search_ids(&state.db, &mut page).await?;
-                let mut matches = page
+                let mut scored = page
                     .groups
                     .into_iter()
-                    .filter_map(|group| {
-                        let score = trumped_group_score(&source, &identities, &group);
-                        (score >= AUTO_MERGE_THRESHOLD).then_some((score, group))
+                    .map(|group| {
+                        let score = trumped_group_score(
+                            &source,
+                            &identities,
+                            request.artist.as_deref(),
+                            &group,
+                        );
+                        (score, group)
                     })
                     .collect::<Vec<_>>();
-                matches
+                scored
                     .sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
+                let matches = scored
+                    .iter()
+                    .filter(|(score, _)| *score >= AUTO_MERGE_THRESHOLD)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let Some((best_score, best)) = matches.first().cloned() else {
+                    let weak = scored
+                        .into_iter()
+                        .filter(|(score, _)| *score >= 0.60)
+                        .collect::<Vec<_>>();
+                    if let Some(best) =
+                        trumped_file_match_choice(tracker.as_ref(), &source.lookup_files, &weak)
+                            .await
+                    {
+                        let release_id = best
+                            .id
+                            .context("file-matched tracker release has no canonical id")?;
+                        return resolve_release(state, source, release_id, preferences)
+                            .await
+                            .map(Some);
+                    }
                     continue;
                 };
                 if let Some((second_score, second)) = matches.get(1)
                     && best.id != second.id
                     && best_score - second_score < 0.03
                 {
+                    if let Some(best) =
+                        trumped_file_match_choice(tracker.as_ref(), &source.lookup_files, &matches)
+                            .await
+                    {
+                        let release_id = best
+                            .id
+                            .context("file-matched tracker release has no canonical id")?;
+                        return resolve_release(state, source, release_id, preferences)
+                            .await
+                            .map(Some);
+                    }
                     return Ok(Some(unresolved_item(
                         source,
                         RecommendationMatchState::Ambiguous,
@@ -1345,7 +1403,65 @@ fn trumped_source_identities(source: &RecommendationSource) -> Vec<(String, Stri
             }
         }
     }
+    for (artist, title) in trumped_file_identities(source) {
+        for artist in trumped_artist_variants(&artist) {
+            push(artist, title.clone());
+        }
+    }
     identities
+}
+
+fn trumped_file_identities(source: &RecommendationSource) -> Vec<(String, String)> {
+    let source_title = normalized(&source.title);
+    source
+        .lookup_files
+        .iter()
+        .filter_map(|file| {
+            let path = std::path::Path::new(&file.name);
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            if !matches!(
+                extension.as_str(),
+                "flac" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "wav" | "ape" | "wv"
+            ) {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let stem = strip_track_number(stem);
+            let (artist, title) = match stem.split_once(" - ") {
+                Some((artist, title))
+                    if !artist.chars().all(|character| character.is_ascii_digit()) =>
+                {
+                    (artist.trim(), title.trim())
+                }
+                _ => (source.artist.trim(), stem.trim()),
+            };
+            let title_normalized = normalized(title);
+            if source_title.is_empty()
+                || (!title_normalized.contains(&source_title)
+                    && !source_title.contains(&title_normalized))
+            {
+                return None;
+            }
+            let artist = artist.replace(", ", " & ");
+            (!artist.is_empty() && !title.is_empty()).then(|| (artist, title.to_owned()))
+        })
+        .collect()
+}
+
+fn strip_track_number(value: &str) -> &str {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_digit())
+        .last()
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or_default();
+    if digits == 0 {
+        return trimmed;
+    }
+    trimmed[digits..]
+        .trim_start_matches(['.', '-', '_', ' '])
+        .trim()
 }
 
 fn trumped_artist_variants(value: &str) -> Vec<String> {
@@ -1430,6 +1546,7 @@ fn strip_trumped_title_suffix(value: &str) -> Option<String> {
 fn trumped_group_score(
     source: &RecommendationSource,
     identities: &[(String, String)],
+    verified_artist: Option<&str>,
     group: &crate::model::SearchGroup,
 ) -> f64 {
     let mut score = 0.0_f64;
@@ -1444,6 +1561,17 @@ fn trumped_group_score(
                 group.year,
                 group.release_type.as_deref(),
             ));
+            if verified_artist.is_some_and(|verified| normalized(verified) == normalized(artist)) {
+                score = score.max(external_score(
+                    title,
+                    artist,
+                    year,
+                    &group.name,
+                    Some(artist),
+                    group.year,
+                    group.release_type.as_deref(),
+                ));
+            }
         }
         if artist.is_empty()
             && normalized(title) == normalized(&group.name)
@@ -1454,6 +1582,13 @@ fn trumped_group_score(
         {
             score = score.max(0.90);
         }
+    }
+
+    if identities
+        .iter()
+        .any(|(_, title)| normalized(title) == normalized(&group.name))
+    {
+        score = (score + 0.03).min(1.0);
     }
 
     if let Some(intent) = trumped_release_intent(&source.title) {
@@ -1476,8 +1611,132 @@ fn trumped_group_score(
         {
             score = (score - 0.12).max(0.0);
         }
+    } else if ["remix", "acoustic", "live"].iter().any(|intent| {
+        normalized(&group.name).contains(intent)
+            || group
+                .release_type
+                .as_deref()
+                .is_some_and(|value| normalized(value).contains(intent))
+            || group.torrents.iter().any(|torrent| {
+                torrent
+                    .remaster_title
+                    .as_deref()
+                    .is_some_and(|value| normalized(value).contains(intent))
+            })
+    }) {
+        score = (score - 0.08).max(0.0);
     }
     score
+}
+
+async fn trumped_file_match_choice(
+    tracker: &dyn TrackerClient,
+    source_files: &[DownloadFile],
+    matches: &[(f64, crate::model::SearchGroup)],
+) -> Option<crate::model::SearchGroup> {
+    if source_audio_manifest(source_files).is_empty() {
+        return None;
+    }
+    let mut scored = Vec::new();
+    for (_, group) in matches.iter().take(4) {
+        let raw = match tracker
+            .group_with_class(group.group_id, RequestClass::Scheduled)
+            .await
+        {
+            Ok((_, raw)) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    tracker = tracker.name(),
+                    group_id = group.group_id,
+                    %error,
+                    "trumped candidate manifest unavailable"
+                );
+                continue;
+            }
+        };
+        scored.push((
+            trumped_manifest_similarity(source_files, group, &raw),
+            group.clone(),
+        ));
+    }
+    scored.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
+    let (best_score, best) = scored.first()?;
+    let second_score = scored
+        .get(1)
+        .map(|candidate| candidate.0)
+        .unwrap_or_default();
+    if *best_score >= 0.60 && best_score - second_score >= 0.15 {
+        tracing::info!(
+            tracker = tracker.name(),
+            group_id = best.group_id,
+            manifest_score = best_score,
+            "resolved trumped release using downloaded file contents"
+        );
+        Some(best.clone())
+    } else {
+        None
+    }
+}
+
+fn trumped_manifest_similarity(
+    source_files: &[DownloadFile],
+    group: &crate::model::SearchGroup,
+    raw: &Value,
+) -> f64 {
+    let source = source_audio_manifest(source_files);
+    if source.is_empty() {
+        return 0.0;
+    }
+    let response = raw.get("response").unwrap_or(raw);
+    let torrents = response
+        .get("torrents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let torrent_ids = group
+        .torrents
+        .iter()
+        .map(|torrent| torrent.torrent_id)
+        .collect::<HashSet<_>>();
+    torrents
+        .filter(|torrent| {
+            value_i64(torrent, &["id", "torrentId"])
+                .is_some_and(|torrent_id| torrent_ids.contains(&torrent_id))
+        })
+        .filter_map(|torrent| torrent.get("fileList").and_then(Value::as_str))
+        .map(|file_list| {
+            let target = file_list
+                .split("|||")
+                .filter_map(|entry| entry.rsplit_once("{{{").map(|(path, _)| path))
+                .filter_map(audio_manifest_name)
+                .collect::<HashSet<_>>();
+            if target.is_empty() {
+                return 0.0;
+            }
+            let intersection = source.intersection(&target).count() as f64;
+            2.0 * intersection / (source.len() + target.len()) as f64
+        })
+        .fold(0.0, f64::max)
+}
+
+fn source_audio_manifest(files: &[DownloadFile]) -> HashSet<String> {
+    files
+        .iter()
+        .filter_map(|file| audio_manifest_name(&file.name))
+        .collect()
+}
+
+fn audio_manifest_name(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "flac" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "wav" | "ape" | "wv"
+    ) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    Some(normalized(strip_track_number(stem)))
 }
 
 fn trumped_release_intent(value: &str) -> Option<&'static str> {
@@ -1754,6 +2013,7 @@ fn apple_sources_from_cache(
                 mbid: source.mbid.clone(),
                 release_type: "single".into(),
             }),
+            lookup_files: Vec::new(),
         })
         .collect())
 }
@@ -2186,18 +2446,18 @@ mod tests {
 
     use crate::model::{
         ChannelConfig, ChannelPackItem, CountryChartChannelSettings, DownloadEligibility,
-        DownloadEligibilityReason, DownloadProfile, LeechStatus, PackItemPlanState,
+        DownloadEligibilityReason, DownloadFile, DownloadProfile, LeechStatus, PackItemPlanState,
         PlannedDownload, RecommendationMatchState, RecommendationSource, ReleasePreferences,
-        RuntimePreferences, SearchGroup, TorrentVariant,
+        RuntimePreferences, SearchGroup, SearchTorrent, TorrentVariant,
     };
 
     use super::{
         apple_chart_url, apple_sources_from_cache, apply_pack_constraints, base_edition_title,
         channel_is_due, compare_variants, get_json_with_retry, lastfm_failure, next_occurrence,
         next_refresh_at, parse_apple_chart, parse_download_release_name, tracker_query_title,
-        trumped_group_score, trumped_identity_component, trumped_search_requests,
-        trumped_source_identities, trumped_source_tracker, validate_channel,
-        validate_channel_refresh,
+        trumped_group_score, trumped_identity_component, trumped_manifest_similarity,
+        trumped_search_requests, trumped_source_identities, trumped_source_tracker,
+        validate_channel, validate_channel_refresh,
     };
 
     #[test]
@@ -2304,6 +2564,7 @@ mod tests {
             score: None,
             catalog_country: None,
             substituted_from: None,
+            lookup_files: Vec::new(),
         }
     }
 
@@ -2349,6 +2610,7 @@ mod tests {
             trumped_group_score(
                 &shivering,
                 &identities,
+                Some("ILLENIUM"),
                 &search_group("Shivering", "ILLENIUM", 2022, "Single")
             ) >= crate::release_matcher::AUTO_MERGE_THRESHOLD
         );
@@ -2361,15 +2623,111 @@ mod tests {
         let remix = trumped_group_score(
             &source,
             &identities,
+            None,
             &search_group("Magnificent", "U2", 2009, "Remix"),
         );
         let single = trumped_group_score(
             &source,
             &identities,
+            None,
             &search_group("Magnificent", "U2", 2009, "Single"),
         );
         assert!(remix >= crate::release_matcher::AUTO_MERGE_THRESHOLD);
         assert!(single < crate::release_matcher::AUTO_MERGE_THRESHOLD);
+    }
+
+    #[test]
+    fn trumped_search_uses_downloaded_file_artist_credits() {
+        let mut source = trumped_source("ILLENIUM", "All That Really Matters", None);
+        source.lookup_files = vec![DownloadFile {
+            name: "release/01. ILLENIUM, Teddy Swims - All That Really Matters.flac".into(),
+            size: 1,
+            progress: 1.0,
+        }];
+        let identities = trumped_source_identities(&source);
+        assert!(identities.iter().any(|(artist, title)| {
+            artist == "ILLENIUM & Teddy Swims" && title == "All That Really Matters"
+        }));
+        assert!(
+            trumped_group_score(
+                &source,
+                &identities,
+                Some("ILLENIUM"),
+                &search_group(
+                    "All That Really Matters",
+                    "ILLENIUM and Teddy Swims",
+                    2022,
+                    "Single"
+                )
+            ) >= crate::release_matcher::AUTO_MERGE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn trumped_search_prefers_an_unqualified_release_over_a_remix_group() {
+        let source = trumped_source("Coldplay", "Every Teardrop Is A Waterfall", Some(2011));
+        let identities = trumped_source_identities(&source);
+        let single = trumped_group_score(
+            &source,
+            &identities,
+            Some("Coldplay"),
+            &search_group("Every Teardrop Is A Waterfall", "Coldplay", 2011, "Single"),
+        );
+        let remix = trumped_group_score(
+            &source,
+            &identities,
+            Some("Coldplay"),
+            &search_group("Every Teardrop Is A Waterfall", "Coldplay", 2011, "Remix"),
+        );
+        assert!(single - remix >= 0.03);
+    }
+
+    #[test]
+    fn trumped_manifest_matching_compares_downloaded_audio_contents() {
+        let source_files = vec![
+            DownloadFile {
+                name: "release/01 - Every Teardrop Is A Waterfall.flac".into(),
+                size: 1,
+                progress: 1.0,
+            },
+            DownloadFile {
+                name: "release/02 - Major Minus.flac".into(),
+                size: 1,
+                progress: 1.0,
+            },
+        ];
+        let mut group = search_group("Every Teardrop Is A Waterfall", "Coldplay", 2011, "Single");
+        group.torrents.push(SearchTorrent {
+            tracker: "ops".into(),
+            torrent_id: 10,
+            edition_id: None,
+            format: Some("FLAC".into()),
+            encoding: Some("Lossless".into()),
+            media: Some("CD".into()),
+            size: None,
+            seeders: None,
+            leechers: None,
+            snatched: None,
+            freeleech: false,
+            leech_status: LeechStatus::Regular,
+            can_use_token: false,
+            eligibility: None,
+            remaster_title: None,
+            info_hash: None,
+            downloads: Vec::new(),
+        });
+        let raw = json!({
+            "response": {
+                "torrents": [{
+                    "id": 10,
+                    "fileList": "01 - Every Teardrop Is A Waterfall.flac{{{1}}}|||02 - Major Minus.flac{{{1}}}"
+                }]
+            }
+        });
+        assert_eq!(
+            trumped_manifest_similarity(&source_files, &group, &raw),
+            1.0
+        );
     }
 
     #[test]
@@ -2561,6 +2919,7 @@ mod tests {
             score: Some(1.0),
             catalog_country: Some("AU".into()),
             substituted_from: None,
+            lookup_files: Vec::new(),
         };
         let candidates = apple_sources_from_cache(
             &source,
@@ -2694,6 +3053,7 @@ mod tests {
                     score: None,
                     catalog_country: None,
                     substituted_from: None,
+                    lookup_files: Vec::new(),
                 },
                 match_state: RecommendationMatchState::Matched,
                 release: None,

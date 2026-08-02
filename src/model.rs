@@ -1521,6 +1521,10 @@ pub struct RecommendationSource {
     pub catalog_country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub substituted_from: Option<RecommendationSubstitution>,
+    /// Local qBittorrent file metadata used only while resolving a trumped download.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub lookup_files: Vec<DownloadFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -5578,6 +5578,7 @@ mod tests {
                 score: None,
                 catalog_country: None,
                 substituted_from: None,
+                lookup_files: Vec::new(),
             },
             match_state: RecommendationMatchState::Unmatched,
             release: None,
