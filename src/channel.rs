@@ -756,7 +756,11 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
             continue;
         };
         let (artist, title, year) = parse_download_release_name(name);
-        let identity = format!("{}\0{}", normalized(&artist), normalized(&title));
+        let identity = format!(
+            "{}\0{}",
+            trumped_identity_component(&artist),
+            trumped_identity_component(&title)
+        );
         if title.is_empty() || !seen.insert(identity) {
             continue;
         }
@@ -791,9 +795,24 @@ fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
     let display = display.split_whitespace().collect::<Vec<_>>().join(" ");
     let year = release_name_year(&display);
     let Some((artist, remainder)) = display.split_once(" - ") else {
+        if let Some((title, artist)) = display.split_once(" ~ ") {
+            return (
+                strip_download_metadata(artist),
+                strip_download_metadata(strip_leading_catalog_code(title)),
+                year,
+            );
+        }
+        let parts = display.split(" · ").map(str::trim).collect::<Vec<_>>();
+        if parts.len() >= 3 && parts[1].parse::<i64>().ok() == year {
+            return (
+                parts[0].to_owned(),
+                strip_download_metadata(&parts[2..].join(" · ")),
+                year,
+            );
+        }
         return (String::new(), strip_download_metadata(&display), year);
     };
-    let artist = artist.trim().to_owned();
+    let artist = strip_leading_year(artist.trim());
     let remainder = remainder.trim();
     let title = if remainder
         .get(..4)
@@ -829,14 +848,22 @@ fn strip_download_metadata(value: &str) -> String {
         " [19",
         " [20",
         " - single",
+        " [single",
+        " (single",
         " [flac",
+        " [cd",
         " [web",
         " (flac",
         " (web",
+        " (320",
+        " [320",
         " (v0",
         " (v2",
         " [v0",
         " [v2",
+        " v0",
+        " v2",
+        " 320",
     ];
     let end = markers
         .iter()
@@ -844,6 +871,41 @@ fn strip_download_metadata(value: &str) -> String {
         .min()
         .unwrap_or(value.len());
     value[..end].trim().trim_end_matches('-').trim().to_owned()
+}
+
+fn strip_leading_year(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('(')
+        && trimmed.get(5..6) == Some(")")
+        && trimmed
+            .get(1..5)
+            .and_then(|year| year.parse::<i64>().ok())
+            .is_some_and(|year| (1900..=2100).contains(&year))
+    {
+        return trimmed[6..].trim().to_owned();
+    }
+    trimmed.to_owned()
+}
+
+fn strip_leading_catalog_code(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[')
+        && let Some(end) = trimmed.find("] ")
+        && trimmed[1..end]
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return trimmed[end + 2..].trim();
+    }
+    trimmed
+}
+
+fn trumped_identity_component(value: &str) -> String {
+    normalized(value)
+        .split_whitespace()
+        .filter(|token| !matches!(*token, "v0" | "v2" | "320" | "flac" | "mp3" | "web" | "cdm"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn resolve_source(
@@ -1243,9 +1305,11 @@ pub async fn resolve_release(
         .get_release_detail(release_id)
         .await?
         .context("canonical release detail is unavailable")?;
-    if !detail.release.release_type.as_deref().is_some_and(|value| {
-        value.eq_ignore_ascii_case("album") || value.eq_ignore_ascii_case("ep")
-    }) {
+    if !source.id.starts_with("trumped:")
+        && !detail.release.release_type.as_deref().is_some_and(|value| {
+            value.eq_ignore_ascii_case("album") || value.eq_ignore_ascii_case("ep")
+        })
+    {
         bail!("only Album and EP releases can be attached to a channel pack");
     }
     let mut variants = detail.variants;
@@ -1629,7 +1693,7 @@ mod tests {
         apple_chart_url, apple_sources_from_cache, apply_pack_constraints, base_edition_title,
         channel_is_due, compare_variants, get_json_with_retry, lastfm_failure, next_occurrence,
         next_refresh_at, parse_apple_chart, parse_download_release_name, tracker_query_title,
-        validate_channel, validate_channel_refresh,
+        trumped_identity_component, validate_channel, validate_channel_refresh,
     };
 
     #[test]
@@ -1658,6 +1722,22 @@ mod tests {
         assert_eq!(
             parse_download_release_name("Bruno Mars - Unorthodox Jukebox (2012) [FLAC]"),
             ("Bruno Mars".into(), "Unorthodox Jukebox".into(), Some(2012))
+        );
+        assert_eq!(
+            parse_download_release_name("Rihanna - Te Amo [Single] 2010 V0"),
+            ("Rihanna".into(), "Te Amo".into(), Some(2010))
+        );
+        assert_eq!(
+            parse_download_release_name("[220729] All That Really Matters ~ ILLENIUM [WEB]"),
+            ("ILLENIUM".into(), "All That Really Matters".into(), None)
+        );
+        assert_eq!(
+            parse_download_release_name("Illenium · 2021 · First Time"),
+            ("Illenium".into(), "First Time".into(), Some(2021))
+        );
+        assert_eq!(
+            trumped_identity_component("Hate That I Love You CDM V0 2007 WRE"),
+            trumped_identity_component("Hate That I Love You CDM 320 2007 WRE")
         );
     }
 
