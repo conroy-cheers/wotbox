@@ -64,10 +64,7 @@ impl ProviderDefinition {
             display_name: name.to_ascii_uppercase(),
             kind: "tracker".into(),
             safe_minimum_interval: Duration::from_millis(2_500),
-            // Gazelle trackers commonly enforce a ten-request rolling minute.
-            // Leave enough margin for clock and response-time variance instead
-            // of running exactly at the theoretical six-second boundary.
-            safe_background_minimum_interval: Duration::from_secs(7),
+            safe_background_minimum_interval: Duration::from_secs(5),
             safe_max_concurrency: 1,
         }
     }
@@ -115,6 +112,14 @@ impl ProviderDefinition {
             safe_max_concurrency: 2,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderRequestLimit {
+    pub bucket: &'static str,
+    pub max_requests: u32,
+    pub interval: Duration,
+    pub failure_retry_after: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,13 +247,24 @@ struct ProviderHandle {
 }
 
 struct Waiter {
-    sender: oneshot::Sender<std::result::Result<(), ProviderRequestError>>,
+    request_limit: Option<ProviderRequestLimit>,
+    sender: oneshot::Sender<std::result::Result<Grant, ProviderRequestError>>,
+}
+
+struct Grant {
+    request_limit_reset_at: Option<DateTime<Utc>>,
+}
+
+struct RequestWindow {
+    reset_at: DateTime<Utc>,
+    requests: u32,
 }
 
 enum Command {
     Acquire {
         class: RequestClass,
-        sender: oneshot::Sender<std::result::Result<(), ProviderRequestError>>,
+        request_limit: Option<ProviderRequestLimit>,
+        sender: oneshot::Sender<std::result::Result<Grant, ProviderRequestError>>,
     },
     Complete(Option<ProviderFailure>, oneshot::Sender<()>),
     Abandoned,
@@ -263,6 +279,7 @@ enum Command {
 
 struct Permit {
     sender: mpsc::UnboundedSender<Command>,
+    request_limit_reset_at: Option<DateTime<Utc>>,
     completed: bool,
 }
 
@@ -289,6 +306,7 @@ struct Actor {
     definition: ProviderDefinition,
     stored: StoredProviderState,
     queues: [VecDeque<Waiter>; PRIORITY_COUNT],
+    request_windows: HashMap<&'static str, RequestWindow>,
     active: u32,
     receiver: mpsc::UnboundedReceiver<Command>,
 }
@@ -349,6 +367,7 @@ impl ProviderGovernor {
                 definition: definition.clone(),
                 stored,
                 queues: array::from_fn(|_| VecDeque::new()),
+                request_windows: HashMap::new(),
                 active: 0,
                 receiver,
             };
@@ -370,13 +389,42 @@ impl ProviderGovernor {
         F: FnOnce() -> Fut,
         Fut: Future<Output = std::result::Result<T, ProviderFailure>>,
     {
-        let permit = self.acquire(provider, class).await?;
+        self.execute_with_limit(provider, class, None, operation)
+            .await
+    }
+
+    pub async fn execute_with_limit<T, F, Fut>(
+        &self,
+        provider: &str,
+        class: RequestClass,
+        request_limit: Option<ProviderRequestLimit>,
+        operation: F,
+    ) -> std::result::Result<T, ProviderRequestError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<T, ProviderFailure>>,
+    {
+        let permit = self.acquire(provider, class, request_limit).await?;
         match operation().await {
             Ok(value) => {
                 permit.complete(None).await;
                 Ok(value)
             }
-            Err(failure) => {
+            Err(mut failure) => {
+                if failure.kind == ProviderFailureKind::RateLimited && failure.retry_after.is_none()
+                {
+                    let known_window = permit
+                        .request_limit_reset_at
+                        .and_then(|reset_at| (reset_at - Utc::now()).to_std().ok());
+                    let conservative_fallback =
+                        request_limit.map(|limit| limit.failure_retry_after);
+                    failure.retry_after = match (known_window, conservative_fallback) {
+                        (Some(known), Some(fallback)) => Some(known.max(fallback)),
+                        (Some(known), None) => Some(known),
+                        (None, Some(fallback)) => Some(fallback),
+                        (None, None) => None,
+                    };
+                }
                 let error = ProviderRequestError::Upstream {
                     provider: provider.into(),
                     failure: failure.message.clone(),
@@ -392,6 +440,7 @@ impl ProviderGovernor {
         &self,
         provider: &str,
         class: RequestClass,
+        request_limit: Option<ProviderRequestLimit>,
     ) -> std::result::Result<Permit, ProviderRequestError> {
         let handle = self
             .providers
@@ -400,9 +449,13 @@ impl ProviderGovernor {
         let (sender, receiver) = oneshot::channel();
         handle
             .sender
-            .send(Command::Acquire { class, sender })
+            .send(Command::Acquire {
+                class,
+                request_limit,
+                sender,
+            })
             .map_err(|_| ProviderRequestError::Stopped(provider.into()))?;
-        let granted = if class.is_background() {
+        let granted = if matches!(class, RequestClass::Scheduled | RequestClass::Background) {
             receiver
                 .await
                 .map_err(|_| ProviderRequestError::Stopped(provider.into()))?
@@ -414,9 +467,10 @@ impl ProviderGovernor {
                 })?
                 .map_err(|_| ProviderRequestError::Stopped(provider.into()))?
         };
-        granted?;
+        let grant = granted?;
         Ok(Permit {
             sender: handle.sender.clone(),
+            request_limit_reset_at: grant.request_limit_reset_at,
             completed: false,
         })
     }
@@ -519,7 +573,11 @@ impl Actor {
 
     async fn handle(&mut self, command: Command) {
         match command {
-            Command::Acquire { class, sender } => {
+            Command::Acquire {
+                class,
+                request_limit,
+                sender,
+            } => {
                 if let Some(error) = self.unavailable_error() {
                     let _ = sender.send(Err(error));
                 } else if self.queue_depth() >= MAX_QUEUE_DEPTH {
@@ -527,14 +585,24 @@ impl Actor {
                         provider: self.definition.id.clone(),
                     }));
                 } else if class.is_background()
-                    && let Some(retry_at) = self.background_defer_until()
+                    && let Some(retry_at) = self.background_defer_until(request_limit)
+                {
+                    let _ = sender.send(Err(ProviderRequestError::Deferred {
+                        provider: self.definition.id.clone(),
+                        retry_at,
+                    }));
+                } else if class == RequestClass::Scheduled
+                    && let Some(retry_at) = self.request_limit_defer_until(request_limit)
                 {
                     let _ = sender.send(Err(ProviderRequestError::Deferred {
                         provider: self.definition.id.clone(),
                         retry_at,
                     }));
                 } else {
-                    self.queues[class.index()].push_back(Waiter { sender });
+                    self.queues[class.index()].push_back(Waiter {
+                        request_limit,
+                        sender,
+                    });
                 }
             }
             Command::Complete(failure, sender) => {
@@ -619,15 +687,9 @@ impl Actor {
             {
                 return;
             }
-            let Some(queue) = self.best_queue() else {
+            let Some(queue) = self.best_ready_queue() else {
                 return;
             };
-            if self
-                .next_eligible_at(queue)
-                .is_some_and(|next| next > Utc::now())
-            {
-                return;
-            }
             let Some(waiter) = self.queues[queue].pop_front() else {
                 continue;
             };
@@ -636,6 +698,9 @@ impl Actor {
             }
             self.active += 1;
             let granted_at = Utc::now();
+            let request_limit_reset_at = waiter
+                .request_limit
+                .map(|limit| self.record_request_limit(limit, granted_at));
             self.stored.last_request_at = Some(granted_at);
             if matches!(
                 queue,
@@ -652,7 +717,9 @@ impl Actor {
                 tracing::error!(provider = %self.definition.id, %error, "could not persist provider request permit");
                 return;
             }
-            let _ = waiter.sender.send(Ok(()));
+            let _ = waiter.sender.send(Ok(Grant {
+                request_limit_reset_at,
+            }));
             if self.stored.minimum_interval_ms > 0 {
                 return;
             }
@@ -815,11 +882,14 @@ impl Actor {
         }
     }
 
-    fn best_queue(&self) -> Option<usize> {
-        self.queues
-            .iter()
-            .enumerate()
-            .find_map(|(index, queue)| (!queue.is_empty()).then_some(index))
+    fn best_ready_queue(&self) -> Option<usize> {
+        let now = Utc::now();
+        self.queues.iter().enumerate().find_map(|(index, queue)| {
+            let waiter = queue.front()?;
+            self.next_eligible_at(index, waiter.request_limit)
+                .is_none_or(|next| next <= now)
+                .then_some(index)
+        })
     }
 
     fn next_wait(&self) -> Option<Duration> {
@@ -832,12 +902,22 @@ impl Actor {
                 .retry_at
                 .and_then(|value| (value - Utc::now()).to_std().ok());
         }
-        self.best_queue()
-            .and_then(|queue| self.next_eligible_at(queue))
+        self.queues
+            .iter()
+            .enumerate()
+            .filter_map(|(queue, waiters)| {
+                let waiter = waiters.front()?;
+                self.next_eligible_at(queue, waiter.request_limit)
+            })
+            .min()
             .and_then(|next| (next - Utc::now()).to_std().ok())
     }
 
-    fn next_eligible_at(&self, queue: usize) -> Option<DateTime<Utc>> {
+    fn next_eligible_at(
+        &self,
+        queue: usize,
+        request_limit: Option<ProviderRequestLimit>,
+    ) -> Option<DateTime<Utc>> {
         let global = self.stored.last_request_at.map(|last| {
             last + chrono::Duration::milliseconds(
                 i64::try_from(self.stored.minimum_interval_ms).unwrap_or(i64::MAX),
@@ -854,14 +934,54 @@ impl Actor {
             })
         })
         .flatten();
-        global.into_iter().chain(background).max()
+        let request_window = self.request_limit_defer_until(request_limit);
+        global
+            .into_iter()
+            .chain(background)
+            .chain(request_window)
+            .max()
     }
 
-    fn background_defer_until(&self) -> Option<DateTime<Utc>> {
+    fn request_limit_defer_until(
+        &self,
+        request_limit: Option<ProviderRequestLimit>,
+    ) -> Option<DateTime<Utc>> {
+        let limit = request_limit?;
+        let window = self.request_windows.get(limit.bucket)?;
+        (window.reset_at > Utc::now() && window.requests >= limit.max_requests)
+            .then_some(window.reset_at)
+    }
+
+    fn record_request_limit(
+        &mut self,
+        limit: ProviderRequestLimit,
+        granted_at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        let interval = chrono::Duration::from_std(limit.interval)
+            .unwrap_or_else(|_| chrono::Duration::minutes(1));
+        let window = self
+            .request_windows
+            .entry(limit.bucket)
+            .or_insert_with(|| RequestWindow {
+                reset_at: granted_at + interval,
+                requests: 0,
+            });
+        if window.reset_at <= granted_at {
+            window.reset_at = granted_at + interval;
+            window.requests = 0;
+        }
+        window.requests = window.requests.saturating_add(1);
+        window.reset_at
+    }
+
+    fn background_defer_until(
+        &self,
+        request_limit: Option<ProviderRequestLimit>,
+    ) -> Option<DateTime<Utc>> {
         let foreground_waiting = self.queues[..RequestClass::Background.index()]
             .iter()
             .any(|queue| !queue.is_empty());
-        let eligible_at = self.next_eligible_at(RequestClass::Background.index());
+        let eligible_at = self.next_eligible_at(RequestClass::Background.index(), request_limit);
         if self.active >= self.stored.max_concurrency || foreground_waiting {
             return Some(
                 eligible_at
@@ -1000,7 +1120,7 @@ mod tests {
                 &definition,
                 &ProviderPolicyOverride {
                     minimum_interval_ms: Some(3_000),
-                    background_minimum_interval_ms: Some(7_000),
+                    background_minimum_interval_ms: Some(5_000),
                     max_concurrency: Some(1),
                 }
             )
@@ -1008,7 +1128,7 @@ mod tests {
         );
         assert_eq!(
             definition.safe_background_minimum_interval,
-            Duration::from_secs(7)
+            Duration::from_secs(5)
         );
     }
 
@@ -1233,5 +1353,110 @@ mod tests {
             .last_background_request_at
             .expect("second bulk timestamp");
         assert!(second_bulk_request - first_bulk_request >= chrono::Duration::milliseconds(300));
+    }
+
+    #[tokio::test]
+    async fn scheduled_endpoint_thresholds_defer_to_the_window_opened_by_the_first_action() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("endpoint-window.sqlite"))
+            .await
+            .expect("database");
+        let governor = ProviderGovernor::new(
+            db,
+            vec![ProviderDefinition {
+                id: "test".into(),
+                display_name: "Test".into(),
+                kind: "test".into(),
+                safe_minimum_interval: Duration::ZERO,
+                safe_background_minimum_interval: Duration::ZERO,
+                safe_max_concurrency: 1,
+            }],
+            &ApiPreferences::default(),
+        )
+        .await
+        .expect("governor");
+        let long_window = ProviderRequestLimit {
+            bucket: "shared",
+            max_requests: 10,
+            interval: Duration::from_secs(60),
+            failure_retry_after: Duration::from_secs(60),
+        };
+        let strict_action = ProviderRequestLimit {
+            bucket: "shared",
+            max_requests: 2,
+            interval: Duration::from_secs(1),
+            failure_retry_after: Duration::from_secs(60),
+        };
+
+        for _ in 0..2 {
+            governor
+                .execute_with_limit("test", RequestClass::Manual, Some(long_window), || async {
+                    Ok::<_, ProviderFailure>(())
+                })
+                .await
+                .expect("request in initial window");
+        }
+        let error = governor
+            .execute_with_limit(
+                "test",
+                RequestClass::Scheduled,
+                Some(strict_action),
+                || async { Ok::<_, ProviderFailure>(()) },
+            )
+            .await
+            .expect_err("strict scheduled action should defer");
+        let ProviderRequestError::Deferred { retry_at, .. } = error else {
+            panic!("expected endpoint-window deferral");
+        };
+        let retry_delay = retry_at - Utc::now();
+        assert!(retry_delay >= chrono::Duration::seconds(30));
+        assert!(retry_delay <= chrono::Duration::seconds(60));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_failures_reuse_the_known_endpoint_window() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("endpoint-retry.sqlite"))
+            .await
+            .expect("database");
+        let governor = ProviderGovernor::new(
+            db,
+            vec![ProviderDefinition {
+                id: "test".into(),
+                display_name: "Test".into(),
+                kind: "test".into(),
+                safe_minimum_interval: Duration::ZERO,
+                safe_background_minimum_interval: Duration::ZERO,
+                safe_max_concurrency: 1,
+            }],
+            &ApiPreferences::default(),
+        )
+        .await
+        .expect("governor");
+        let limit = ProviderRequestLimit {
+            bucket: "shared",
+            max_requests: 5,
+            interval: Duration::from_secs(2),
+            failure_retry_after: Duration::from_secs(2),
+        };
+
+        governor
+            .execute_with_limit("test", RequestClass::Scheduled, Some(limit), || async {
+                Err::<(), _>(ProviderFailure::new(
+                    ProviderFailureKind::RateLimited,
+                    "rate limit exceeded",
+                ))
+            })
+            .await
+            .expect_err("request should be rate-limited");
+        let retry_at = governor
+            .status("test")
+            .await
+            .expect("provider status")
+            .retry_at
+            .expect("retry timestamp");
+        let retry_delay = retry_at - Utc::now();
+        assert!(retry_delay > chrono::Duration::seconds(1));
+        assert!(retry_delay <= chrono::Duration::seconds(2));
     }
 }

@@ -15,8 +15,37 @@ use crate::{
         ReleaseSource, ReleaseSummary, SearchGroup, SearchPage, SearchTorrent, TorrentMetadata,
         TorrentVariant, sanitized, value_bool, value_f64, value_i64, value_string,
     },
-    provider::{ProviderFailure, ProviderFailureKind, ProviderGovernor, RequestClass, retry_after},
+    provider::{
+        ProviderFailure, ProviderFailureKind, ProviderGovernor, ProviderRequestLimit, RequestClass,
+        retry_after,
+    },
 };
+
+const OPS_AJAX_BUCKET: &str = "ops_ajax_user";
+
+fn ops_ajax_limit(action: &str) -> Option<ProviderRequestLimit> {
+    // OPS uses one per-user cache counter for every limited AJAX action. The
+    // first action opens the fixed window, while each later action applies its
+    // own threshold to that shared count. These values mirror the public OPS
+    // Gazelle dispatcher; use the documented counts rather than its accidental
+    // two-request off-by-one allowance.
+    let (max_requests, interval_seconds) = match action {
+        "artist" => (15, 30),
+        "browse" => (5, 10),
+        "torrentgroup" => (15, 60),
+        _ => return None,
+    };
+    Some(ProviderRequestLimit {
+        bucket: OPS_AJAX_BUCKET,
+        max_requests,
+        interval: Duration::from_secs(interval_seconds),
+        // The cache counter is per user and retains the expiry selected by the
+        // first limited action. If another client consumed the account budget,
+        // the local window cannot reveal whether OPS is enforcing the 60-second
+        // torrentgroup window, so an actual rejection must assume the maximum.
+        failure_retry_after: Duration::from_secs(60),
+    })
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchRequest {
@@ -202,7 +231,14 @@ impl GazelleTrackerClient {
         };
         match &self.governor {
             Some(governor) => governor
-                .execute(&self.provider_id, class, operation)
+                .execute_with_limit(
+                    &self.provider_id,
+                    class,
+                    matches!(self.kind, TrackerKind::Ops)
+                        .then(|| ops_ajax_limit(action))
+                        .flatten(),
+                    operation,
+                )
                 .await
                 .map_err(Into::into),
             None => operation()
@@ -1144,6 +1180,28 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn ops_ajax_limits_match_the_public_dispatcher() {
+        let browse = ops_ajax_limit("browse").expect("browse limit");
+        assert_eq!(browse.max_requests, 5);
+        assert_eq!(browse.interval, Duration::from_secs(10));
+        assert_eq!(browse.failure_retry_after, Duration::from_secs(60));
+
+        let artist = ops_ajax_limit("artist").expect("artist limit");
+        assert_eq!(artist.max_requests, 15);
+        assert_eq!(artist.interval, Duration::from_secs(30));
+        assert_eq!(artist.bucket, browse.bucket);
+
+        let group = ops_ajax_limit("torrentgroup").expect("torrent group limit");
+        assert_eq!(group.max_requests, 15);
+        assert_eq!(group.interval, Duration::from_secs(60));
+        assert_eq!(group.bucket, browse.bucket);
+
+        assert!(ops_ajax_limit("index").is_none());
+        assert!(ops_ajax_limit("torrent").is_none());
+        assert!(ops_ajax_limit("download").is_none());
+    }
 
     #[test]
     fn search_cache_keys_are_deterministic() {
