@@ -4,6 +4,7 @@
   import { api, appPath, formatBytes, relativeTime, type DownloadsPage, type ProviderStatus, type TrackerAccount } from "../lib/api";
   import StatusPill from "../lib/StatusPill.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
+  import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import { releaseViewPath } from "../lib/routing";
 
@@ -109,6 +110,7 @@
               {item.release.artist ?? "Various artists"} · {item.variant.format ?? "Unknown format"} ·
               {download.diagnostic?.summary ?? (download.addedAt ? relativeTime(download.addedAt) : download.clientState)}
             </span>
+            <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
           </div>
           <StatusPill state={download.state} />
         </article>

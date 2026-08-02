@@ -17,6 +17,7 @@
   import StaleNotice from "../lib/StaleNotice.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
+  import TrackerLinks from "../lib/TrackerLinks.svelte";
   import DownloadDiagnostic from "../lib/DownloadDiagnostic.svelte";
   import { sanitizeReleaseDescription } from "../lib/releaseDescription";
   import {
@@ -168,6 +169,7 @@
       <p class="release-byline">
         {[detail.release.artist, detail.release.year, detail.release.releaseType, detail.recordLabel].filter(Boolean).join(" · ")}
       </p>
+      <TrackerLinks sources={detail.release.sources} tracker={detail.release.tracker} groupId={detail.release.groupId} />
       <div class="tag-list">
         {#each detail.tags.slice(0, 8) as tag}<span>{tag}</span>{/each}
       </div>

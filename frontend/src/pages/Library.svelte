@@ -14,6 +14,7 @@
   } from "../lib/api";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
+  import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { oneOf, positiveInteger, replaceView } from "../lib/routing";
 
   const routeParams = new URLSearchParams(location.search);
@@ -279,6 +280,7 @@
                     </span>
                   {/if}
                 </p>
+                <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
                 <div class="variant-chips">
                   {#each item.variants as variant}
                     <a href={item.release.id ? appPath(`/releases/${item.release.id}?torrent=${variant.torrentId}&from=library`) : undefined}>

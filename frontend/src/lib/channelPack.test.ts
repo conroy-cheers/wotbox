@@ -14,6 +14,8 @@ function item(
     source: { id: `source:${ordinal}`, rank: ordinal, artist: "Artist", title: `Album ${ordinal}` },
     matchState: "matched",
     variants: [],
+    candidates: [],
+    downloads: [],
     planState,
     plan: planState === "executable"
       ? {

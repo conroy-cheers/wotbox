@@ -13,6 +13,7 @@ export type Envelope<T> = {
 export type PublicConfig = {
   basePath: string;
   trackers: string[];
+  trackerSites: Record<string, string>;
   downloadProfiles: string[];
 };
 
@@ -171,6 +172,13 @@ export type LiveDownloadStatus = {
   savePath: string;
   addedAt?: string;
   completedAt?: string;
+};
+
+export type ReleaseDownload = {
+  name: string;
+  tracker?: string;
+  inLibrary: boolean;
+  live: LiveDownloadStatus;
 };
 
 export type ReleaseSummary = {
@@ -641,6 +649,8 @@ export type ChannelPackItem = {
   matchState: "matched" | "unmatched" | "ambiguous" | "error";
   release?: ReleaseSummary;
   variants: TorrentVariant[];
+  candidates: ReleaseSummary[];
+  downloads: ReleaseDownload[];
   planState:
     | "executable"
     | "already_owned"

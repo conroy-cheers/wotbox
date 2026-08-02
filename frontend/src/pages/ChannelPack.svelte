@@ -13,6 +13,9 @@
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import { executableOrdinals, summarizeSelection } from "../lib/channelPack";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
+  import ReleaseCandidatePicker from "../lib/ReleaseCandidatePicker.svelte";
+  import ReleaseDownloads from "../lib/ReleaseDownloads.svelte";
+  import TrackerLinks from "../lib/TrackerLinks.svelte";
 
   let { id }: { id: string } = $props();
   const initialId = untrack(() => id);
@@ -30,6 +33,17 @@
   const replan = createMutation({
     mutationFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}/replan`, { method: "POST" }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] })
+  });
+  const attach = createMutation({
+    mutationFn: ({ ordinal, releaseId, version }: { ordinal: number; releaseId: string; version: number }) =>
+      api<ChannelPack>(`/api/v1/channel-packs/${initialId}/items/${ordinal}/attach`, {
+        method: "POST",
+        body: JSON.stringify({ planVersion: version, releaseId })
+      }),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["channel-pack", initialId], updated);
+      queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] });
+    }
   });
   const decide = createMutation({
     mutationFn: ({
@@ -129,6 +143,7 @@
   {/if}
   {#if $decide.isError}<div class="error-panel">{$decide.error.message}</div>{/if}
   {#if $replan.isError}<div class="error-panel">{$replan.error.message}</div>{/if}
+  {#if $attach.isError}<div class="error-panel">{$attach.error.message}</div>{/if}
 
   <section class="plan-summary">
     <div><strong>{visibleSummary.executable}</strong><span>{current.decision === "open" ? "Selected" : "Ready"}</span></div>
@@ -170,6 +185,9 @@
                 {item.source.year ?? ""}
                 {#if item.plan}<span class="source-badges"><span>{item.plan.tracker.toUpperCase()}</span></span>{/if}
               </span>
+              {#if item.release}
+                <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
+              {/if}
             </div>
             {#if item.source.url}<a class="icon-link" href={item.source.url} target="_blank" rel="noreferrer" aria-label="Open source"><ExternalLink size={15} /></a>{/if}
           </div>
@@ -184,6 +202,7 @@
               · mapped to this containing release
             </div>
           {/if}
+          <ReleaseDownloads downloads={item.downloads} />
           {#if item.release}
             <PreferredVariants
               variants={item.variants}
@@ -193,6 +212,16 @@
               title={item.release.title}
               source="channels"
               onadd={(variant) => choose(item, variant)}
+            />
+          {:else if item.candidates.length}
+            <ReleaseCandidatePicker
+              candidates={item.candidates}
+              pending={$attach.isPending}
+              onselect={(candidate) => candidate.id && $attach.mutate({
+                ordinal: item.ordinal,
+                releaseId: candidate.id,
+                version: current.planVersion
+              })}
             />
           {/if}
           <div class="pack-item-state">

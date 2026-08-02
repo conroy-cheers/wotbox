@@ -862,6 +862,35 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
 .substitution-note a, .substitution-note strong { color: var(--accent-strong); }
 .channel-attach-action { display: flex; justify-content: flex-end; margin-bottom: 8px; }
 .channel-attach-action button { display: inline-flex; align-items: center; gap: 6px; }
+.tracker-links { display: inline-flex; align-items: center; gap: 5px; margin-top: 5px; }
+.tracker-links a {
+  display: inline-flex; align-items: center; gap: 3px; padding: 2px 6px;
+  border: 1px solid var(--line); border-radius: 999px; color: var(--accent-strong);
+  font-size: 9px; font-weight: 750; letter-spacing: .05em;
+}
+.tracker-links a:hover { border-color: #6f62a8; background: rgba(168,149,255,.08); }
+.release-downloads, .release-candidate-picker {
+  display: grid; gap: 7px; margin: 10px 0; padding: 9px;
+  border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.012);
+}
+.release-download-row, .release-candidate-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  min-width: 0; padding: 6px 7px;
+}
+.release-download-row + .release-download-row,
+.release-candidate-row + .release-candidate-row { border-top: 1px solid var(--line); }
+.release-download-row > div, .release-candidate-row > div { min-width: 0; }
+.release-download-row strong, .release-download-row small,
+.release-candidate-row strong, .release-candidate-row small { display: block; }
+.release-download-row strong, .release-candidate-row strong {
+  overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap;
+}
+.release-download-row small, .release-candidate-row small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.release-candidate-picker > p {
+  margin: 0 7px 2px; color: var(--muted); font-size: 9px; font-weight: 800;
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.release-candidate-row button { flex: 0 0 auto; }
 .channel-preferences { min-height: 0; margin-top: 18px; }
 .channel-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .channel-setting-card { background: rgba(255,255,255,.012); }
@@ -971,6 +1000,9 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
   .cover { width: 58px; height: 58px; }
   .release-heading { display: block; }
   .release-heading .tag-list { display: none; }
+  .release-download-row, .release-candidate-row { align-items: flex-start; }
+  .release-candidate-row { flex-direction: column; }
+  .release-candidate-row button { width: 100%; justify-content: center; }
   .torrent-row { grid-template-columns: minmax(0,1fr) 58px 94px; }
   .torrent-size, .peer-count { display: none; }
   .torrent-flags { justify-content: flex-end; }

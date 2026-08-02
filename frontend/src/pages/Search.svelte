@@ -6,6 +6,7 @@
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
+  import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import {
     browserViewPath,
@@ -300,6 +301,7 @@
                   </span>
                 {/if}
               </span>
+              <TrackerLinks sources={group.sources} tracker={group.tracker} groupId={group.groupId} />
             </div>
             <div class="tag-list">
               {#each group.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}

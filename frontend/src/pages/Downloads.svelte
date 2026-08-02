@@ -5,6 +5,7 @@
   import { api, formatBytes, formatSpeed, relativeTime, type DownloadsPage } from "../lib/api";
   import DownloadDiagnostic from "../lib/DownloadDiagnostic.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
+  import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import { positiveInteger, releaseViewPath, replaceView } from "../lib/routing";
 
@@ -83,6 +84,7 @@
               </a>
             </h2>
             <p>{item.release.artist ?? "Various artists"} · {[item.release.year, item.release.releaseType, item.variant.format, item.variant.encoding].filter(Boolean).join(" · ")} · {formatBytes(download.size)}</p>
+            <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
           </div>
           <StatusPill state={download.state} />
         </div>
