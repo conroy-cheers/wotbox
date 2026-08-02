@@ -1,8 +1,23 @@
 export type Provenance = {
   tracker: string;
-  fetchedAt: string;
-  cacheAgeSeconds: number;
+  fetchedAt?: string;
+  cacheAgeSeconds?: number;
   stale: boolean;
+  sources: SourceProvenance[];
+};
+
+export type SnapshotState = "fresh" | "stale" | "missing";
+
+export type SourceProvenance = {
+  providerId: string;
+  tracker: string;
+  state: SnapshotState;
+  fetchedAt?: string;
+  cacheAgeSeconds?: number;
+  refreshJobId?: string;
+  refreshState?: BackgroundJobState;
+  retryAt?: string;
+  errorCode?: string;
 };
 
 export type Envelope<T> = {
@@ -642,10 +657,11 @@ export type ChannelRun = {
   channelId: string;
   trigger: "scheduled" | "manual";
   status: "running" | "successful" | "partial" | "failed";
-  phase?: "discovering" | "matching" | "planning" | "saving";
+  phase?: "discovering" | "matching" | "waiting_provider" | "planning" | "saving";
   progressCompleted: number;
   progressTotal?: number;
   progressMessage?: string;
+  retryAt?: string;
   packId?: string;
   error?: string;
   startedAt: string;

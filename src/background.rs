@@ -36,6 +36,7 @@ pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
 pub const NOTIFY_PLEX: &str = "notify_plex";
 pub const SUBMIT_DOWNLOAD: &str = "submit_download";
 pub const PROCESS_IMPORT: &str = "process_import";
+pub const REFRESH_ARTIST_CATALOG: &str = "refresh_artist_catalog";
 
 const WORKER_LANES: [&str; 6] = [
     "event",
@@ -269,6 +270,50 @@ pub async fn enqueue_track_index(
         },
     )
     .await
+}
+
+pub async fn enqueue_artist_catalog_refresh(
+    state: &AppState,
+    tracker: &str,
+    artist_id: i64,
+    interactive: bool,
+    force: bool,
+) -> Result<crate::model::BackgroundJobStatus> {
+    let key = format!(
+        "refresh-artist-catalog:{}:{}:v1",
+        tracker.to_ascii_lowercase(),
+        artist_id
+    );
+    if force {
+        state.db.retry_background_job_by_key(&key).await?;
+    } else {
+        state.db.retry_completed_background_job_by_key(&key).await?;
+    }
+    enqueue(
+        state,
+        EnqueueBackgroundJob {
+            deduplication_key: &key,
+            kind: REFRESH_ARTIST_CATALOG,
+            payload: json!({
+                "tracker": tracker,
+                "artistId": artist_id,
+                "interactive": interactive,
+            }),
+            provider_id: Some(format!("tracker:{tracker}")),
+            lane: "sync",
+            priority: if interactive { 35 } else { 5 },
+            max_attempts: 8,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: None,
+        },
+    )
+    .await?;
+    state
+        .db
+        .background_job_by_key(&key)
+        .await?
+        .context("artist catalog refresh job disappeared after enqueue")
 }
 
 pub async fn enqueue_single_coverage(
@@ -558,8 +603,33 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
         NOTIFY_PLEX => notify_plex(state, &job.payload).await,
         SUBMIT_DOWNLOAD => submit_download(state, &job.payload).await,
         PROCESS_IMPORT => process_import(state, &job.payload).await,
+        REFRESH_ARTIST_CATALOG => refresh_artist_catalog(state, &job.payload).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtistCatalogRefreshPayload {
+    tracker: String,
+    artist_id: i64,
+    interactive: bool,
+}
+
+async fn refresh_artist_catalog(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+    let payload: ArtistCatalogRefreshPayload = serde_json::from_value(payload.clone())?;
+    crate::api::refresh_artist_catalog(
+        state.clone(),
+        payload.tracker,
+        payload.artist_id,
+        if payload.interactive {
+            RequestClass::Interactive
+        } else {
+            RequestClass::Background
+        },
+    )
+    .await?;
+    Ok(JobOutcome::Complete)
 }
 
 #[derive(Deserialize)]

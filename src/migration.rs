@@ -30,7 +30,34 @@ impl MigratorTrait for Migrator {
             Box::new(QueryPerformanceSchema),
             Box::new(OpsTorrentDiagnosisSchema),
             Box::new(ImportQueueSchema),
+            Box::new(ChannelProviderWaitSchema),
         ]
+    }
+}
+
+struct ChannelProviderWaitSchema;
+
+impl MigrationName for ChannelProviderWaitSchema {
+    fn name(&self) -> &str {
+        "m20260803_000012_channel_provider_wait"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ChannelProviderWaitSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        add_column_if_missing(
+            manager,
+            &schema,
+            channel_run::Entity,
+            channel_run::Column::RetryAt,
+        )
+        .await
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

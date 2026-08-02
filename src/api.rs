@@ -41,8 +41,8 @@ use crate::{
         LibraryArtistSummary, LibraryArtistsPage, LibraryAvailability, LibraryCopy,
         LibraryIndexStatus, LibraryRelease, LibraryVariantState, LiveDownloadStatus,
         PlexIntegrationStatus, PlexScanQueued, Provenance, ProviderStatus, PublicConfig,
-        ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage, TorrentMetadata,
-        TorrentVariant, value_i64,
+        ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage, SnapshotState,
+        SourceProvenance, TorrentMetadata, TorrentVariant, value_i64,
     },
     plex::PlexIntegration,
     provider::{
@@ -1003,10 +1003,12 @@ async fn start_channel_run(
             Ok((pack_id, status)) => {
                 let _ = task_state
                     .db
-                    .finish_channel_run(task_run.id, status, Some(pack_id), None)
+                    .finish_channel_run(task_run.id, status.clone(), Some(pack_id), None)
                     .await;
                 if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
-                    current.last_successful_at = Some(Utc::now());
+                    if status == ChannelRunStatus::Successful {
+                        current.last_successful_at = Some(Utc::now());
+                    }
                     current.last_error = None;
                     current.failure_count = 0;
                     current.updated_at = Utc::now();
@@ -2043,14 +2045,15 @@ async fn artist_catalog(
         enrich_cross_tracker_artist_catalog(&state, &tracker_name, &mut response.data).await?;
         enrich_artist_catalog(&state, &tracker_name, id, &mut response.data).await?;
         if stale {
-            let refresh_state = state.clone();
-            let refresh_tracker = tracker_name.clone();
-            tokio::spawn(async move {
-                if let Err(error) = refresh_artist_catalog(refresh_state, refresh_tracker, id).await
-                {
-                    tracing::warn!(%error, "asynchronous artist catalog refresh failed");
-                }
-            });
+            let job =
+                background::enqueue_artist_catalog_refresh(&state, &tracker_name, id, false, false)
+                    .await?;
+            if let Some(source) = response.provenance.sources.first_mut() {
+                source.refresh_job_id = Some(job.id);
+                source.refresh_state = Some(job.state);
+                source.retry_at = job.next_run_at;
+                source.error_code = job.last_error_code;
+            }
         }
         return Ok(Json(response));
     }
@@ -2117,35 +2120,69 @@ async fn canonical_artist_catalog(
         .ok_or_else(|| AppError::not_found("artist_not_found", "Artist was not found"))?;
     let sources = state.db.artist_sources_for(id).await?;
     let mut snapshot_groups = Vec::new();
-    let mut stale = false;
+    let mut source_provenance = Vec::new();
     for source in sources {
+        let provider_id = format!("tracker:{}", source.tracker);
         let Some(artist_id) = source.artist_id else {
+            source_provenance.push(SourceProvenance {
+                provider_id,
+                tracker: source.tracker,
+                state: SnapshotState::Missing,
+                fetched_at: None,
+                cache_age_seconds: None,
+                refresh_job_id: None,
+                refresh_state: None,
+                retry_at: None,
+                error_code: Some("artist_source_unresolved".into()),
+            });
             continue;
         };
         let cached = state
             .db
             .get_snapshot::<ArtistCatalogPage>(&source.tracker, "artist", &artist_id.to_string())
             .await?;
-        let mut source_stale = true;
-        let mut source_empty = true;
+        let fetched_at = cached.as_ref().map(|cached| cached.fetched_at);
+        let source_state = match cached.as_ref() {
+            Some(cached) if cached.expires_at > Utc::now() => SnapshotState::Fresh,
+            Some(_) => SnapshotState::Stale,
+            None => SnapshotState::Missing,
+        };
         if let Some(cached) = cached {
-            source_stale = cached.expires_at <= Utc::now();
-            source_empty = cached.value.groups.is_empty();
             snapshot_groups.extend(cached.value.groups);
         }
-        stale |= source_stale;
-        if (query.refresh || source_stale || source_empty)
+        let refresh_job = if (query.refresh || source_state != SnapshotState::Fresh)
             && state.trackers.contains_key(&source.tracker)
         {
-            let refresh_state = state.clone();
-            let tracker = source.tracker.clone();
-            tokio::spawn(async move {
-                if let Err(error) = refresh_artist_catalog(refresh_state, tracker, artist_id).await
-                {
-                    tracing::warn!(%error, "canonical artist source refresh failed");
-                }
-            });
-        }
+            Some(
+                background::enqueue_artist_catalog_refresh(
+                    &state,
+                    &source.tracker,
+                    artist_id,
+                    query.refresh || source_state == SnapshotState::Missing,
+                    query.refresh,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let provider = state.providers.status(&provider_id).await;
+        source_provenance.push(SourceProvenance {
+            provider_id,
+            tracker: source.tracker,
+            state: source_state,
+            fetched_at,
+            cache_age_seconds: fetched_at.map(|value| (Utc::now() - value).num_seconds().max(0)),
+            refresh_job_id: refresh_job.as_ref().map(|job| job.id),
+            refresh_state: refresh_job.as_ref().map(|job| job.state),
+            retry_at: refresh_job
+                .as_ref()
+                .and_then(|job| job.next_run_at)
+                .or_else(|| provider.as_ref().and_then(|status| status.retry_at)),
+            error_code: refresh_job
+                .and_then(|job| job.last_error_code)
+                .or_else(|| provider.and_then(|status| status.reason_code)),
+        });
     }
 
     let source_keys = snapshot_groups
@@ -2295,9 +2332,22 @@ async fn canonical_artist_catalog(
         deduplication: Default::default(),
     };
     enrich_artist_deduplication_batched(&state, &mut page, &preferences.release).await?;
+    let fetched_at = source_provenance
+        .iter()
+        .filter_map(|source| source.fetched_at)
+        .min();
+    let stale = source_provenance
+        .iter()
+        .any(|source| source.state != SnapshotState::Fresh);
     Ok(Json(ApiEnvelope {
         data: page,
-        provenance: provenance("canonical", Utc::now(), stale),
+        provenance: Provenance {
+            tracker: "canonical".into(),
+            fetched_at,
+            cache_age_seconds: fetched_at.map(|value| (Utc::now() - value).num_seconds().max(0)),
+            stale,
+            sources: source_provenance,
+        },
     }))
 }
 
@@ -4545,14 +4595,17 @@ async fn refresh_group(state: Arc<AppState>, tracker_name: String, id: i64) -> R
         .await
 }
 
-async fn refresh_artist_catalog(state: Arc<AppState>, tracker_name: String, id: i64) -> Result<()> {
+pub(crate) async fn refresh_artist_catalog(
+    state: Arc<AppState>,
+    tracker_name: String,
+    id: i64,
+    class: RequestClass,
+) -> Result<()> {
     let tracker = state
         .trackers
         .get(&tracker_name)
         .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
-    let (catalog, raw) = tracker
-        .artist_catalog_with_class(id, RequestClass::Background)
-        .await?;
+    let (catalog, raw) = tracker.artist_catalog_with_class(id, class).await?;
     cache_artist_catalog(&state.db, &catalog).await?;
     seed_catalog_deduplication(&state, &tracker_name, &catalog).await?;
     let now = Utc::now();
@@ -4612,11 +4665,27 @@ fn envelope<T>(tracker: &str, cached: Cached<T>, stale: bool) -> ApiEnvelope<T> 
 }
 
 fn provenance(tracker: &str, fetched_at: chrono::DateTime<Utc>, stale: bool) -> Provenance {
+    let cache_age_seconds = (Utc::now() - fetched_at).num_seconds().max(0);
     Provenance {
         tracker: tracker.to_owned(),
-        fetched_at,
-        cache_age_seconds: (Utc::now() - fetched_at).num_seconds().max(0),
+        fetched_at: Some(fetched_at),
+        cache_age_seconds: Some(cache_age_seconds),
         stale,
+        sources: vec![SourceProvenance {
+            provider_id: format!("tracker:{tracker}"),
+            tracker: tracker.to_owned(),
+            state: if stale {
+                SnapshotState::Stale
+            } else {
+                SnapshotState::Fresh
+            },
+            fetched_at: Some(fetched_at),
+            cache_age_seconds: Some(cache_age_seconds),
+            refresh_job_id: None,
+            refresh_state: None,
+            retry_at: None,
+            error_code: None,
+        }],
     }
 }
 

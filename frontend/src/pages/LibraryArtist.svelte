@@ -75,11 +75,23 @@
       ),
       enabled: true,
       staleTime: 60_000,
-      refetchInterval: 30_000,
+      refetchInterval: (query: { state: { data?: Envelope<ArtistCatalogPage> } }) => {
+        const sources = query.state.data?.provenance.sources ?? [];
+        return sources.some((source) =>
+          ["pending", "running", "retrying", "completed"].includes(source.refreshState ?? "")
+        ) ? 5_000 : false;
+      },
       retry: false
     };
   });
   const catalog = createQuery(catalogOptions);
+
+  async function retryCatalog(): Promise<void> {
+    await api<Envelope<ArtistCatalogPage>>(
+      `/api/v1/artists/${encodeURIComponent(initialId)}?refresh=true`
+    );
+    await $catalog.refetch();
+  }
 
   const filteredGroups = derived(
     [artist, catalog, search, format, ownership, sort],
@@ -289,7 +301,7 @@
     </div>
   {/if}
 
-  <StaleNotice provenance={$catalog.data?.provenance} />
+  <StaleNotice provenance={$catalog.data?.provenance} onrefresh={retryCatalog} />
 
   {#if $catalog.data?.data.deduplication}
     <DeduplicationProgress

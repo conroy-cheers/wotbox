@@ -291,6 +291,9 @@ main { margin-left: 240px; width: min(1220px, calc(100% - 240px)); padding: 54px
 .search-welcome p, .empty-state span { margin: 0; font-size: 13px; }
 .stale-notice, .error-panel { display: flex; align-items: center; gap: 8px; padding: 11px 13px; margin: 0 0 14px; border-radius: 9px; font-size: 12px; }
 .stale-notice { border: 1px solid #6a582e; background: rgba(148,111,36,.1); color: #e2c77d; }
+.stale-notice > div { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
+.stale-notice a { margin-left: auto; color: #f0dc9b; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.stale-notice .inline-link { margin-left: auto; color: #f0dc9b; font-size: 10px; white-space: nowrap; }
 .error-panel { border: 1px solid #63373c; background: rgba(147,55,63,.11); color: #ffabb0; }
 .error-panel.compact { margin-top: 14px; margin-bottom: 0; }
 .submission-status { display: flex; align-items: center; gap: 10px; padding: 11px 13px; margin-top: 14px; border: 1px solid #4d476c; border-radius: 9px; color: #d1c8ff; background: rgba(118,100,213,.11); }

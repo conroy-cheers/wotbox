@@ -432,7 +432,6 @@ impl ProviderGovernor {
         statuses
     }
 
-    #[cfg(test)]
     pub async fn status(&self, provider: &str) -> Option<ProviderStatus> {
         let handle = self.providers.get(provider)?;
         let (sender, receiver) = oneshot::channel();
@@ -635,7 +634,11 @@ impl Actor {
             self.active += 1;
             let granted_at = Utc::now();
             self.stored.last_request_at = Some(granted_at);
-            if queue == RequestClass::Background.index() {
+            if matches!(
+                queue,
+                value if value == RequestClass::Scheduled.index()
+                    || value == RequestClass::Background.index()
+            ) {
                 self.stored.last_background_request_at = Some(granted_at);
             }
             if let Err(error) = self.persist().await {
@@ -837,16 +840,17 @@ impl Actor {
                 i64::try_from(self.stored.minimum_interval_ms).unwrap_or(i64::MAX),
             )
         });
-        let background = (queue == RequestClass::Background.index())
-            .then(|| {
-                self.stored.last_background_request_at.map(|last| {
-                    last + chrono::Duration::milliseconds(
-                        i64::try_from(self.stored.background_minimum_interval_ms)
-                            .unwrap_or(i64::MAX),
-                    )
-                })
+        let background = ([RequestClass::Scheduled, RequestClass::Background]
+            .into_iter()
+            .any(|class| class.index() == queue))
+        .then(|| {
+            self.stored.last_background_request_at.map(|last| {
+                last + chrono::Duration::milliseconds(
+                    i64::try_from(self.stored.background_minimum_interval_ms).unwrap_or(i64::MAX),
+                )
             })
-            .flatten();
+        })
+        .flatten();
         global.into_iter().chain(background).max()
     }
 
@@ -1160,5 +1164,67 @@ mod tests {
         assert_eq!(status.queued.background, 0);
         assert_eq!(status.background_minimum_interval_ms, 60_000);
         assert!(status.last_background_request_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn scheduled_requests_use_bulk_spacing_without_delaying_interactive_work() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("scheduled-spacing.sqlite"))
+            .await
+            .expect("database");
+        let governor = ProviderGovernor::new(
+            db,
+            vec![ProviderDefinition {
+                id: "test".into(),
+                display_name: "Test".into(),
+                kind: "test".into(),
+                safe_minimum_interval: Duration::ZERO,
+                safe_background_minimum_interval: Duration::from_millis(300),
+                safe_max_concurrency: 1,
+            }],
+            &ApiPreferences::default(),
+        )
+        .await
+        .expect("governor");
+
+        governor
+            .execute("test", RequestClass::Scheduled, || async {
+                Ok::<_, ProviderFailure>(())
+            })
+            .await
+            .expect("first scheduled request");
+        let first_bulk_request = governor
+            .status("test")
+            .await
+            .expect("first status")
+            .last_background_request_at
+            .expect("first bulk timestamp");
+
+        governor
+            .execute("test", RequestClass::Interactive, || async {
+                Ok::<_, ProviderFailure>(())
+            })
+            .await
+            .expect("interactive request");
+        let interactive_status = governor.status("test").await.expect("interactive status");
+        assert_eq!(
+            interactive_status.last_background_request_at,
+            Some(first_bulk_request)
+        );
+        assert!(interactive_status.last_request_at > Some(first_bulk_request));
+
+        governor
+            .execute("test", RequestClass::Scheduled, || async {
+                Ok::<_, ProviderFailure>(())
+            })
+            .await
+            .expect("second scheduled request");
+        let second_bulk_request = governor
+            .status("test")
+            .await
+            .expect("second status")
+            .last_background_request_at
+            .expect("second bulk timestamp");
+        assert!(second_bulk_request - first_bulk_request >= chrono::Duration::milliseconds(300));
     }
 }

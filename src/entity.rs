@@ -472,6 +472,7 @@ pub mod channel_run {
         pub progress_completed: i32,
         pub progress_total: Option<i32>,
         pub progress_message: Option<String>,
+        pub retry_at: Option<String>,
         pub pack_id: Option<String>,
         pub error: Option<String>,
         pub started_at: String,

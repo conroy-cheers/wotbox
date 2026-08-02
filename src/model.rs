@@ -73,9 +73,41 @@ pub struct DownloadEligibility {
 #[serde(rename_all = "camelCase")]
 pub struct Provenance {
     pub tracker: String,
-    pub fetched_at: DateTime<Utc>,
-    pub cache_age_seconds: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_age_seconds: Option<i64>,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceProvenance>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotState {
+    Fresh,
+    Stale,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceProvenance {
+    pub provider_id: String,
+    pub tracker: String,
+    pub state: SnapshotState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_age_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_state: Option<BackgroundJobState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1561,6 +1593,7 @@ pub enum ChannelRunTrigger {
 pub enum ChannelRunPhase {
     Discovering,
     Matching,
+    WaitingProvider,
     Planning,
     Saving,
 }
@@ -1580,6 +1613,8 @@ pub struct ChannelRun {
     pub progress_total: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

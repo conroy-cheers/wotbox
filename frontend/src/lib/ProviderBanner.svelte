@@ -2,6 +2,7 @@
   import { createQuery } from "@tanstack/svelte-query";
   import { AlertTriangle } from "@lucide/svelte";
   import { api, appPath, type ProviderStatus } from "./api";
+  import { providerStatusSummary } from "./providerStatus";
 
   const providers = createQuery({
     queryKey: ["providers"],
@@ -21,7 +22,7 @@
     <div>
       <strong>External services are limited</strong>
       <span>
-        {affected.map((provider) => `${provider.displayName} (${provider.state})`).join(", ")}.
+        {affected.map(providerStatusSummary).join("; ")}.
         Cached library data remains available.
       </span>
     </div>

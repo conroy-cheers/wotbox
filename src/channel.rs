@@ -24,7 +24,8 @@ use crate::{
         TrumpedDownloadRef, value_i64,
     },
     provider::{
-        ProviderFailure, ProviderFailureKind, RequestClass, is_provider_unavailable, retry_after,
+        ProviderFailure, ProviderFailureKind, ProviderRequestError, RequestClass,
+        is_provider_unavailable, retry_after,
     },
     release_matcher::{AUTO_MERGE_THRESHOLD, external_score, normalized},
     tracker::{SearchRequest, TrackerClient},
@@ -324,6 +325,21 @@ pub async fn refresh_channel(
     if sources.is_empty() && !empty_source_is_valid {
         bail!("recommendation source returned no usable albums");
     }
+    if matches!(channel.kind, ChannelKind::TrumpedDownloads) {
+        for tracker in sources
+            .iter()
+            .filter_map(|source| trumped_source_tracker(&source.id))
+            .collect::<HashSet<_>>()
+        {
+            if !state
+                .trackers
+                .keys()
+                .any(|configured| configured.eq_ignore_ascii_case(tracker))
+            {
+                bail!("origin tracker {tracker} is not configured");
+            }
+        }
+    }
 
     let preferences = state.db.get_runtime_preferences().await?;
     let fingerprint = preference_fingerprint(&state, &preferences)?;
@@ -351,9 +367,26 @@ pub async fn refresh_channel(
                 Some(&format!("Matching {} — {}", source.artist, source.title)),
             )
             .await?;
-        let item = match resolve_source(&state, source.clone(), &preferences, &download_index).await
+        let item = match resolve_source_with_provider_recovery(
+            &state,
+            run_id,
+            index as u32,
+            source_total,
+            source.clone(),
+            &preferences,
+            &download_index,
+        )
+        .await
         {
             Ok(item) => item,
+            Err(error) if is_provider_unavailable(&error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "tracker became unavailable while matching {} — {}",
+                        source.artist, source.title
+                    )
+                });
+            }
             Err(error) => {
                 partial = true;
                 ChannelPackItem {
@@ -407,6 +440,78 @@ pub async fn refresh_channel(
         } else {
             ChannelRunStatus::Successful
         },
+    ))
+}
+
+async fn resolve_source_with_provider_recovery(
+    state: &Arc<AppState>,
+    run_id: uuid::Uuid,
+    completed: u32,
+    total: u32,
+    source: RecommendationSource,
+    preferences: &RuntimePreferences,
+    download_index: &ReleaseDownloadIndex,
+) -> Result<ChannelPackItem> {
+    loop {
+        match resolve_source(state, source.clone(), preferences, download_index).await {
+            Ok(item) => return Ok(item),
+            Err(error) => {
+                let Some((provider, retry_at)) = provider_retry(&state.providers, &error).await
+                else {
+                    return Err(error);
+                };
+                let message = format!(
+                    "{provider} is temporarily limited; retrying {} — {} after cooldown",
+                    source.artist, source.title
+                );
+                state
+                    .db
+                    .wait_channel_run_for_provider(run_id, completed, total, &message, retry_at)
+                    .await?;
+                let delay = (retry_at - Utc::now())
+                    .to_std()
+                    .unwrap_or_else(|_| std::time::Duration::from_millis(1));
+                tokio::time::sleep(delay).await;
+                state
+                    .db
+                    .update_channel_run_progress(
+                        run_id,
+                        ChannelRunPhase::Matching,
+                        completed,
+                        Some(total),
+                        Some(&format!("Retrying {} — {}", source.artist, source.title)),
+                    )
+                    .await?;
+            }
+        }
+    }
+}
+
+async fn provider_retry(
+    providers: &crate::provider::ProviderGovernor,
+    error: &anyhow::Error,
+) -> Option<(String, DateTime<Utc>)> {
+    let error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderRequestError>())?;
+    let provider_id = error.provider_id()?.to_owned();
+    let status = providers.status(&provider_id).await;
+    let retry_at = match error {
+        ProviderRequestError::Unavailable {
+            retry_at: Some(retry_at),
+            ..
+        }
+        | ProviderRequestError::Deferred { retry_at, .. } => Some(*retry_at),
+        ProviderRequestError::Busy { .. } => Some(Utc::now() + ChronoDuration::seconds(5)),
+        ProviderRequestError::Upstream {
+            kind: ProviderFailureKind::RateLimited,
+            ..
+        } => status.as_ref().and_then(|status| status.retry_at),
+        _ => None,
+    }?;
+    Some((
+        status.map_or(provider_id, |status| status.display_name),
+        retry_at.max(Utc::now() + ChronoDuration::seconds(1)),
     ))
 }
 
@@ -1365,6 +1470,7 @@ async fn resolve_tracker_source(
         queries.push(base);
     }
     let mut tracker_errors = Vec::new();
+    let mut unavailable_error = None;
     let mut successful_lookups = 0usize;
     for (name, tracker) in &state.trackers {
         for query in &queries {
@@ -1394,7 +1500,11 @@ async fn resolve_tracker_source(
                 }
                 Err(error) => {
                     tracing::warn!(tracker = name, %error, "channel tracker lookup failed");
-                    tracker_errors.push(format!("{name}: {error}"));
+                    let message = format!("{name}: {error}");
+                    if unavailable_error.is_none() && is_provider_unavailable(&error) {
+                        unavailable_error = Some(error);
+                    }
+                    tracker_errors.push(message);
                 }
             }
         }
@@ -1419,6 +1529,9 @@ async fn resolve_tracker_source(
     matches.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
     let Some((best_score, best)) = matches.first().cloned() else {
         if successful_lookups == 0 && !tracker_errors.is_empty() {
+            if let Some(error) = unavailable_error {
+                return Err(error);
+            }
             bail!("tracker lookup incomplete: {}", tracker_errors.join("; "));
         }
         return Ok(None);
@@ -1551,6 +1664,9 @@ async fn resolve_trumped_tracker_source(
             }
             Err(error) => {
                 tracing::warn!(tracker = tracker_name, %error, "trumped replacement lookup failed");
+                if is_provider_unavailable(&error) {
+                    return Err(error);
+                }
                 last_error = Some(error);
             }
         }

@@ -195,7 +195,8 @@ impl GazelleTrackerClient {
             if body.get("status").and_then(Value::as_str) != Some("success") {
                 return Err(ProviderFailure::from_message(format!(
                     "tracker rejected request: {message}"
-                )));
+                ))
+                .retry_after(retry));
             }
             Ok(body)
         };
@@ -1135,7 +1136,12 @@ mod tests {
         matchers::{header, method, path, query_param, query_param_is_missing},
     };
 
-    use crate::config::{TrackerConfig, TrackerKind};
+    use crate::{
+        config::{TrackerConfig, TrackerKind},
+        db::Database,
+        model::ApiPreferences,
+        provider::{ProviderDefinition, ProviderGovernor},
+    };
 
     use super::*;
 
@@ -1392,6 +1398,61 @@ mod tests {
 
         let (catalog, _) = client.artist_catalog(10).await.expect("artist lookup");
         assert_eq!(catalog.artist.name, "The Artist");
+    }
+
+    #[tokio::test]
+    async fn preserves_retry_after_from_semantic_rate_limit_responses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ajax.php"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(serde_json::json!({
+                        "status": "failure",
+                        "error": "Rate limit exceeded"
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let directory = tempdir().expect("temporary directory");
+        let token_path = directory.path().join("token");
+        std::fs::write(&token_path, "tracker-token").expect("write token");
+        let db = Database::open(&directory.path().join("provider.sqlite"))
+            .await
+            .expect("database");
+        let governor = ProviderGovernor::new(
+            db,
+            vec![ProviderDefinition::tracker("ops")],
+            &ApiPreferences::default(),
+        )
+        .await
+        .expect("provider governor");
+        let client = GazelleTrackerClient::governed(
+            "ops".into(),
+            &TrackerConfig {
+                kind: TrackerKind::Ops,
+                base_url: server.uri(),
+                token_file: token_path,
+                announce_hosts: vec!["home.opsfet.ch".into()],
+            },
+            governor.clone(),
+        )
+        .expect("tracker client");
+
+        client
+            .artist_catalog(10)
+            .await
+            .expect_err("rate limit should fail");
+        let retry_at = governor
+            .status("tracker:ops")
+            .await
+            .expect("provider status")
+            .retry_at
+            .expect("retry timestamp");
+        let delay = retry_at - chrono::Utc::now();
+        assert!(delay >= chrono::Duration::seconds(110));
+        assert!(delay <= chrono::Duration::seconds(120));
     }
 
     #[tokio::test]

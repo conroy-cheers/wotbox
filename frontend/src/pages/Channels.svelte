@@ -69,6 +69,7 @@
     switch (run.phase) {
       case "discovering": return "Discovering recommendations";
       case "matching": return "Matching tracker releases";
+      case "waiting_provider": return "Waiting for tracker";
       case "planning": return "Building download plan";
       case "saving": return "Saving pack";
       default: return "Starting refresh";
@@ -148,6 +149,9 @@
               <span>
                 <strong>{phaseLabel(overview.activeRun)}</strong>
                 <small>{overview.activeRun.progressMessage ?? "Preparing…"}</small>
+                {#if overview.activeRun.retryAt}
+                  <small>Retrying at {new Date(overview.activeRun.retryAt).toLocaleString()}</small>
+                {/if}
               </span>
               <span>
                 {#if overview.activeRun.progressTotal}

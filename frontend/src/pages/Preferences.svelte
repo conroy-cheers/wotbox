@@ -703,7 +703,7 @@
                 <small>Safe minimum: {provider.safeMinimumIntervalMs.toLocaleString()} ms</small>
               </label>
               <label class="dialog-field">
-                <span>Background interval (ms)</span>
+                <span>Bulk/background interval (ms)</span>
                 <input
                   type="number"
                   min={provider.safeBackgroundMinimumIntervalMs}
@@ -712,7 +712,7 @@
                   onchange={(event) =>
                     setProviderPolicy(provider, "backgroundMinimumIntervalMs", event.currentTarget.value)}
                 />
-                <small>Safe background minimum: {provider.safeBackgroundMinimumIntervalMs.toLocaleString()} ms</small>
+                <small>Safe bulk minimum: {provider.safeBackgroundMinimumIntervalMs.toLocaleString()} ms</small>
               </label>
               <label class="dialog-field">
                 <span>Maximum concurrency</span>

@@ -341,6 +341,8 @@ impl Database {
         {
             let id = Uuid::parse_str(&model.id)?;
             let mut active = model.clone().into_active_model();
+            active.kind = Set(request.kind.into());
+            active.payload_json = Set(request.payload);
             active.priority = Set(model.priority.max(request.priority));
             active.max_attempts = Set(i64::from(request.max_attempts.max(1)));
             active.parent_id = Set(request.parent_id.map(|value| value.to_string()));
@@ -947,6 +949,40 @@ impl Database {
             .transpose()
     }
 
+    pub async fn background_job_by_key(&self, key: &str) -> Result<Option<BackgroundJobStatus>> {
+        background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(key))
+            .one(&self.connection)
+            .await?
+            .map(background_job_status)
+            .transpose()
+    }
+
+    pub async fn retry_completed_background_job_by_key(&self, key: &str) -> Result<bool> {
+        let Some(model) = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(key))
+            .filter(background_job::Column::State.eq("completed"))
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut active = model.into_active_model();
+        active.state = Set("pending".into());
+        active.attempts = Set(0);
+        active.deferrals = Set(0);
+        active.next_run_at = Set(None);
+        active.progress_completed = Set(0);
+        active.progress_total = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(None);
+        active.last_error_message = Set(None);
+        active.finished_at = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(true)
+    }
+
     pub async fn resume_waiting_jobs_for_provider(&self, provider_id: &str) -> Result<u64> {
         let now = Utc::now().to_rfc3339();
         Ok(background_job::Entity::update_many()
@@ -1209,6 +1245,7 @@ impl Database {
             let mut active = model.into_active_model();
             active.status = Set("failed".into());
             active.error = Set(Some(message.into()));
+            active.retry_at = Set(None);
             let now = Utc::now().to_rfc3339();
             active.updated_at = Set(now.clone());
             active.finished_at = Set(Some(now));
@@ -1249,6 +1286,7 @@ impl Database {
             progress_completed: 0,
             progress_total: None,
             progress_message: Some("Contacting recommendation source".into()),
+            retry_at: None,
             pack_id: None,
             error: None,
             started_at: now,
@@ -1264,6 +1302,7 @@ impl Database {
             progress_completed: Set(0),
             progress_total: Set(None),
             progress_message: Set(run.progress_message.clone()),
+            retry_at: Set(None),
             pack_id: Set(None),
             error: Set(None),
             started_at: Set(run.started_at.to_rfc3339()),
@@ -1299,6 +1338,7 @@ impl Database {
             active.status = Set(channel_run_status(&status).into());
             active.pack_id = Set(pack_id.map(|value| value.to_string()));
             active.error = Set(error.map(|value| value.chars().take(500).collect()));
+            active.retry_at = Set(None);
             let now = Utc::now().to_rfc3339();
             active.updated_at = Set(now.clone());
             active.finished_at = Set(Some(now));
@@ -1325,6 +1365,34 @@ impl Database {
             active.progress_completed = Set(completed.min(i32::MAX as u32) as i32);
             active.progress_total = Set(total.map(|value| value.min(i32::MAX as u32) as i32));
             active.progress_message = Set(message.map(|value| value.chars().take(200).collect()));
+            active.retry_at = Set(None);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn wait_channel_run_for_provider(
+        &self,
+        id: Uuid,
+        completed: u32,
+        total: u32,
+        message: &str,
+        retry_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if let Some(model) = channel_run::Entity::find_by_id(id.to_string())
+            .filter(channel_run::Column::Status.eq("running"))
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.phase = Set(Some(
+                channel_run_phase(&ChannelRunPhase::WaitingProvider).into(),
+            ));
+            active.progress_completed = Set(completed.min(i32::MAX as u32) as i32);
+            active.progress_total = Set(Some(total.min(i32::MAX as u32) as i32));
+            active.progress_message = Set(Some(message.chars().take(200).collect()));
+            active.retry_at = Set(Some(retry_at.to_rfc3339()));
             active.updated_at = Set(Utc::now().to_rfc3339());
             active.update(&self.connection).await?;
         }
@@ -5342,6 +5410,7 @@ fn channel_run_phase(value: &ChannelRunPhase) -> &'static str {
     match value {
         ChannelRunPhase::Discovering => "discovering",
         ChannelRunPhase::Matching => "matching",
+        ChannelRunPhase::WaitingProvider => "waiting_provider",
         ChannelRunPhase::Planning => "planning",
         ChannelRunPhase::Saving => "saving",
     }
@@ -5372,6 +5441,7 @@ fn channel_run_from_model(model: channel_run::Model) -> Result<ChannelRun> {
         phase: match model.phase.as_deref() {
             Some("discovering") => Some(ChannelRunPhase::Discovering),
             Some("matching") => Some(ChannelRunPhase::Matching),
+            Some("waiting_provider") => Some(ChannelRunPhase::WaitingProvider),
             Some("planning") => Some(ChannelRunPhase::Planning),
             Some("saving") => Some(ChannelRunPhase::Saving),
             _ => None,
@@ -5379,6 +5449,7 @@ fn channel_run_from_model(model: channel_run::Model) -> Result<ChannelRun> {
         progress_completed: model.progress_completed.max(0) as u32,
         progress_total: model.progress_total.map(|value| value.max(0) as u32),
         progress_message: model.progress_message,
+        retry_at: model.retry_at.as_deref().map(parse_timestamp).transpose()?,
         pack_id: model.pack_id.as_deref().map(Uuid::parse_str).transpose()?,
         error: model.error,
         started_at: parse_timestamp(&model.started_at)?,
@@ -5898,6 +5969,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_refresh_jobs_reactivate_and_accept_priority_upgrades() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("refresh-jobs.sqlite"))
+            .await
+            .expect("database");
+        let key = "refresh-artist-catalog:ops:10:v1";
+        let id = db
+            .enqueue_background_job(EnqueueBackgroundJob {
+                deduplication_key: key,
+                kind: "refresh_artist_catalog",
+                payload: serde_json::json!({
+                    "tracker": "ops",
+                    "artistId": 10,
+                    "interactive": false,
+                }),
+                provider_id: Some("tracker:ops".into()),
+                lane: "sync",
+                priority: 5,
+                max_attempts: 8,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            })
+            .await
+            .expect("enqueue refresh");
+        background_job::Entity::update_many()
+            .col_expr(
+                background_job::Column::State,
+                sea_orm::sea_query::Expr::value("completed"),
+            )
+            .filter(background_job::Column::Id.eq(id.to_string()))
+            .exec(&db.connection)
+            .await
+            .expect("complete refresh");
+
+        assert!(
+            db.retry_completed_background_job_by_key(key)
+                .await
+                .expect("reactivate refresh")
+        );
+        db.enqueue_background_job(EnqueueBackgroundJob {
+            deduplication_key: key,
+            kind: "refresh_artist_catalog",
+            payload: serde_json::json!({
+                "tracker": "ops",
+                "artistId": 10,
+                "interactive": true,
+            }),
+            provider_id: Some("tracker:ops".into()),
+            lane: "sync",
+            priority: 35,
+            max_attempts: 8,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: None,
+        })
+        .await
+        .expect("upgrade refresh");
+
+        let stored = background_job::Entity::find_by_id(id.to_string())
+            .one(&db.connection)
+            .await
+            .expect("load refresh")
+            .expect("refresh exists");
+        assert_eq!(stored.state, "pending");
+        assert_eq!(stored.priority, 35);
+        assert_eq!(
+            stored
+                .payload_json
+                .get("interactive")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            db.background_job_by_key(key)
+                .await
+                .expect("refresh status")
+                .expect("refresh status exists")
+                .state,
+            crate::model::BackgroundJobState::Pending
+        );
+    }
+
+    #[tokio::test]
     async fn job_claims_respect_provider_windows_and_in_flight_work() {
         let directory = tempdir().expect("temporary directory");
         let db = Database::open(&directory.path().join("provider-claims.sqlite"))
@@ -6374,6 +6529,44 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("restarted"))
         );
+    }
+
+    #[tokio::test]
+    async fn channel_runs_expose_provider_wait_progress_and_retry_time() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("channel-wait.sqlite"))
+            .await
+            .expect("database");
+        db.ensure_default_channels().await.expect("seed channels");
+        let run = db
+            .create_channel_run("trumped_downloads", ChannelRunTrigger::Manual)
+            .await
+            .expect("create run")
+            .expect("new run");
+        let retry_at = Utc::now() + Duration::minutes(15);
+
+        db.wait_channel_run_for_provider(
+            run.id,
+            12,
+            53,
+            "tracker:ops is temporarily limited",
+            retry_at,
+        )
+        .await
+        .expect("wait for provider");
+
+        let waiting = db
+            .get_channel_run(run.id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(
+            waiting.phase,
+            Some(crate::model::ChannelRunPhase::WaitingProvider)
+        );
+        assert_eq!(waiting.progress_completed, 12);
+        assert_eq!(waiting.progress_total, Some(53));
+        assert_eq!(waiting.retry_at, Some(retry_at));
     }
 
     #[tokio::test]

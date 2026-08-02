@@ -25,7 +25,9 @@
     canonical_backfill: "Update library identities",
     enrich_library_artists: "Enrich library artists",
     notify_plex: "Notify Plex",
-    submit_download: "Submit download"
+    submit_download: "Submit download",
+    process_import: "Replace trumped download",
+    refresh_artist_catalog: "Refresh artist catalogue"
   };
   const stateOrder: BackgroundJobState[] = [
     "running",
@@ -55,6 +57,9 @@
     }
     if (job.kind === "scan_download_client") {
       return parts.slice(1).join(":");
+    }
+    if (job.kind === "refresh_artist_catalog") {
+      return `${parts[1]?.toUpperCase()} artist #${parts[2]}`;
     }
     if (job.kind === "notify_plex") {
       return "Partial music library scan";
