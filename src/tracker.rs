@@ -39,6 +39,10 @@ fn ops_ajax_limit(action: &str) -> Option<ProviderRequestLimit> {
         bucket: OPS_AJAX_BUCKET,
         max_requests,
         interval: Duration::from_secs(interval_seconds),
+        // OPS starts its cache TTL only after the request reaches the server.
+        // Our permit timestamp necessarily precedes that, and cache expiry may
+        // have whole-second granularity, so do not retry exactly on our edge.
+        window_safety_margin: Duration::from_secs(2),
         // The cache counter is per user and retains the expiry selected by the
         // first limited action. If another client consumed the account budget,
         // the local window cannot reveal whether OPS is enforcing the 60-second
@@ -1186,6 +1190,7 @@ mod tests {
         let browse = ops_ajax_limit("browse").expect("browse limit");
         assert_eq!(browse.max_requests, 5);
         assert_eq!(browse.interval, Duration::from_secs(10));
+        assert_eq!(browse.window_safety_margin, Duration::from_secs(2));
         assert_eq!(browse.failure_retry_after, Duration::from_secs(60));
 
         let artist = ops_ajax_limit("artist").expect("artist limit");

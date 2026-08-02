@@ -119,6 +119,7 @@ pub struct ProviderRequestLimit {
     pub bucket: &'static str,
     pub max_requests: u32,
     pub interval: Duration,
+    pub window_safety_margin: Duration,
     pub failure_retry_after: Duration,
 }
 
@@ -957,8 +958,9 @@ impl Actor {
         limit: ProviderRequestLimit,
         granted_at: DateTime<Utc>,
     ) -> DateTime<Utc> {
-        let interval = chrono::Duration::from_std(limit.interval)
-            .unwrap_or_else(|_| chrono::Duration::minutes(1));
+        let interval =
+            chrono::Duration::from_std(limit.interval.saturating_add(limit.window_safety_margin))
+                .unwrap_or_else(|_| chrono::Duration::minutes(1));
         let window = self
             .request_windows
             .entry(limit.bucket)
@@ -1379,12 +1381,14 @@ mod tests {
             bucket: "shared",
             max_requests: 10,
             interval: Duration::from_secs(60),
+            window_safety_margin: Duration::from_secs(2),
             failure_retry_after: Duration::from_secs(60),
         };
         let strict_action = ProviderRequestLimit {
             bucket: "shared",
             max_requests: 2,
             interval: Duration::from_secs(1),
+            window_safety_margin: Duration::ZERO,
             failure_retry_after: Duration::from_secs(60),
         };
 
@@ -1409,8 +1413,8 @@ mod tests {
             panic!("expected endpoint-window deferral");
         };
         let retry_delay = retry_at - Utc::now();
-        assert!(retry_delay >= chrono::Duration::seconds(30));
-        assert!(retry_delay <= chrono::Duration::seconds(60));
+        assert!(retry_delay > chrono::Duration::seconds(60));
+        assert!(retry_delay <= chrono::Duration::seconds(62));
     }
 
     #[tokio::test]
@@ -1437,6 +1441,7 @@ mod tests {
             bucket: "shared",
             max_requests: 5,
             interval: Duration::from_secs(2),
+            window_safety_margin: Duration::ZERO,
             failure_retry_after: Duration::from_secs(2),
         };
 
