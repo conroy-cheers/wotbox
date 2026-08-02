@@ -1,8 +1,10 @@
 <script lang="ts">
   import { createQuery, useQueryClient } from "@tanstack/svelte-query";
-  import { ArrowDown, ArrowUp, CirclePause, GripVertical, Library, Play, Radio, RefreshCw, RotateCcw, Save } from "@lucide/svelte";
+  import { ArrowDown, ArrowUp, CirclePause, GripVertical, Library, Play, Radio, RefreshCw, RotateCcw } from "@lucide/svelte";
+  import { onMount } from "svelte";
   import {
     api,
+    appPath,
     type ChannelConfig,
     type ChannelOverview,
     type PlexIntegrationStatus,
@@ -60,19 +62,58 @@
     structuredClone(defaultReleasePreferences.trackerPolicies)
   );
   let loaded = $state(false);
-  let saving = $state(false);
-  let saved = $state(false);
   let error = $state("");
+  let savedRuntimePayload = $state("");
+  let runtimeSaveState = $state<"idle" | "pending" | "saving" | "error">("idle");
+  let runtimeSaveInFlight = false;
   let channelDrafts = $state<ChannelConfig[]>([]);
   let channelLoaded = $state(false);
-  let channelSaving = $state("");
   let channelError = $state("");
+  let savedChannelPayloads = $state<Record<string, string>>({});
+  let channelSaveState = $state<"idle" | "pending" | "saving" | "error">("idle");
+  let channelSaveInFlight = false;
   let apiPolicies = $state<Record<string, ProviderPolicyOverride>>({});
   let providerAction = $state("");
   let providerError = $state("");
   let plexScanning = $state(false);
   let plexMessage = $state("");
   let plexError = $state("");
+
+  type PreferenceSection =
+    | "download-planning"
+    | "quality-media"
+    | "api-safety"
+    | "plex"
+    | "channels"
+    | "background-work";
+
+  const sectionGroups: {
+    label: string;
+    items: { id: PreferenceSection; label: string; description: string }[];
+  }[] = [
+    {
+      label: "Downloads",
+      items: [
+        { id: "download-planning", label: "Trackers & cost", description: "Priority, profiles, and tokens" },
+        { id: "quality-media", label: "Quality & ranking", description: "Formats, cutoffs, and tie-breaks" }
+      ]
+    },
+    {
+      label: "Services",
+      items: [
+        { id: "api-safety", label: "API safety", description: "Limits and provider state" },
+        { id: "plex", label: "Plex", description: "Library scan notifications" }
+      ]
+    },
+    {
+      label: "Automation",
+      items: [
+        { id: "channels", label: "Channels", description: "Sources and schedules" },
+        { id: "background-work", label: "Background work", description: "Queue progress and failures" }
+      ]
+    }
+  ];
+  let activeSection = $state<PreferenceSection>("download-planning");
 
   const criterionLabels: Record<VariantSortCriterion, string> = {
     quality: "Quality",
@@ -82,17 +123,63 @@
   };
   let draggedCriterion = $state<number | null>(null);
 
+  onMount(() => {
+    function syncSectionFromHash() {
+      const id = location.hash.slice(1);
+      if (sectionGroups.some((group) => group.items.some((item) => item.id === id))) {
+        activeSection = id as PreferenceSection;
+      }
+    }
+
+    syncSectionFromHash();
+    addEventListener("hashchange", syncSectionFromHash);
+    return () => removeEventListener("hashchange", syncSectionFromHash);
+  });
+
   $effect(() => {
     if (!loaded && $preferences.data) {
       load($preferences.data);
+      savedRuntimePayload = JSON.stringify(payload());
       loaded = true;
     }
   });
   $effect(() => {
     if (!channelLoaded && $channels.data) {
       channelDrafts = structuredClone($channels.data.map((overview) => overview.channel));
+      for (const channel of channelDrafts) {
+        if (channel.countryChart && !Number.isInteger(channel.countryChart.albumCount)) {
+          channel.countryChart.albumCount = 100;
+        }
+      }
+      savedChannelPayloads = Object.fromEntries(
+        channelDrafts.map((channel) => [channel.id, JSON.stringify(channel)])
+      );
       channelLoaded = true;
     }
+  });
+  $effect(() => {
+    if (!loaded) return;
+    const serialized = JSON.stringify(payload());
+    if (serialized === savedRuntimePayload) {
+      if (!runtimeSaveInFlight) runtimeSaveState = "idle";
+      return;
+    }
+    runtimeSaveState = "pending";
+    const timer = setTimeout(() => void flushRuntimeAutosave(), 700);
+    return () => clearTimeout(timer);
+  });
+  $effect(() => {
+    if (!channelLoaded) return;
+    const dirty = channelDrafts.some(
+      (channel) => JSON.stringify(channel) !== savedChannelPayloads[channel.id]
+    );
+    if (!dirty) {
+      if (!channelSaveInFlight) channelSaveState = "idle";
+      return;
+    }
+    channelSaveState = "pending";
+    const timer = setTimeout(() => void flushChannelAutosave(), 700);
+    return () => clearTimeout(timer);
   });
 
   function load(value: RuntimePreferences) {
@@ -156,31 +243,40 @@
     });
   }
 
-  async function save() {
-    saving = true;
-    saved = false;
+  async function flushRuntimeAutosave() {
+    if (runtimeSaveInFlight) return;
+    const serialized = JSON.stringify(payload());
+    if (serialized === savedRuntimePayload) return;
+    runtimeSaveInFlight = true;
+    runtimeSaveState = "saving";
     error = "";
     try {
       const value = await api<RuntimePreferences>("/api/v1/preferences", {
         method: "PUT",
-        body: JSON.stringify(payload())
+        body: serialized
       });
       queryClient.setQueryData(["preferences"], value);
-      load(value);
-      saved = true;
+      savedRuntimePayload = serialized;
+      runtimeSaveState = JSON.stringify(payload()) === serialized ? "idle" : "pending";
     } catch (cause) {
       error = cause instanceof Error ? cause.message : "Unable to save preferences";
+      runtimeSaveState = "error";
+      setTimeout(() => {
+        if (JSON.stringify(payload()) !== savedRuntimePayload) void flushRuntimeAutosave();
+      }, 5_000);
     } finally {
-      saving = false;
+      runtimeSaveInFlight = false;
     }
   }
 
   function restoreDefaults() {
+    if (!confirm("Restore all download, quality, and API safety preferences to their defaults?")) {
+      return;
+    }
     load({
       release: structuredClone(defaultReleasePreferences),
       api: { providers: {} }
     });
-    saved = false;
   }
 
   function providerPolicy(provider: ProviderStatus): ProviderPolicyOverride {
@@ -216,22 +312,38 @@
     }
   }
 
-  async function saveChannel(channel: ChannelConfig) {
-    channelSaving = channel.id;
+  async function flushChannelAutosave() {
+    if (channelSaveInFlight) return;
+    const changed = channelDrafts
+      .map((channel) => ({ channel, serialized: JSON.stringify(channel) }))
+      .filter(({ channel, serialized }) => serialized !== savedChannelPayloads[channel.id]);
+    if (changed.length === 0) return;
+    channelSaveInFlight = true;
+    channelSaveState = "saving";
     channelError = "";
     try {
-      const saved = await api<ChannelConfig>(`/api/v1/channels/${channel.id}`, {
-        method: "PUT",
-        body: JSON.stringify(channel)
-      });
-      const index = channelDrafts.findIndex((candidate) => candidate.id === channel.id);
-      channelDrafts[index] = saved;
-      channelDrafts = [...channelDrafts];
+      for (const { channel, serialized } of changed) {
+        await api<ChannelConfig>(`/api/v1/channels/${channel.id}`, {
+          method: "PUT",
+          body: serialized
+        });
+        savedChannelPayloads = { ...savedChannelPayloads, [channel.id]: serialized };
+      }
       await queryClient.invalidateQueries({ queryKey: ["channels"] });
+      channelSaveState = channelDrafts.some(
+        (channel) => JSON.stringify(channel) !== savedChannelPayloads[channel.id]
+      ) ? "pending" : "idle";
     } catch (cause) {
       channelError = cause instanceof Error ? cause.message : "Unable to save channel";
+      channelSaveState = "error";
+      setTimeout(() => {
+        const dirty = channelDrafts.some(
+          (channel) => JSON.stringify(channel) !== savedChannelPayloads[channel.id]
+        );
+        if (dirty) void flushChannelAutosave();
+      }, 5_000);
     } finally {
-      channelSaving = "";
+      channelSaveInFlight = false;
     }
   }
 
@@ -284,32 +396,78 @@
     if (Number(policy.autoTokenLimit) === 0) return "No tokens may be spent automatically in a pack.";
     return `Up to ${policy.autoTokenLimit} ${Number(policy.autoTokenLimit) === 1 ? "token" : "tokens"} may be spent automatically per pack.`;
   }
+
+  function selectSection(section: PreferenceSection) {
+    activeSection = section;
+    location.hash = section;
+  }
+
+  function autosaveState(): "loading" | "saved" | "saving" | "error" {
+    if (!loaded || (!channelLoaded && $channels.isPending)) return "loading";
+    if (runtimeSaveState === "error" || channelSaveState === "error") return "error";
+    if ([runtimeSaveState, channelSaveState].some((state) => state === "pending" || state === "saving")) {
+      return "saving";
+    }
+    return "saved";
+  }
 </script>
 
 <svelte:head><title>Preferences · Wotbox</title></svelte:head>
 
-<header class="page-heading compact">
+<header class="page-heading compact settings-page-heading">
   <div>
     <p class="eyebrow">Runtime settings</p>
     <h1>Preferences</h1>
     <p>Control how Wotbox chooses downloads and builds recommendation packs.</p>
   </div>
+  <div class:autosave-error={autosaveState() === "error"} class:autosave-saving={autosaveState() === "saving"} class="autosave-status" role="status">
+    <span></span>
+    <div>
+      <strong>{autosaveState() === "loading" ? "Loading preferences…" : autosaveState() === "error" ? "Changes not saved" : autosaveState() === "saving" ? "Saving changes…" : "All changes saved"}</strong>
+      <small>{autosaveState() === "error" ? error || channelError : "Preferences save automatically"}</small>
+    </div>
+  </div>
 </header>
 
-<nav class="settings-nav" aria-label="Preference sections">
-  <a href="#download-planning"><strong>Download planning</strong><span>Trackers, cost, and profiles</span></a>
-  <a href="#quality-media"><strong>Quality &amp; media</strong><span>Cutoff and format ranking</span></a>
-  <a href="#api-safety"><strong>API safety</strong><span>Limits and circuit state</span></a>
-  <a href="#plex"><strong>Plex</strong><span>Library scan notifications</span></a>
-  <a href="#background-work"><strong>Background work</strong><span>Progress, retries, and failures</span></a>
-  <a href="#channels"><strong>Channels</strong><span>Sources and schedules</span></a>
-</nav>
+<div class="settings-workspace">
+  <nav class="settings-menu" aria-label="Preference sections">
+    {#each sectionGroups as group}
+      <div class="settings-menu-group">
+        <p>{group.label}</p>
+        {#each group.items as item}
+          <a
+            href={appPath(`/preferences#${item.id}`)}
+            class:active={activeSection === item.id}
+            aria-current={activeSection === item.id ? "page" : undefined}
+            onclick={() => activeSection = item.id}
+          >
+            <strong>{item.label}</strong>
+            <span>{item.description}</span>
+          </a>
+        {/each}
+      </div>
+    {/each}
+  </nav>
 
-{#if $preferences.isPending}
-  <div class="preferences-panel skeleton-card"></div>
-{:else if $preferences.isError}
-  <div class="error-panel">{$preferences.error.message}</div>
-{:else}
+  <label class="settings-mobile-picker">
+    <span>Settings section</span>
+    <select value={activeSection} onchange={(event) => selectSection(event.currentTarget.value as PreferenceSection)}>
+      {#each sectionGroups as group}
+        <optgroup label={group.label}>
+          {#each group.items as item}
+            <option value={item.id}>{item.label}</option>
+          {/each}
+        </optgroup>
+      {/each}
+    </select>
+  </label>
+
+  <div class="settings-content">
+  {#if $preferences.isPending}
+    <div class="preferences-panel skeleton-card"></div>
+  {:else if $preferences.isError}
+    <div class="error-panel">{$preferences.error.message}</div>
+  {:else if activeSection === "download-planning"}
   <section class="preferences-panel tracker-settings-panel" id="download-planning">
     <div class="section-heading">
       <div><p class="eyebrow">Download planning</p><h2>Trackers, cost, and destination</h2></div>
@@ -396,6 +554,7 @@
     </div>
   </section>
 
+  {:else if activeSection === "quality-media"}
   <div class="preferences-grid quality-media-grid" id="quality-media">
     <section class="preferences-panel">
       <div class="section-heading">
@@ -447,15 +606,12 @@
     </div>
   </section>
 
-  {#if error}<div class="error-panel compact">{error}</div>{/if}
-  <div class="settings-actions preference-save-actions">
+  <div class="settings-actions preference-reset-actions">
     <span>These settings affect search results and every newly planned or replanned pack.</span>
-    <div>
-      <button class="secondary-button" onclick={restoreDefaults}><RotateCcw size={16} /> Restore defaults</button>
-      <button class="primary-button" disabled={saving} onclick={save}><Save size={16} /> {saving ? "Saving…" : saved ? "Saved" : "Save download preferences"}</button>
-    </div>
+    <button class="secondary-button" onclick={restoreDefaults}><RotateCcw size={16} /> Restore all defaults</button>
   </div>
 
+  {:else if activeSection === "api-safety"}
   <section class="preferences-panel provider-preferences" id="api-safety">
     <div class="section-heading">
       <div><p class="eyebrow">External services</p><h2>API safety</h2></div>
@@ -548,14 +704,9 @@
       </div>
     {/if}
     {#if providerError}<div class="error-panel compact">{providerError}</div>{/if}
-    <div class="settings-actions">
-      <span>Limit changes apply immediately after saving.</span>
-      <button class="primary-button" disabled={saving} onclick={save}>
-        <Save size={16} /> {saving ? "Saving…" : saved ? "Saved" : "Save API limits"}
-      </button>
-    </div>
   </section>
 
+  {:else if activeSection === "plex"}
   <section class="preferences-panel plex-preferences" id="plex">
     <div class="section-heading">
       <div><p class="eyebrow">Media server</p><h2>Plex library updates</h2></div>
@@ -597,8 +748,10 @@
     {#if plexError}<div class="error-panel compact">{plexError}</div>{/if}
   </section>
 
+  {:else if activeSection === "background-work"}
   <BackgroundJobsPanel />
 
+  {:else if activeSection === "channels"}
   <section class="preferences-panel channel-preferences" id="channels">
     <div class="section-heading">
       <div><p class="eyebrow">Scheduled discovery</p><h2>Recommendation channels</h2></div>
@@ -704,13 +857,12 @@
                 </label>
               </div>
             </div>
-            <button class="secondary-button" disabled={channelSaving === channel.id} onclick={() => saveChannel(channel)}>
-              <Save size={15} /> {channelSaving === channel.id ? "Saving…" : "Save channel"}
-            </button>
           </div>
         {/each}
       </div>
     {/if}
     {#if channelError}<div class="error-panel compact">{channelError}</div>{/if}
   </section>
-{/if}
+  {/if}
+  </div>
+</div>
