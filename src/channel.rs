@@ -926,11 +926,16 @@ async fn resolve_source(
             }
         }
     }
+    let reason = if source.id.starts_with("trumped:") {
+        "No matching release is currently available on a configured tracker"
+    } else {
+        "No matching Album or EP is currently available on a configured tracker"
+    };
     Ok(unresolved_item(
         source,
         RecommendationMatchState::Unmatched,
         PackItemPlanState::Unmatched,
-        "No matching Album or EP is currently available on a configured tracker",
+        reason,
     ))
 }
 
