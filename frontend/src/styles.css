@@ -1039,8 +1039,8 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
   .pack-heading .heading-actions button { flex: 1 1 0; justify-content: center; }
   .pack-toolbar { align-items: stretch; flex-direction: column; }
   .selection-actions { justify-content: flex-end; padding: 0 5px 4px; }
-  .segmented-tabs { width: 100%; }
-  .segmented-tabs button { flex: 1 0 auto; }
+  .pack-toolbar .segmented-tabs { width: 100%; flex-wrap: wrap; overflow-x: visible; }
+  .pack-toolbar .segmented-tabs button { flex: 1 1 auto; }
   .pack-item > .cover { display: none; }
   .pack-item .release-content { grid-template-columns: minmax(0, 1fr); }
   .pack-item .release-content > * { grid-column: 1; }
