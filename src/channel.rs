@@ -408,7 +408,14 @@ pub async fn replan_items(
     let download_index = ReleaseDownloadIndex::load(state).await?;
     let mut replanned = Vec::with_capacity(items.len());
     for item in items {
-        replanned.push(resolve_source(state, item.source, &preferences, &download_index).await?);
+        let release_id = item.release.as_ref().and_then(|release| release.id);
+        let source = item.source;
+        replanned.push(if let Some(release_id) = release_id {
+            resolve_release_with_index(state, source, release_id, &preferences, &download_index)
+                .await?
+        } else {
+            resolve_source(state, source, &preferences, &download_index).await?
+        });
     }
     coordinate_pack_plan(state, &mut replanned, &preferences).await;
     Ok(replanned)
