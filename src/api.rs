@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::Write,
     path::{Path as StdPath, PathBuf},
@@ -67,6 +67,7 @@ pub struct AppState {
     pub db: Database,
     pub base_path: String,
     pub trackers: HashMap<String, Arc<dyn TrackerClient>>,
+    pub tracker_sites: BTreeMap<String, String>,
     pub download_clients: HashMap<String, Arc<dyn DownloadClient>>,
     pub profiles: HashMap<String, DownloadProfile>,
     pub announce_hosts: HashMap<String, String>,
@@ -115,6 +116,16 @@ impl AppState {
         }
         let providers = ProviderGovernor::new(db.clone(), definitions, &preferences.api).await?;
         let mut trackers: HashMap<String, Arc<dyn TrackerClient>> = HashMap::new();
+        let tracker_sites = config
+            .trackers
+            .iter()
+            .map(|(name, tracker)| {
+                (
+                    name.to_ascii_lowercase(),
+                    tracker.base_url.trim_end_matches('/').to_owned(),
+                )
+            })
+            .collect();
         let mut announce_hosts = HashMap::new();
         for (name, tracker) in &config.trackers {
             trackers.insert(
@@ -169,6 +180,7 @@ impl AppState {
             db,
             base_path: config.base_path.clone(),
             trackers,
+            tracker_sites,
             download_clients,
             profiles,
             announce_hosts,
@@ -530,6 +542,7 @@ async fn public_config(State(state): State<Arc<AppState>>) -> Json<PublicConfig>
     Json(PublicConfig {
         base_path: state.base_path.clone(),
         trackers,
+        tracker_sites: state.tracker_sites.clone(),
         download_profiles,
     })
 }
@@ -687,6 +700,7 @@ async fn channel_pack(
             AppError::not_found("channel_pack_not_found", "Channel pack was not found")
         })?;
     hydrate_pack_jobs(&state, &mut pack).await?;
+    channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
     Ok(Json(pack))
 }
 
@@ -715,11 +729,13 @@ async fn replan_channel_pack(
         .db
         .replace_channel_plan(id, &fingerprint, &items)
         .await?;
-    let pack = state
+    let mut pack = state
         .db
         .get_channel_pack(id, &fingerprint)
         .await?
         .context("channel pack disappeared")?;
+    hydrate_pack_jobs(&state, &mut pack).await?;
+    channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
     Ok(Json(pack))
 }
 
@@ -748,11 +764,13 @@ async fn attach_channel_pack_item(
         .db
         .replace_channel_plan(id, &fingerprint, &pack.items)
         .await?;
-    let pack = state
+    let mut pack = state
         .db
         .get_channel_pack(id, &fingerprint)
         .await?
         .context("channel pack disappeared")?;
+    hydrate_pack_jobs(&state, &mut pack).await?;
+    channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
     Ok(Json(pack))
 }
 
@@ -4328,7 +4346,7 @@ pub(crate) async fn enrich_library_artist_credits(state: &Arc<AppState>) -> Resu
     Ok(())
 }
 
-async fn live_downloads_by_hash(
+pub(crate) async fn live_downloads_by_hash(
     state: &Arc<AppState>,
     hashes: &[String],
 ) -> HashMap<String, Vec<LiveDownloadStatus>> {

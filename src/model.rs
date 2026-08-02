@@ -841,6 +841,16 @@ pub struct LiveDownloadStatus {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseDownload {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker: Option<String>,
+    pub in_library: bool,
+    pub live: LiveDownloadStatus,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObservedDownload {
     pub name: String,
@@ -1236,6 +1246,8 @@ pub struct DownloadJob {
 pub struct PublicConfig {
     pub base_path: String,
     pub trackers: Vec<String>,
+    #[serde(default)]
+    pub tracker_sites: std::collections::BTreeMap<String, String>,
     pub download_profiles: Vec<String>,
 }
 
@@ -1567,6 +1579,10 @@ pub struct ChannelPackItem {
     pub release: Option<ReleaseSummary>,
     #[serde(default)]
     pub variants: Vec<TorrentVariant>,
+    #[serde(default)]
+    pub candidates: Vec<ReleaseSummary>,
+    #[serde(default)]
+    pub downloads: Vec<ReleaseDownload>,
     pub plan_state: PackItemPlanState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlannedDownload>,

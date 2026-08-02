@@ -14,11 +14,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     api::{AppState, assign_search_ids, cache_search_canonical},
+    db::UnlinkedDownload,
     model::{
         ChannelConfig, ChannelKind, ChannelPackItem, ChannelRunPhase, ChannelRunStatus,
         DownloadFile, LastfmChannelSettings, PackItemPlanState, PlannedDownload,
         RecommendationMatchState, RecommendationSource, RecommendationSubstitution,
-        ReleasePreferences, RuntimePreferences, TorrentVariant, value_i64,
+        ReleaseDownload, ReleasePreferences, ReleaseSummary, RuntimePreferences, SearchGroup,
+        TorrentVariant, value_i64,
     },
     provider::{
         ProviderFailure, ProviderFailureKind, RequestClass, is_provider_unavailable, retry_after,
@@ -30,6 +32,71 @@ use crate::{
 const APPLE_FEED_ROOT: &str = "https://rss.applemarketingtools.com/api/v2";
 const APPLE_SEARCH_ROOT: &str = "https://itunes.apple.com";
 const LASTFM_ROOT: &str = "https://ws.audioscrobbler.com/2.0/";
+
+#[derive(Default)]
+struct ReleaseDownloadIndex {
+    downloads: Vec<UnlinkedDownload>,
+}
+
+impl ReleaseDownloadIndex {
+    async fn load(state: &AppState) -> Result<Self> {
+        Ok(Self {
+            downloads: state.db.list_unlinked_downloads().await?,
+        })
+    }
+
+    fn matching(
+        &self,
+        source: &RecommendationSource,
+        release: &ReleaseSummary,
+    ) -> Vec<ReleaseDownload> {
+        self.matching_identity(
+            source,
+            release.artist.as_deref().unwrap_or(&source.artist),
+            &release.title,
+            release.year,
+        )
+    }
+
+    fn matching_source(&self, source: &RecommendationSource) -> Vec<ReleaseDownload> {
+        self.matching_identity(source, &source.artist, &source.title, source.year)
+    }
+
+    fn matching_identity(
+        &self,
+        source: &RecommendationSource,
+        target_artist: &str,
+        target_title: &str,
+        target_year: Option<i64>,
+    ) -> Vec<ReleaseDownload> {
+        self.downloads
+            .iter()
+            .filter_map(|download| {
+                let (artist, title, year) = parse_download_release_name(&download.torrent_name);
+                let title_matches = trumped_identity_component(&title)
+                    == trumped_identity_component(target_title)
+                    || trumped_identity_component(&title)
+                        == trumped_identity_component(&source.title);
+                let artist_matches = artist.trim().is_empty()
+                    || target_artist.trim().is_empty()
+                    || trumped_identity_component(&artist)
+                        == trumped_identity_component(target_artist)
+                    || trumped_identity_component(&artist)
+                        == trumped_identity_component(&source.artist);
+                let year_matches = year.is_none()
+                    || target_year.is_none()
+                    || year == target_year
+                    || year == source.year;
+                (title_matches && artist_matches && year_matches).then(|| ReleaseDownload {
+                    name: download.torrent_name.clone(),
+                    tracker: download.tracker.clone(),
+                    in_library: download.in_library,
+                    live: download.live.clone(),
+                })
+            })
+            .collect()
+    }
+}
 
 pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Result<()> {
     if !(1..=7).contains(&channel.schedule.weekday) {
@@ -251,6 +318,7 @@ pub async fn refresh_channel(
 
     let preferences = state.db.get_runtime_preferences().await?;
     let fingerprint = preference_fingerprint(&state, &preferences)?;
+    let download_index = ReleaseDownloadIndex::load(&state).await?;
     let mut items = Vec::with_capacity(sources.len());
     let source_total = sources.len() as u32;
     state
@@ -274,7 +342,8 @@ pub async fn refresh_channel(
                 Some(&format!("Matching {} — {}", source.artist, source.title)),
             )
             .await?;
-        let item = match resolve_source(&state, source.clone(), &preferences).await {
+        let item = match resolve_source(&state, source.clone(), &preferences, &download_index).await
+        {
             Ok(item) => item,
             Err(error) => {
                 partial = true;
@@ -284,6 +353,8 @@ pub async fn refresh_channel(
                     match_state: RecommendationMatchState::Error,
                     release: None,
                     variants: Vec::new(),
+                    candidates: Vec::new(),
+                    downloads: Vec::new(),
                     plan_state: PackItemPlanState::SourceError,
                     plan: None,
                     reason: Some(format!("Tracker lookup failed: {error}")),
@@ -334,12 +405,62 @@ pub async fn replan_items(
     items: Vec<ChannelPackItem>,
 ) -> Result<Vec<ChannelPackItem>> {
     let preferences = state.db.get_runtime_preferences().await?;
+    let download_index = ReleaseDownloadIndex::load(state).await?;
     let mut replanned = Vec::with_capacity(items.len());
     for item in items {
-        replanned.push(resolve_source(state, item.source, &preferences).await?);
+        replanned.push(resolve_source(state, item.source, &preferences, &download_index).await?);
     }
     coordinate_pack_plan(state, &mut replanned, &preferences).await;
     Ok(replanned)
+}
+
+pub async fn hydrate_pack_downloads(
+    state: &Arc<AppState>,
+    items: &mut [ChannelPackItem],
+) -> Result<()> {
+    let download_index = ReleaseDownloadIndex::load(state).await?;
+    for item in items.iter_mut() {
+        item.downloads = item.release.as_ref().map_or_else(
+            || download_index.matching_source(&item.source),
+            |release| download_index.matching(&item.source, release),
+        );
+    }
+    let hashes = items
+        .iter()
+        .flat_map(|item| {
+            item.variants
+                .iter()
+                .filter_map(|variant| variant.info_hash.clone())
+                .chain(
+                    item.downloads
+                        .iter()
+                        .map(|download| download.live.info_hash.clone()),
+                )
+        })
+        .collect::<Vec<_>>();
+    let live = crate::api::live_downloads_by_hash(state, &hashes).await;
+    for item in items {
+        for variant in &mut item.variants {
+            variant.downloads = variant
+                .info_hash
+                .as_ref()
+                .and_then(|hash| live.get(&hash.to_ascii_lowercase()).cloned())
+                .unwrap_or_default();
+        }
+        for download in &mut item.downloads {
+            if let Some(status) = live
+                .get(&download.live.info_hash.to_ascii_lowercase())
+                .and_then(|statuses| {
+                    statuses
+                        .iter()
+                        .find(|status| status.client == download.live.client)
+                })
+            {
+                download.live = status.clone();
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn preference_fingerprint(
@@ -834,6 +955,8 @@ fn trumped_source_identity(tracker: &str, artist: &str, title: &str) -> String {
 }
 
 fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
+    let value = value.replace(['—', '–'], " - ");
+    let value = value.as_str();
     if let Some(parsed) = parse_scene_release_name(value) {
         return parsed;
     }
@@ -1086,8 +1209,11 @@ async fn resolve_source(
     state: &Arc<AppState>,
     source: RecommendationSource,
     preferences: &RuntimePreferences,
+    download_index: &ReleaseDownloadIndex,
 ) -> Result<ChannelPackItem> {
-    if let Some(item) = resolve_tracker_source(state, source.clone(), preferences).await? {
+    if let Some(item) =
+        resolve_tracker_source(state, source.clone(), preferences, download_index).await?
+    {
         return Ok(item);
     }
     if source.id.starts_with("lastfm:")
@@ -1095,7 +1221,9 @@ async fn resolve_source(
         && let Some(candidates) = apple_containing_releases(state, &source).await?
     {
         for candidate in candidates {
-            if let Some(item) = resolve_tracker_source(state, candidate, preferences).await? {
+            if let Some(item) =
+                resolve_tracker_source(state, candidate, preferences, download_index).await?
+            {
                 return Ok(item);
             }
         }
@@ -1117,9 +1245,10 @@ async fn resolve_tracker_source(
     state: &Arc<AppState>,
     source: RecommendationSource,
     preferences: &RuntimePreferences,
+    download_index: &ReleaseDownloadIndex,
 ) -> Result<Option<ChannelPackItem>> {
     if source.id.starts_with("trumped:") {
-        return resolve_trumped_tracker_source(state, source, preferences).await;
+        return resolve_trumped_tracker_source(state, source, preferences, download_index).await;
     }
     let mut groups = Vec::new();
     let mut queries = vec![source.title.clone()];
@@ -1193,17 +1322,16 @@ async fn resolve_tracker_source(
         && best.id != second.id
         && best_score - second_score < 0.03
     {
-        return Ok(Some(unresolved_item(
+        return Ok(Some(ambiguous_item(
             source,
-            RecommendationMatchState::Ambiguous,
-            PackItemPlanState::Ambiguous,
             "Multiple tracker releases matched with similar confidence",
+            nearby_candidates(&matches, best_score),
         )));
     }
     let release_id = best
         .id
         .context("matched tracker release has no canonical id")?;
-    resolve_release(state, source, release_id, preferences)
+    resolve_release_with_index(state, source, release_id, preferences, download_index)
         .await
         .map(Some)
 }
@@ -1212,6 +1340,7 @@ async fn resolve_trumped_tracker_source(
     state: &Arc<AppState>,
     source: RecommendationSource,
     preferences: &RuntimePreferences,
+    download_index: &ReleaseDownloadIndex,
 ) -> Result<Option<ChannelPackItem>> {
     let origin = trumped_source_tracker(&source.id).with_context(
         || "trumped download source has no origin tracker; refresh the channel before replanning",
@@ -1263,9 +1392,15 @@ async fn resolve_trumped_tracker_source(
                         let release_id = best
                             .id
                             .context("file-matched tracker release has no canonical id")?;
-                        return resolve_release(state, source, release_id, preferences)
-                            .await
-                            .map(Some);
+                        return resolve_release_with_index(
+                            state,
+                            source,
+                            release_id,
+                            preferences,
+                            download_index,
+                        )
+                        .await
+                        .map(Some);
                     }
                     continue;
                 };
@@ -1280,23 +1415,34 @@ async fn resolve_trumped_tracker_source(
                         let release_id = best
                             .id
                             .context("file-matched tracker release has no canonical id")?;
-                        return resolve_release(state, source, release_id, preferences)
-                            .await
-                            .map(Some);
+                        return resolve_release_with_index(
+                            state,
+                            source,
+                            release_id,
+                            preferences,
+                            download_index,
+                        )
+                        .await
+                        .map(Some);
                     }
-                    return Ok(Some(unresolved_item(
+                    return Ok(Some(ambiguous_item(
                         source,
-                        RecommendationMatchState::Ambiguous,
-                        PackItemPlanState::Ambiguous,
                         "Multiple same-tracker releases matched with similar confidence",
+                        nearby_candidates(&matches, best_score),
                     )));
                 }
                 let release_id = best
                     .id
                     .context("matched tracker release has no canonical id")?;
-                return resolve_release(state, source, release_id, preferences)
-                    .await
-                    .map(Some);
+                return resolve_release_with_index(
+                    state,
+                    source,
+                    release_id,
+                    preferences,
+                    download_index,
+                )
+                .await
+                .map(Some);
             }
             Err(error) => {
                 tracing::warn!(tracker = tracker_name, %error, "trumped replacement lookup failed");
@@ -2024,6 +2170,17 @@ pub async fn resolve_release(
     release_id: uuid::Uuid,
     preferences: &RuntimePreferences,
 ) -> Result<ChannelPackItem> {
+    let download_index = ReleaseDownloadIndex::load(state).await?;
+    resolve_release_with_index(state, source, release_id, preferences, &download_index).await
+}
+
+async fn resolve_release_with_index(
+    state: &Arc<AppState>,
+    source: RecommendationSource,
+    release_id: uuid::Uuid,
+    preferences: &RuntimePreferences,
+    download_index: &ReleaseDownloadIndex,
+) -> Result<ChannelPackItem> {
     let trumped_tracker = if source.id.starts_with("trumped:") {
         Some(trumped_source_tracker(&source.id).with_context(|| {
             "trumped download source has no origin tracker; refresh the channel before attaching a release"
@@ -2046,19 +2203,6 @@ pub async fn resolve_release(
     let mut variants = detail.variants;
     if let Some(tracker) = trumped_tracker {
         variants.retain(|variant| variant.tracker.eq_ignore_ascii_case(tracker));
-        let downloaded = state
-            .db
-            .downloaded_torrent_ids(
-                tracker,
-                &variants
-                    .iter()
-                    .map(|variant| variant.torrent_id)
-                    .collect::<Vec<_>>(),
-            )
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        variants.retain(|variant| !downloaded.contains(&variant.torrent_id));
     }
     for variant in &mut variants {
         variant.eligibility = Some(preferences.release.eligibility(
@@ -2071,13 +2215,36 @@ pub async fn resolve_release(
             variant.can_use_token || !variant.token_eligibility_known,
         ));
     }
-    let (owned, downloading) = if trumped_tracker.is_some() {
+    let mut planning_variants = variants.clone();
+    if let Some(tracker) = trumped_tracker {
+        let downloaded = state
+            .db
+            .downloaded_torrent_ids(
+                tracker,
+                &planning_variants
+                    .iter()
+                    .map(|variant| variant.torrent_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        planning_variants.retain(|variant| !downloaded.contains(&variant.torrent_id));
+    }
+    let downloads = download_index.matching(&source, &detail.release);
+    let (mut owned, mut downloading) = if trumped_tracker.is_some() {
         (false, false)
     } else {
         state.db.release_download_flags(release_id).await?
     };
+    if trumped_tracker.is_none() {
+        owned |= downloads.iter().any(|download| download.in_library);
+        downloading |= downloads
+            .iter()
+            .any(|download| !download.in_library && download.live.progress < 1.0);
+    }
     let (plan_state, plan, reason) = if let Some(tracker) = trumped_tracker
-        && variants.is_empty()
+        && planning_variants.is_empty()
     {
         (
             PackItemPlanState::AlreadyOwned,
@@ -2102,7 +2269,7 @@ pub async fn resolve_release(
     } else {
         plan_variant(
             &state.profiles,
-            &variants,
+            &planning_variants,
             &preferences.release,
             u32::MAX,
             &source.title,
@@ -2114,6 +2281,8 @@ pub async fn resolve_release(
         match_state: RecommendationMatchState::Matched,
         release: Some(detail.release),
         variants,
+        candidates: Vec::new(),
+        downloads,
         plan_state,
         plan,
         reason,
@@ -2394,12 +2563,56 @@ fn unresolved_item(
         match_state,
         release: None,
         variants: Vec::new(),
+        candidates: Vec::new(),
+        downloads: Vec::new(),
         plan_state,
         plan: None,
         reason: Some(reason.into()),
         job_id: None,
         job: None,
     }
+}
+
+fn ambiguous_item(
+    source: RecommendationSource,
+    reason: &str,
+    candidates: Vec<ReleaseSummary>,
+) -> ChannelPackItem {
+    ChannelPackItem {
+        ordinal: source.rank,
+        source,
+        match_state: RecommendationMatchState::Ambiguous,
+        release: None,
+        variants: Vec::new(),
+        candidates,
+        downloads: Vec::new(),
+        plan_state: PackItemPlanState::Ambiguous,
+        plan: None,
+        reason: Some(reason.into()),
+        job_id: None,
+        job: None,
+    }
+}
+
+fn nearby_candidates(matches: &[(f64, SearchGroup)], best_score: f64) -> Vec<ReleaseSummary> {
+    matches
+        .iter()
+        .take_while(|(score, _)| best_score - score < 0.03)
+        .take(6)
+        .map(|(_, group)| ReleaseSummary {
+            id: group.id,
+            tracker: group.tracker.clone(),
+            group_id: group.group_id,
+            title: group.name.clone(),
+            artist: group.artist.clone(),
+            artists: Vec::new(),
+            year: group.year,
+            artwork: group.image.clone(),
+            release_type: group.release_type.clone(),
+            sources: group.sources.clone(),
+            album_coverage: group.album_coverage.clone(),
+        })
+        .collect()
 }
 
 fn json_array<'a>(value: &'a Value, pointer: &str) -> Vec<&'a Value> {
@@ -2498,6 +2711,10 @@ mod tests {
         assert_eq!(
             parse_download_release_name("Illenium · 2021 · First Time"),
             ("Illenium".into(), "First Time".into(), Some(2021))
+        );
+        assert_eq!(
+            parse_download_release_name("Sleep Theory — Afterglow (2025) [WEB-FLAC 24-48]"),
+            ("Sleep Theory".into(), "Afterglow".into(), Some(2025))
         );
         assert_eq!(
             trumped_identity_component("Hate That I Love You CDM V0 2007 WRE"),
@@ -3058,6 +3275,8 @@ mod tests {
                 match_state: RecommendationMatchState::Matched,
                 release: None,
                 variants: vec![variant],
+                candidates: Vec::new(),
+                downloads: Vec::new(),
                 plan_state: PackItemPlanState::Executable,
                 plan: Some(PlannedDownload {
                     tracker: "ops".into(),

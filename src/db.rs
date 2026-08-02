@@ -85,6 +85,14 @@ pub struct DownloadObservation {
 }
 
 #[derive(Debug, Clone)]
+pub struct UnlinkedDownload {
+    pub torrent_name: String,
+    pub tracker: Option<String>,
+    pub in_library: bool,
+    pub live: LiveDownloadStatus,
+}
+
+#[derive(Debug, Clone)]
 pub struct TrackIndexJob {
     pub tracker: String,
     pub group_id: i64,
@@ -1545,6 +1553,37 @@ impl Database {
             .iter()
             .any(|link| link.present && link.library_added_at.is_none());
         Ok((owned, downloading))
+    }
+
+    pub async fn list_unlinked_downloads(&self) -> Result<Vec<UnlinkedDownload>> {
+        let links = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Present.eq(true))
+            .filter(download_release_link::Column::ReleaseId.is_null())
+            .filter(download_release_link::Column::TorrentName.is_not_null())
+            .filter(download_release_link::Column::ObservedJson.is_not_null())
+            .all(&self.connection)
+            .await?;
+        links
+            .into_iter()
+            .filter_map(|link| {
+                let name = link.torrent_name?;
+                let observed = link.observed_json?;
+                Some((
+                    name,
+                    link.tracker,
+                    link.library_added_at.is_some(),
+                    observed,
+                ))
+            })
+            .map(|(torrent_name, tracker, in_library, observed)| {
+                Ok(UnlinkedDownload {
+                    torrent_name,
+                    tracker,
+                    in_library,
+                    live: serde_json::from_value(observed)?,
+                })
+            })
+            .collect()
     }
 
     pub async fn downloaded_torrent_ids(
@@ -5583,6 +5622,8 @@ mod tests {
             match_state: RecommendationMatchState::Unmatched,
             release: None,
             variants: Vec::new(),
+            candidates: Vec::new(),
+            downloads: Vec::new(),
             plan_state: PackItemPlanState::Unmatched,
             plan: None,
             reason: Some("Unavailable".into()),
