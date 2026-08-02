@@ -11,6 +11,7 @@
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
+  import ReleaseCover from "../lib/ReleaseCover.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import StaleNotice from "../lib/StaleNotice.svelte";
@@ -352,12 +353,11 @@
         <div class="result-list artist-catalog-list">
           {#each items as group}
             <article class="release-card catalog-release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(group.release.releaseType)}`}>
-              <a class="cover" href={group.release.id ? appPath(`/releases/${group.release.id}?from=library`) : undefined}>
-                <Disc3 size={36} />
-                {#if group.release.artwork}
-                  <img src={group.release.artwork} alt="" referrerpolicy="no-referrer" loading="lazy" onerror={(event) => (event.currentTarget as HTMLImageElement).remove()} />
-                {/if}
-              </a>
+              <ReleaseCover
+                image={group.release.artwork}
+                href={group.release.id ? appPath(`/releases/${group.release.id}?from=library`) : undefined}
+                label={`${displayArtist(group)} — ${group.release.title}`}
+              />
               <div class="release-content">
                 <div class="release-heading">
                   <div>

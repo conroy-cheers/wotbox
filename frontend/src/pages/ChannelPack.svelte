@@ -8,13 +8,16 @@
     formatBytes,
     type ChannelBatchResult,
     type ChannelPack,
+    type ClientDownloadState,
     type DownloadSelection
   } from "../lib/api";
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import { executableOrdinals, summarizeSelection } from "../lib/channelPack";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
   import ReleaseCandidatePicker from "../lib/ReleaseCandidatePicker.svelte";
+  import ReleaseCover from "../lib/ReleaseCover.svelte";
   import ReleaseDownloads from "../lib/ReleaseDownloads.svelte";
+  import StatusPill from "../lib/StatusPill.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
 
   let { id }: { id: string } = $props();
@@ -124,6 +127,10 @@
     selectedOrdinals = executableOrdinals(current.items);
   }
 
+  function downloadStates(downloads: ChannelPack["items"][number]["downloads"]): ClientDownloadState[] {
+    return [...new Set(downloads.map((download) => download.live.state))];
+  }
+
   $effect(() => {
     const current = $pack.data;
     if (!current || current.planVersion === selectionVersion) return;
@@ -220,9 +227,7 @@
             {item.source.rank}
           {/if}
         </div>
-        <div class="cover">
-          {#if item.source.artwork ?? item.release?.artwork}<img src={item.source.artwork ?? item.release?.artwork} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
-        </div>
+        <ReleaseCover image={item.source.artwork ?? item.release?.artwork} />
         <div class="release-content">
           <div class="release-heading">
             <div>
@@ -254,7 +259,10 @@
           {/if}
           {#if item.downloads.length}
             <details class="pack-source-downloads">
-              <summary>{item.downloads.length} trumped {item.downloads.length === 1 ? "download" : "downloads"}</summary>
+              <summary>
+                {item.downloads.length} trumped {item.downloads.length === 1 ? "download" : "downloads"}
+                {#each downloadStates(item.downloads) as state}<StatusPill {state} />{/each}
+              </summary>
               <ReleaseDownloads downloads={item.downloads} />
             </details>
           {/if}

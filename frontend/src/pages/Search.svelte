@@ -1,11 +1,12 @@
 <script lang="ts">
   import { createMutation, createQuery } from "@tanstack/svelte-query";
   import { derived, writable } from "svelte/store";
-  import { Check, Disc3, Search as SearchIcon, SlidersHorizontal } from "@lucide/svelte";
+  import { Check, Search as SearchIcon, SlidersHorizontal } from "@lucide/svelte";
   import { api, ApiError, appPath, type ChannelPack, type Envelope, type PublicConfig, type SearchGroup, type SearchPage, type SearchTorrent } from "../lib/api";
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
+  import ReleaseCover from "../lib/ReleaseCover.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import {
@@ -266,18 +267,7 @@
   <div class="result-list">
     {#each visibleGroups($results.data.data.groups) as group}
       <article class="release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(group.releaseType)}`}>
-        <div class="cover">
-          <Disc3 size={36} />
-          {#if group.image}
-            <img
-              src={group.image}
-              alt=""
-              referrerpolicy="no-referrer"
-              loading="lazy"
-              onerror={(event) => (event.currentTarget as HTMLImageElement).remove()}
-            />
-          {/if}
-        </div>
+        <ReleaseCover image={group.image} />
         <div class="release-content">
           <div class="release-heading">
             <div>

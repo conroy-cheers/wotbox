@@ -13,6 +13,7 @@
     type PublicConfig
   } from "../lib/api";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
+  import ReleaseCover from "../lib/ReleaseCover.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { oneOf, positiveInteger, replaceView } from "../lib/routing";
@@ -259,12 +260,12 @@
         <div class="library-release-grid">
           {#each visibleReleases($library.data.releases) as item}
             <article class="library-release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
-              <a class="cover" href={item.release.id ? appPath(`/releases/${item.release.id}?from=library`) : undefined}>
-                <Disc3 size={28} />
-                {#if item.release.artwork}
-                  <img src={item.release.artwork} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
-                {/if}
-              </a>
+              <ReleaseCover
+                image={item.release.artwork}
+                href={item.release.id ? appPath(`/releases/${item.release.id}?from=library`) : undefined}
+                label={`${item.release.artist} — ${item.release.title}`}
+                iconSize={28}
+              />
               <div>
                 <h3><a href={item.release.id ? appPath(`/releases/${item.release.id}?from=library`) : undefined}>{item.release.title}</a></h3>
                 <p>
