@@ -847,6 +847,13 @@ pub struct ObservedDownload {
     pub announce_host: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadTrackerStatus {
+    pub announce_host: Option<String>,
+    pub status: i64,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadFile {

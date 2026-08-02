@@ -168,7 +168,7 @@ pub async fn retry_hash_resolution(
     info_hash: &str,
 ) -> Result<Uuid> {
     let key = format!(
-        "resolve-hash:{}:{}:v2",
+        "resolve-hash:{}:{}:v3",
         tracker.to_ascii_lowercase(),
         info_hash.to_ascii_lowercase()
     );
@@ -193,7 +193,7 @@ async fn enqueue_hash_resolution_at(
         state,
         EnqueueBackgroundJob {
             deduplication_key: &format!(
-                "resolve-hash:{}:{}:v2",
+                "resolve-hash:{}:{}:v3",
                 tracker.to_ascii_lowercase(),
                 info_hash.to_ascii_lowercase()
             ),
@@ -631,37 +631,138 @@ async fn resolve_download_hash(state: &Arc<AppState>, payload: &Value) -> Result
             Ok(JobOutcome::Complete)
         }
         Err(error) => {
-            let message = error.to_string();
-            let normalized = message.to_ascii_lowercase();
+            let provider_message = error.to_string();
+            let normalized = provider_message.to_ascii_lowercase();
             let not_found = normalized.contains("not found")
                 || normalized.contains("does not exist")
                 || normalized.contains("bad hash")
                 || (payload.tracker.eq_ignore_ascii_case("ops")
                     && normalized.contains("bad parameters"));
             let provider_wait = provider_error_is_admission_or_blocked(&error);
+            let diagnosis = if not_found {
+                diagnose_missing_torrent(state, &payload, &links).await
+            } else {
+                MissingTorrentDiagnosis {
+                    code: "tracker_error",
+                    message: provider_message.clone(),
+                }
+            };
             for link in &links {
                 if provider_wait {
                     state
                         .db
-                        .defer_link_resolution(&link.client, &link.info_hash, &message)
+                        .defer_link_resolution(&link.client, &link.info_hash, &provider_message)
                         .await?;
                 } else {
                     state
                         .db
-                        .set_link_failure(&link.client, &link.info_hash, not_found, &message)
+                        .set_link_failure(
+                            &link.client,
+                            &link.info_hash,
+                            not_found,
+                            diagnosis.code,
+                            &diagnosis.message,
+                        )
                         .await?;
                 }
             }
             if not_found {
                 Ok(JobOutcome::Fail {
-                    code: "not_found",
-                    message,
+                    code: diagnosis.code,
+                    message: diagnosis.message,
                 })
             } else {
                 Err(error)
             }
         }
     }
+}
+
+struct MissingTorrentDiagnosis {
+    code: &'static str,
+    message: String,
+}
+
+async fn diagnose_missing_torrent(
+    state: &AppState,
+    payload: &TrackerHashPayload,
+    links: &[crate::db::DownloadReleaseLink],
+) -> MissingTorrentDiagnosis {
+    if !payload.tracker.eq_ignore_ascii_case("ops") {
+        return MissingTorrentDiagnosis {
+            code: "not_found",
+            message: format!(
+                "{} did not recognize this torrent hash; manual retry is available",
+                payload.tracker
+            ),
+        };
+    }
+
+    let mut queried_clients = HashSet::new();
+    for link in links {
+        if !queried_clients.insert(link.client.as_str()) {
+            continue;
+        }
+        let Some(client) = state.download_clients.get(&link.client) else {
+            continue;
+        };
+        let expected_hosts = links
+            .iter()
+            .filter(|candidate| candidate.client == link.client)
+            .filter_map(|candidate| candidate.announce_host.as_deref())
+            .collect::<HashSet<_>>();
+        match client
+            .tracker_statuses_with_class(&payload.info_hash, RequestClass::Background)
+            .await
+        {
+            Ok(statuses) => {
+                if statuses.iter().any(|status| {
+                    status
+                        .announce_host
+                        .as_deref()
+                        .is_some_and(|host| expected_hosts.contains(host))
+                        && status
+                            .message
+                            .as_deref()
+                            .is_some_and(tracker_message_reports_unregistered)
+                }) {
+                    return MissingTorrentDiagnosis {
+                        code: "torrent_unregistered",
+                        message: "qBittorrent confirms that OPS reports this torrent as unregistered. It was removed from the active tracker catalogue and may have been trumped; find and add its replacement before deleting the old torrent.".into(),
+                    };
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    client = %link.client,
+                    info_hash = %payload.info_hash,
+                    %error,
+                    "could not inspect qBittorrent tracker status for missing OPS torrent"
+                );
+            }
+        }
+    }
+
+    MissingTorrentDiagnosis {
+        code: "not_found",
+        message: "OPS does not currently recognize this torrent hash. It may have been removed or trumped; qBittorrent did not return an explicit unregistered-torrent response. Manual retry is available.".into(),
+    }
+}
+
+fn tracker_message_reports_unregistered(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "unregistered torrent",
+        "torrent not registered",
+        "torrent is not registered",
+        "torrent not found",
+        "unknown torrent",
+        "torrent does not exist",
+        "torrent has been deleted",
+        "torrent has been removed",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 #[derive(Deserialize)]
@@ -1052,7 +1153,7 @@ fn provider_error_is_admission_or_blocked(error: &anyhow::Error) -> bool {
 mod tests {
     use crate::model::ArtistCatalogRole;
 
-    use super::has_primary_role;
+    use super::{has_primary_role, tracker_message_reports_unregistered};
 
     #[test]
     fn coverage_uses_only_primary_artist_catalog_groups() {
@@ -1061,5 +1162,19 @@ mod tests {
             ArtistCatalogRole::Guest,
             ArtistCatalogRole::Remixer,
         ]));
+    }
+
+    #[test]
+    fn recognizes_explicit_tracker_removal_messages() {
+        assert!(tracker_message_reports_unregistered("Unregistered torrent"));
+        assert!(tracker_message_reports_unregistered(
+            "Torrent has been removed by staff"
+        ));
+        assert!(!tracker_message_reports_unregistered(
+            "The tracker is not working"
+        ));
+        assert!(!tracker_message_reports_unregistered(
+            "No peers are currently available"
+        ));
     }
 }

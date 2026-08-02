@@ -9,8 +9,8 @@ use url::Url;
 use crate::{
     config::{DownloadClientConfig, read_secret},
     model::{
-        ClientDownloadState, DownloadDiagnostic, DownloadFile, DownloadProfile, LiveDownloadStatus,
-        ObservedDownload,
+        ClientDownloadState, DownloadDiagnostic, DownloadFile, DownloadProfile,
+        DownloadTrackerStatus, LiveDownloadStatus, ObservedDownload,
     },
     provider::{ProviderFailure, ProviderFailureKind, ProviderGovernor, RequestClass, retry_after},
 };
@@ -42,6 +42,13 @@ pub trait DownloadClient: Send + Sync {
         _class: RequestClass,
     ) -> Result<Vec<ObservedDownload>> {
         self.downloads_by_hashes(info_hashes).await
+    }
+    async fn tracker_statuses_with_class(
+        &self,
+        _info_hash: &str,
+        _class: RequestClass,
+    ) -> Result<Vec<DownloadTrackerStatus>> {
+        Ok(Vec::new())
     }
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>>;
     async fn add_torrent(
@@ -233,6 +240,16 @@ struct QbitFile {
     progress: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct QbitTrackerStatus {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    status: i64,
+    #[serde(default, rename = "msg")]
+    message: String,
+}
+
 impl QbitTorrent {
     fn normalized(self, client: &str) -> ObservedDownload {
         ObservedDownload {
@@ -373,6 +390,38 @@ impl DownloadClient for QbittorrentClient {
         }
         self.fetch_downloads(Some(&info_hashes.join("|")), None, None, class)
             .await
+    }
+
+    async fn tracker_statuses_with_class(
+        &self,
+        info_hash: &str,
+        class: RequestClass,
+    ) -> Result<Vec<DownloadTrackerStatus>> {
+        self.execute(class, || async {
+            let response = self
+                .request(reqwest::Method::GET, "/api/v2/torrents/trackers")
+                .query(&[("hash", info_hash)])
+                .send()
+                .await
+                .map_err(transient)?;
+            let response = successful(response, "qBittorrent tracker status").await?;
+            response
+                .json::<Vec<QbitTrackerStatus>>()
+                .await
+                .map(|statuses| {
+                    statuses
+                        .into_iter()
+                        .map(|status| DownloadTrackerStatus {
+                            announce_host: announce_host(&status.url),
+                            status: status.status,
+                            message: (!status.message.trim().is_empty())
+                                .then(|| status.message.trim().to_owned()),
+                        })
+                        .collect()
+                })
+                .map_err(transient)
+        })
+        .await
     }
 
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>> {
@@ -599,6 +648,46 @@ mod tests {
         assert_eq!(files[0].name, "Album/01 Track.flac");
         assert_eq!(files[0].size, 2048);
         assert_eq!(files[0].progress, 1.0);
+    }
+
+    #[tokio::test]
+    async fn reads_sanitized_tracker_status_for_a_torrent() {
+        let server = MockServer::start().await;
+        let info_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/trackers"))
+            .and(query_param("hash", info_hash))
+            .and(header(
+                "authorization",
+                "Bearer qbt_0123456789012345678901234567",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "url": "https://secret-passkey@home.opsfet.ch/announce",
+                    "status": 4,
+                    "tier": 0,
+                    "msg": "Unregistered torrent"
+                }, {
+                    "url": "** [DHT] **",
+                    "status": 0,
+                    "msg": ""
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let statuses = test_client(&server)
+            .tracker_statuses_with_class(info_hash, crate::provider::RequestClass::Background)
+            .await
+            .expect("qBittorrent tracker response");
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].announce_host.as_deref(), Some("home.opsfet.ch"));
+        assert_eq!(statuses[0].status, 4);
+        assert_eq!(statuses[0].message.as_deref(), Some("Unregistered torrent"));
+        assert_eq!(statuses[1].announce_host, None);
+        assert!(format!("{statuses:?}").contains("home.opsfet.ch"));
+        assert!(!format!("{statuses:?}").contains("secret-passkey"));
     }
 
     #[tokio::test]

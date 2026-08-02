@@ -50,6 +50,7 @@ pub struct Cached<T> {
 pub struct DownloadReleaseLink {
     pub client: String,
     pub info_hash: String,
+    pub announce_host: Option<String>,
     pub tracker: Option<String>,
     pub torrent_id: Option<i64>,
     pub resolution_state: String,
@@ -3933,7 +3934,7 @@ impl Database {
                 transaction,
                 EnqueueBackgroundJob {
                     deduplication_key: &format!(
-                        "resolve-hash:{}:{hash}:v2",
+                        "resolve-hash:{}:{hash}:v3",
                         tracker.to_ascii_lowercase()
                     ),
                     kind: "resolve_download_hash",
@@ -4171,6 +4172,7 @@ impl Database {
         client: &str,
         info_hash: &str,
         not_found: bool,
+        error_code: &str,
         message: &str,
     ) -> Result<()> {
         let model =
@@ -4185,14 +4187,7 @@ impl Database {
         active.resolution_state = Set(if not_found { "not_found" } else { "failed" }.into());
         active.attempts = Set(if not_found { attempts } else { attempts + 1 });
         active.next_retry_at = Set((!not_found).then(|| (Utc::now() + delay).to_rfc3339()));
-        active.error_code = Set(Some(
-            if not_found {
-                "not_found"
-            } else {
-                "tracker_error"
-            }
-            .into(),
-        ));
+        active.error_code = Set(Some(error_code.into()));
         active.error_message = Set(Some(message.chars().take(500).collect()));
         active.updated_at = Set(Utc::now().to_rfc3339());
         active.update(&self.connection).await?;
@@ -4861,6 +4856,7 @@ fn link_from_model(model: download_release_link::Model) -> DownloadReleaseLink {
     DownloadReleaseLink {
         client: model.client,
         info_hash: model.info_hash,
+        announce_host: model.announce_host,
         tracker: model.tracker,
         torrent_id: model.torrent_id,
         resolution_state: model.resolution_state,
@@ -5749,7 +5745,7 @@ mod tests {
         active.first_seen_at = Set((Utc::now() - Duration::hours(25)).to_rfc3339());
         active.update(&db.connection).await.expect("age link");
 
-        db.set_link_failure("music", hash, true, "not found")
+        db.set_link_failure("music", hash, true, "not_found", "not found")
             .await
             .expect("negative result");
         let link = db

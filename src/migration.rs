@@ -28,7 +28,44 @@ impl MigratorTrait for Migrator {
             Box::new(BackgroundRetryRepairSchema),
             Box::new(BackgroundTerminalNormalizationSchema),
             Box::new(QueryPerformanceSchema),
+            Box::new(OpsTorrentDiagnosisSchema),
         ]
+    }
+}
+
+struct OpsTorrentDiagnosisSchema;
+
+impl MigrationName for OpsTorrentDiagnosisSchema {
+    fn name(&self) -> &str {
+        "m20260802_000010_ops_torrent_diagnosis"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for OpsTorrentDiagnosisSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                UPDATE download_release_links
+                   SET resolution_state = 'pending',
+                       attempts = 0,
+                       next_retry_at = NULL,
+                       error_code = NULL,
+                       error_message = NULL,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE lower(tracker) = 'ops'
+                   AND resolution_state = 'not_found'
+                   AND error_code = 'not_found';
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 
