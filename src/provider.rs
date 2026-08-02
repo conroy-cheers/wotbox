@@ -64,7 +64,10 @@ impl ProviderDefinition {
             display_name: name.to_ascii_uppercase(),
             kind: "tracker".into(),
             safe_minimum_interval: Duration::from_millis(2_500),
-            safe_background_minimum_interval: Duration::from_secs(5),
+            // Gazelle trackers commonly enforce a ten-request rolling minute.
+            // Leave enough margin for clock and response-time variance instead
+            // of running exactly at the theoretical six-second boundary.
+            safe_background_minimum_interval: Duration::from_secs(7),
             safe_max_concurrency: 1,
         }
     }
@@ -997,11 +1000,15 @@ mod tests {
                 &definition,
                 &ProviderPolicyOverride {
                     minimum_interval_ms: Some(3_000),
-                    background_minimum_interval_ms: Some(5_000),
+                    background_minimum_interval_ms: Some(7_000),
                     max_concurrency: Some(1),
                 }
             )
             .is_ok()
+        );
+        assert_eq!(
+            definition.safe_background_minimum_interval,
+            Duration::from_secs(7)
         );
     }
 
