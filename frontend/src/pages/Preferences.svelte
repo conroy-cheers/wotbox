@@ -368,9 +368,11 @@
   }
 
   function channelLabel(channel: ChannelConfig): string {
-    return channel.id === "country_chart"
-      ? `Country Top ${channel.countryChart?.albumCount ?? 100}`
-      : "Last.fm Discovery";
+    switch (channel.kind) {
+      case "country_chart": return `Country Top ${channel.countryChart?.albumCount ?? 100}`;
+      case "lastfm": return "Last.fm Discovery";
+      case "trumped_downloads": return "Trumped downloads";
+    }
   }
 
   function setCountryChartAlbumCount(channel: ChannelConfig, count: number) {
@@ -767,7 +769,7 @@
         {#each channelDrafts as channel}
           <div class="channel-setting-card">
             <header>
-              <div><p class="eyebrow">{channel.kind.replace("_", " ")}</p><h3>{channelLabel(channel)}</h3></div>
+              <div><p class="eyebrow">{channel.kind.replaceAll("_", " ")}</p><h3>{channelLabel(channel)}</h3></div>
               <label class="inline-check"><input type="checkbox" bind:checked={channel.enabled} /> Enabled</label>
             </header>
             <div class="channel-setting-group">
@@ -835,6 +837,11 @@
                 {#if !channel.credentialConfigured}
                   <div class="notice-banner compact">Set <code>lastfm_api_key_file</code> or <code>LASTFM_API_KEY</code> before enabling this channel.</div>
                 {/if}
+              {/if}
+              {#if channel.kind === "trumped_downloads"}
+                <div class="notice-banner compact">
+                  Includes completed downloads only when OPS rejects their hash and qBittorrent explicitly reports the torrent as unregistered. Refreshing searches for current replacement releases but never removes the old torrent.
+                </div>
               {/if}
             </div>
             <div class="channel-setting-group">

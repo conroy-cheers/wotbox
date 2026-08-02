@@ -183,6 +183,8 @@ struct QbitTorrent {
     #[serde(default)]
     hash: String,
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     state: String,
     #[serde(default)]
     progress: f64,
@@ -253,6 +255,7 @@ struct QbitTrackerStatus {
 impl QbitTorrent {
     fn normalized(self, client: &str) -> ObservedDownload {
         ObservedDownload {
+            name: self.name,
             announce_host: announce_host(&self.tracker),
             live: LiveDownloadStatus {
                 client: client.to_owned(),
@@ -607,6 +610,7 @@ mod tests {
             .expect("qBittorrent response")
             .expect("download");
         assert_eq!(download.live.client, "music");
+        assert_eq!(download.name, "A tracker download");
         assert_eq!(download.live.info_hash, info_hash);
         assert_eq!(download.live.state, ClientDownloadState::Downloading);
         assert_eq!(download.live.downloaded, 1024);

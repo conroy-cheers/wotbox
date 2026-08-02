@@ -843,6 +843,7 @@ pub struct LiveDownloadStatus {
 
 #[derive(Debug, Clone)]
 pub struct ObservedDownload {
+    pub name: String,
     pub live: LiveDownloadStatus,
     pub announce_host: Option<String>,
 }
@@ -1260,6 +1261,7 @@ pub struct PlexScanQueued {
 pub enum ChannelKind {
     CountryChart,
     Lastfm,
+    TrumpedDownloads,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1385,6 +1387,24 @@ impl ChannelConfig {
             country_chart: None,
             lastfm: Some(LastfmChannelSettings::default()),
             credential_configured: false,
+            next_refresh_at: None,
+            last_successful_at: None,
+            last_attempt_at: None,
+            last_error: None,
+            failure_count: 0,
+            updated_at: now,
+        }
+    }
+
+    pub fn trumped_downloads_default(now: DateTime<Utc>) -> Self {
+        Self {
+            id: "trumped_downloads".into(),
+            kind: ChannelKind::TrumpedDownloads,
+            enabled: true,
+            schedule: ChannelSchedule::default(),
+            country_chart: None,
+            lastfm: None,
+            credential_configured: true,
             next_refresh_at: None,
             last_successful_at: None,
             last_attempt_at: None,

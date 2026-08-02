@@ -39,9 +39,11 @@
   });
 
   function label(channel: ChannelOverview["channel"]): string {
-    return channel.id === "country_chart"
-      ? `Country Top ${channel.countryChart?.albumCount ?? 100}`
-      : "Last.fm Discovery";
+    switch (channel.kind) {
+      case "country_chart": return `Country Top ${channel.countryChart?.albumCount ?? 100}`;
+      case "lastfm": return "Last.fm Discovery";
+      case "trumped_downloads": return "Trumped downloads";
+    }
   }
 
   function schedule(channel: ChannelOverview["channel"]): string {
@@ -91,7 +93,7 @@
   <div>
     <p class="eyebrow">Recommendation channels</p>
     <h1>Fresh packs, on your schedule</h1>
-    <p>Browse album-native recommendations and approve a complete download plan when it looks right.</p>
+    <p>Browse recommendations and replacement candidates, then approve a complete download plan when it looks right.</p>
   </div>
   <a class="secondary-button" href={appPath("/preferences#channels")}><Settings2 size={16} /> Configure</a>
 </header>
@@ -171,7 +173,11 @@
             </span>
           </a>
         {:else}
-          <div class="empty-inline">No packs yet. Refresh the channel to build the first one.</div>
+          <div class="empty-inline">
+            {overview.channel.kind === "trumped_downloads"
+              ? "No snapshot yet. Refresh after download inspection to list unregistered OPS torrents."
+              : "No packs yet. Refresh the channel to build the first one."}
+          </div>
         {/if}
         {#if ($data.data?.histories[overview.channel.id]?.length ?? 0) > 1}
           <div class="pack-history">

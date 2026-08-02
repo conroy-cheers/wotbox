@@ -545,7 +545,7 @@ export type BackgroundJobsOverview = {
   jobs: BackgroundJobStatus[];
 };
 
-export type ChannelKind = "country_chart" | "lastfm";
+export type ChannelKind = "country_chart" | "lastfm" | "trumped_downloads";
 
 export type ChannelConfig = {
   id: string;

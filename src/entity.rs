@@ -141,6 +141,7 @@ pub mod download_release_link {
         #[sea_orm(primary_key, auto_increment = false)]
         pub info_hash: String,
         pub announce_host: Option<String>,
+        pub torrent_name: Option<String>,
         pub tracker: Option<String>,
         pub group_id: Option<i64>,
         pub torrent_id: Option<i64>,

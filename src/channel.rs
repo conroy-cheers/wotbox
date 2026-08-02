@@ -89,6 +89,14 @@ pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Res
                 bail!("Last.fm catalog country must be a two-letter code");
             }
         }
+        ChannelKind::TrumpedDownloads => {
+            if channel.id != "trumped_downloads" {
+                bail!("trumped downloads channel id must be trumped_downloads");
+            }
+            if channel.country_chart.is_some() || channel.lastfm.is_some() {
+                bail!("trumped downloads channel does not accept source settings");
+            }
+        }
     }
     Ok(())
 }
@@ -197,6 +205,7 @@ pub async fn refresh_channel(
     channel: ChannelConfig,
     run_id: uuid::Uuid,
 ) -> Result<(uuid::Uuid, ChannelRunStatus)> {
+    let empty_source_is_valid = matches!(channel.kind, ChannelKind::TrumpedDownloads);
     let (sources, mut partial, title) = match channel.kind {
         ChannelKind::CountryChart => {
             let settings = channel
@@ -226,8 +235,17 @@ pub async fn refresh_channel(
                 format!("Last.fm discovery for {}", settings.username),
             )
         }
+        ChannelKind::TrumpedDownloads => {
+            let items = trumped_download_sources(&state).await?;
+            let count = items.len();
+            (
+                items,
+                false,
+                format!("Trumped downloads · {count} detected"),
+            )
+        }
     };
-    if sources.is_empty() {
+    if sources.is_empty() && !empty_source_is_valid {
         bail!("recommendation source returned no usable albums");
     }
 
@@ -730,6 +748,104 @@ async fn get_json_with_retry(request: reqwest::RequestBuilder) -> Result<Value> 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("recommendation request failed")))
 }
 
+async fn trumped_download_sources(state: &AppState) -> Result<Vec<RecommendationSource>> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    for link in state.db.unregistered_downloads().await? {
+        let Some(name) = link.torrent_name.as_deref() else {
+            continue;
+        };
+        let (artist, title, year) = parse_download_release_name(name);
+        let identity = format!("{}\0{}", normalized(&artist), normalized(&title));
+        if title.is_empty() || !seen.insert(identity) {
+            continue;
+        }
+        let digest = Sha256::digest(format!("{}\0{}", link.client, link.info_hash).as_bytes());
+        sources.push(RecommendationSource {
+            id: format!("trumped:{}", &hex::encode(digest)[..20]),
+            rank: sources.len() as u32 + 1,
+            artist,
+            title,
+            year,
+            artwork: None,
+            url: None,
+            mbid: None,
+            score: None,
+            catalog_country: None,
+            substituted_from: None,
+        });
+    }
+    Ok(sources)
+}
+
+fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
+    let structured = value.contains(" - ");
+    let display = value
+        .chars()
+        .map(|character| match character {
+            '_' => ' ',
+            '.' if !structured => ' ',
+            character => character,
+        })
+        .collect::<String>();
+    let display = display.split_whitespace().collect::<Vec<_>>().join(" ");
+    let year = release_name_year(&display);
+    let Some((artist, remainder)) = display.split_once(" - ") else {
+        return (String::new(), strip_download_metadata(&display), year);
+    };
+    let artist = artist.trim().to_owned();
+    let remainder = remainder.trim();
+    let title = if remainder
+        .get(..4)
+        .and_then(|candidate| candidate.parse::<i64>().ok())
+        .is_some_and(|candidate| (1900..=2100).contains(&candidate))
+    {
+        remainder
+            .get(4..)
+            .and_then(|value| value.trim().strip_prefix('-'))
+            .map(str::trim)
+            .unwrap_or(remainder)
+    } else {
+        remainder
+    };
+    (artist, strip_download_metadata(title), year)
+}
+
+fn release_name_year(value: &str) -> Option<i64> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|candidate| candidate.len() == 4)
+        .filter_map(|candidate| candidate.parse::<i64>().ok())
+        .find(|year| (1900..=2100).contains(year))
+}
+
+fn strip_download_metadata(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let markers = [
+        " - 19",
+        " - 20",
+        " (19",
+        " (20",
+        " [19",
+        " [20",
+        " - single",
+        " [flac",
+        " [web",
+        " (flac",
+        " (web",
+        " (v0",
+        " (v2",
+        " [v0",
+        " [v2",
+    ];
+    let end = markers
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .unwrap_or(value.len());
+    value[..end].trim().trim_end_matches('-').trim().to_owned()
+}
+
 async fn resolve_source(
     state: &Arc<AppState>,
     source: RecommendationSource,
@@ -761,6 +877,7 @@ async fn resolve_tracker_source(
     source: RecommendationSource,
     preferences: &RuntimePreferences,
 ) -> Result<Option<ChannelPackItem>> {
+    let include_all_release_types = source.id.starts_with("trumped:");
     let mut groups = Vec::new();
     let mut queries = vec![source.title.clone()];
     if let Some(base) = base_edition_title(&source.title)
@@ -793,9 +910,11 @@ async fn resolve_tracker_source(
                     cache_search_canonical(&state.db, name, &page).await?;
                     assign_search_ids(&state.db, &mut page).await?;
                     groups.extend(page.groups.into_iter().filter(|group| {
-                        group.release_type.as_deref().is_some_and(|value| {
-                            value.eq_ignore_ascii_case("album") || value.eq_ignore_ascii_case("ep")
-                        })
+                        include_all_release_types
+                            || group.release_type.as_deref().is_some_and(|value| {
+                                value.eq_ignore_ascii_case("album")
+                                    || value.eq_ignore_ascii_case("ep")
+                            })
                     }));
                 }
                 Err(error) => {
@@ -1509,8 +1628,8 @@ mod tests {
     use super::{
         apple_chart_url, apple_sources_from_cache, apply_pack_constraints, base_edition_title,
         channel_is_due, compare_variants, get_json_with_retry, lastfm_failure, next_occurrence,
-        next_refresh_at, parse_apple_chart, tracker_query_title, validate_channel,
-        validate_channel_refresh,
+        next_refresh_at, parse_apple_chart, parse_download_release_name, tracker_query_title,
+        validate_channel, validate_channel_refresh,
     };
 
     #[test]
@@ -1519,6 +1638,26 @@ mod tests {
         assert_eq!(
             tracker_query_title(" 1989 (Taylor's Version) "),
             Some("1989 (Taylor's Version)".into())
+        );
+    }
+
+    #[test]
+    fn parses_common_private_tracker_download_names() {
+        assert_eq!(
+            parse_download_release_name("Galantis - Gold Dust (Remixes) - 2015 (WEB - V0)"),
+            ("Galantis".into(), "Gold Dust (Remixes)".into(), Some(2015))
+        );
+        assert_eq!(
+            parse_download_release_name("Coldplay - 2011 - Every Teardrop Is A Waterfall (V2)"),
+            (
+                "Coldplay".into(),
+                "Every Teardrop Is A Waterfall".into(),
+                Some(2011)
+            )
+        );
+        assert_eq!(
+            parse_download_release_name("Bruno Mars - Unorthodox Jukebox (2012) [FLAC]"),
+            ("Bruno Mars".into(), "Unorthodox Jukebox".into(), Some(2012))
         );
     }
 

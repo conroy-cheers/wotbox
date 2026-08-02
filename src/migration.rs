@@ -44,6 +44,14 @@ impl MigrationName for OpsTorrentDiagnosisSchema {
 #[async_trait]
 impl MigrationTrait for OpsTorrentDiagnosisSchema {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        add_column_if_missing(
+            manager,
+            &schema,
+            download_release_link::Entity,
+            download_release_link::Column::TorrentName,
+        )
+        .await?;
         manager
             .get_connection()
             .execute_unprepared(

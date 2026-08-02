@@ -575,14 +575,14 @@ async fn update_channel(
     }
     requested.country_chart = match requested.kind {
         ChannelKind::CountryChart => requested.country_chart,
-        ChannelKind::Lastfm => None,
+        ChannelKind::Lastfm | ChannelKind::TrumpedDownloads => None,
     };
     requested.lastfm = match requested.kind {
         ChannelKind::Lastfm => requested.lastfm,
-        ChannelKind::CountryChart => None,
+        ChannelKind::CountryChart | ChannelKind::TrumpedDownloads => None,
     };
     requested.credential_configured =
-        state.lastfm_api_key.is_some() || matches!(requested.kind, ChannelKind::CountryChart);
+        !matches!(requested.kind, ChannelKind::Lastfm) || state.lastfm_api_key.is_some();
     let lastfm_username_changed = requested.kind == ChannelKind::Lastfm
         && requested
             .lastfm
@@ -2892,6 +2892,7 @@ async fn downloads(
             Ok(Ok(downloads)) => {
                 for download in downloads {
                     observations.push(DownloadObservation {
+                        torrent_name: Some(download.name.clone()),
                         live: download.live.clone(),
                         announce_host: download.announce_host.clone(),
                         tracker: download
@@ -5000,7 +5001,8 @@ fn is_ui_route(path: &str) -> bool {
         | ["preferences"] => true,
         ["library", "artists", id] | ["releases", id] => uuid::Uuid::parse_str(id).is_ok(),
         ["channels", channel, "packs", id] => {
-            matches!(*channel, "country_chart" | "lastfm") && uuid::Uuid::parse_str(id).is_ok()
+            matches!(*channel, "country_chart" | "lastfm" | "trumped_downloads")
+                && uuid::Uuid::parse_str(id).is_ok()
         }
         _ => false,
     }
@@ -5299,6 +5301,7 @@ mod tests {
             "downloads",
             "channels",
             "channels/country_chart/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
+            "channels/trumped_downloads/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
             "matches",
             "preferences",
             "releases/d243a33e-93c5-4f85-b750-5aa301fbe1b5",

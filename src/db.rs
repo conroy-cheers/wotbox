@@ -51,6 +51,7 @@ pub struct DownloadReleaseLink {
     pub client: String,
     pub info_hash: String,
     pub announce_host: Option<String>,
+    pub torrent_name: Option<String>,
     pub tracker: Option<String>,
     pub torrent_id: Option<i64>,
     pub resolution_state: String,
@@ -76,6 +77,7 @@ pub struct IndexedDownload {
 }
 
 pub struct DownloadObservation {
+    pub torrent_name: Option<String>,
     pub live: LiveDownloadStatus,
     pub announce_host: Option<String>,
     pub tracker: Option<String>,
@@ -1096,6 +1098,7 @@ impl Database {
         for channel in [
             ChannelConfig::country_chart_default(now),
             ChannelConfig::lastfm_default(now),
+            ChannelConfig::trumped_downloads_default(now),
         ] {
             if channel_config::Entity::find_by_id(channel.id.clone())
                 .one(&self.connection)
@@ -1131,6 +1134,7 @@ impl Database {
         let kind = match channel.kind {
             crate::model::ChannelKind::CountryChart => "country_chart",
             crate::model::ChannelKind::Lastfm => "lastfm",
+            crate::model::ChannelKind::TrumpedDownloads => "trumped_downloads",
         };
         if let Some(model) = channel_config::Entity::find_by_id(channel.id.clone())
             .one(&self.connection)
@@ -3819,6 +3823,7 @@ impl Database {
         plex_target: Option<&PlexScanTarget>,
     ) -> Result<()> {
         self.observe_downloads(&[DownloadObservation {
+            torrent_name: None,
             live: live.clone(),
             announce_host: announce_host.map(str::to_owned),
             tracker: tracker.map(str::to_owned),
@@ -3842,6 +3847,11 @@ impl Database {
         observation: &DownloadObservation,
     ) -> Result<()> {
         let live = &observation.live;
+        let torrent_name = observation
+            .torrent_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let announce_host = observation.announce_host.as_deref();
         let tracker = observation.tracker.as_deref();
         let plex_target = observation.plex_target.as_ref();
@@ -3879,6 +3889,9 @@ impl Database {
                 .or_else(|| model.client_added_at.clone());
             let mut active = model.into_active_model();
             active.announce_host = Set(announce_host.map(str::to_owned));
+            if let Some(torrent_name) = torrent_name {
+                active.torrent_name = Set(Some(torrent_name.chars().take(500).collect()));
+            }
             if !linked {
                 active.tracker = Set(tracker.map(str::to_owned));
                 if tracker_changed {
@@ -3906,6 +3919,7 @@ impl Database {
                 client: Set(live.client.clone()),
                 info_hash: Set(hash.clone()),
                 announce_host: Set(announce_host.map(str::to_owned)),
+                torrent_name: Set(torrent_name.map(|value| value.chars().take(500).collect())),
                 tracker: Set(tracker.map(str::to_owned)),
                 group_id: Set(None),
                 torrent_id: Set(None),
@@ -3997,6 +4011,7 @@ impl Database {
                 client: Set(client.into()),
                 info_hash: Set(hash),
                 announce_host: Set(None),
+                torrent_name: Set(None),
                 tracker: Set(Some(tracker.into())),
                 group_id: Set(group_id),
                 torrent_id: Set(Some(torrent_id)),
@@ -4053,6 +4068,22 @@ impl Database {
                 "resolving",
                 "failed",
             ]))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(link_from_model)
+            .collect())
+    }
+
+    pub async fn unregistered_downloads(&self) -> Result<Vec<DownloadReleaseLink>> {
+        Ok(download_release_link::Entity::find()
+            .filter(download_release_link::Column::Present.eq(true))
+            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
+            .filter(download_release_link::Column::ErrorCode.eq("torrent_unregistered"))
+            .filter(download_release_link::Column::TorrentName.is_not_null())
+            .order_by_desc(download_release_link::Column::ClientAddedAt)
+            .order_by_asc(download_release_link::Column::Client)
+            .order_by_asc(download_release_link::Column::InfoHash)
             .all(&self.connection)
             .await?
             .into_iter()
@@ -4857,6 +4888,7 @@ fn link_from_model(model: download_release_link::Model) -> DownloadReleaseLink {
         client: model.client,
         info_hash: model.info_hash,
         announce_host: model.announce_host,
+        torrent_name: model.torrent_name,
         tracker: model.tracker,
         torrent_id: model.torrent_id,
         resolution_state: model.resolution_state,
@@ -5451,12 +5483,19 @@ mod tests {
             .expect("database");
         db.ensure_default_channels().await.expect("seed channels");
         let channels = db.list_channels().await.expect("channels");
-        assert_eq!(channels.len(), 2);
+        assert_eq!(channels.len(), 3);
         assert!(
             !channels
                 .iter()
                 .find(|channel| channel.id == "country_chart")
                 .expect("chart")
+                .enabled
+        );
+        assert!(
+            channels
+                .iter()
+                .find(|channel| channel.id == "trumped_downloads")
+                .expect("trumped downloads")
                 .enabled
         );
         let item = ChannelPackItem {
@@ -5768,6 +5807,41 @@ mod tests {
                 .expect("link")
                 .resolution_state,
             "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_only_completed_downloads_with_explicit_unregistered_evidence() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        let hash = "abcdef0123456789abcdef0123456789abcdef01";
+        db.seed_download_link("music", hash, "ops", None, 20, false)
+            .await
+            .expect("link");
+        let model =
+            download_release_link::Entity::find_by_id(("music".to_owned(), hash.to_owned()))
+                .one(&db.connection)
+                .await
+                .expect("lookup link")
+                .expect("link");
+        let mut active = model.into_active_model();
+        active.torrent_name = Set(Some("Artist - Album (2026) [FLAC]".into()));
+        active.library_added_at = Set(Some(Utc::now().to_rfc3339()));
+        active.update(&db.connection).await.expect("complete link");
+
+        db.set_link_failure("music", hash, true, "torrent_unregistered", "unregistered")
+            .await
+            .expect("unregistered result");
+        let downloads = db
+            .unregistered_downloads()
+            .await
+            .expect("unregistered downloads");
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(
+            downloads[0].torrent_name.as_deref(),
+            Some("Artist - Album (2026) [FLAC]")
         );
     }
 

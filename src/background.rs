@@ -979,6 +979,7 @@ async fn scan_download_client(state: &Arc<AppState>, payload: &Value) -> Result<
         let observations = downloads
             .iter()
             .map(|download| DownloadObservation {
+                torrent_name: Some(download.name.clone()),
                 live: download.live.clone(),
                 announce_host: download.announce_host.clone(),
                 tracker: download
