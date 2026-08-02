@@ -751,22 +751,42 @@ async fn get_json_with_retry(request: reqwest::RequestBuilder) -> Result<Value> 
 async fn trumped_download_sources(state: &AppState) -> Result<Vec<RecommendationSource>> {
     let mut sources = Vec::new();
     let mut seen = HashSet::new();
+    let handled = state
+        .db
+        .handled_channel_sources("trumped_downloads")
+        .await?
+        .into_iter()
+        .filter_map(|source| {
+            let tracker = trumped_source_tracker(&source.id)?;
+            Some(trumped_source_identity(
+                tracker,
+                &source.artist,
+                &source.title,
+            ))
+        })
+        .collect::<HashSet<_>>();
     for link in state.db.unregistered_downloads().await? {
+        let Some(tracker) = link.tracker.as_deref() else {
+            continue;
+        };
         let Some(name) = link.torrent_name.as_deref() else {
             continue;
         };
         let (artist, title, year) = parse_download_release_name(name);
-        let identity = format!(
-            "{}\0{}",
-            trumped_identity_component(&artist),
-            trumped_identity_component(&title)
-        );
+        let identity = trumped_source_identity(tracker, &artist, &title);
         if title.is_empty() || !seen.insert(identity) {
+            continue;
+        }
+        if handled.contains(&trumped_source_identity(tracker, &artist, &title)) {
             continue;
         }
         let digest = Sha256::digest(format!("{}\0{}", link.client, link.info_hash).as_bytes());
         sources.push(RecommendationSource {
-            id: format!("trumped:{}", &hex::encode(digest)[..20]),
+            id: format!(
+                "trumped:{}:{}",
+                tracker.to_ascii_lowercase(),
+                &hex::encode(digest)[..20]
+            ),
             rank: sources.len() as u32 + 1,
             artist,
             title,
@@ -782,7 +802,19 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
     Ok(sources)
 }
 
+fn trumped_source_identity(tracker: &str, artist: &str, title: &str) -> String {
+    format!(
+        "{}\0{}\0{}",
+        tracker.to_ascii_lowercase(),
+        trumped_identity_component(artist),
+        trumped_identity_component(title)
+    )
+}
+
 fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
+    if let Some(parsed) = parse_scene_release_name(value) {
+        return parsed;
+    }
     let structured = value.contains(" - ");
     let display = value
         .chars()
@@ -794,14 +826,14 @@ fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
         .collect::<String>();
     let display = display.split_whitespace().collect::<Vec<_>>().join(" ");
     let year = release_name_year(&display);
+    if let Some((title, artist)) = display.split_once(" ~ ") {
+        return (
+            strip_download_metadata(artist),
+            strip_download_metadata(strip_leading_catalog_code(title)),
+            year,
+        );
+    }
     let Some((artist, remainder)) = display.split_once(" - ") else {
-        if let Some((title, artist)) = display.split_once(" ~ ") {
-            return (
-                strip_download_metadata(artist),
-                strip_download_metadata(strip_leading_catalog_code(title)),
-                year,
-            );
-        }
         let parts = display.split(" · ").map(str::trim).collect::<Vec<_>>();
         if parts.len() >= 3 && parts[1].parse::<i64>().ok() == year {
             return (
@@ -810,9 +842,22 @@ fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
                 year,
             );
         }
-        return (String::new(), strip_download_metadata(&display), year);
+        if let Some(year) = year
+            && let Some((artist, title)) = split_dated_release_name(&display, year)
+        {
+            return (
+                strip_download_metadata(strip_leading_catalog_code(&artist)),
+                strip_download_metadata(&title),
+                Some(year),
+            );
+        }
+        return (
+            String::new(),
+            strip_unstructured_download_metadata(&display, year),
+            year,
+        );
     };
-    let artist = strip_leading_year(artist.trim());
+    let artist = strip_leading_catalog_code(&strip_leading_year(artist.trim())).to_owned();
     let remainder = remainder.trim();
     let title = if remainder
         .get(..4)
@@ -828,6 +873,90 @@ fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
         remainder
     };
     (artist, strip_download_metadata(title), year)
+}
+
+fn parse_scene_release_name(value: &str) -> Option<(String, String, Option<i64>)> {
+    let catalog = value.find("-(")?;
+    let catalog_end = value[catalog + 2..].find(')')? + catalog + 2;
+    let catalog_value = &value[catalog + 2..catalog_end];
+    if catalog_value.is_empty()
+        || !catalog_value
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let (artist, title) = value[..catalog].rsplit_once('-')?;
+    let clean = |part: &str| {
+        part.replace('_', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some((
+        clean(artist),
+        strip_download_metadata(&clean(title)),
+        release_name_year(value),
+    ))
+}
+
+fn split_dated_release_name(value: &str, year: i64) -> Option<(String, String)> {
+    let year = year.to_string();
+    let offset = value.find(&year)?;
+    let artist = value[..offset]
+        .trim()
+        .trim_end_matches(['-', '.', ' '])
+        .trim();
+    if artist.is_empty() {
+        return None;
+    }
+    let mut remainder = value[offset + year.len()..].trim_start();
+    let date_end = remainder
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_digit() || matches!(character, '.' | ' '))
+        .map(|(offset, character)| offset + character.len_utf8())
+        .last()
+        .unwrap_or_default();
+    if date_end > 0 && remainder[date_end..].starts_with('-') {
+        remainder = remainder[date_end + 1..].trim_start();
+    }
+    while let Some(next) = remainder.strip_prefix('.') {
+        remainder = next.trim_start_matches(|character: char| character.is_ascii_digit());
+    }
+    remainder = remainder
+        .trim_start()
+        .strip_prefix('-')
+        .unwrap_or(remainder)
+        .trim();
+    if remainder.split_whitespace().all(is_download_metadata_token) {
+        return None;
+    }
+    let title = strip_download_metadata(remainder);
+    (!title.is_empty()).then(|| (artist.to_owned(), title))
+}
+
+fn strip_unstructured_download_metadata(value: &str, year: Option<i64>) -> String {
+    let mut value = strip_leading_year(value);
+    if let Some(year) = year {
+        let marker = year.to_string();
+        if let Some(offset) = value.find(&marker)
+            && value[offset + marker.len()..]
+                .split_whitespace()
+                .all(is_download_metadata_token)
+        {
+            value.truncate(offset);
+        }
+    }
+    strip_download_metadata(&value)
+}
+
+fn is_download_metadata_token(token: &str) -> bool {
+    let token = normalized(token);
+    token.is_empty()
+        || matches!(
+            token.as_str(),
+            "web" | "cd" | "cdm" | "flac" | "mp3" | "v0" | "v2" | "320" | "single"
+        )
 }
 
 fn release_name_year(value: &str) -> Option<i64> {
@@ -861,16 +990,26 @@ fn strip_download_metadata(value: &str) -> String {
         " (v2",
         " [v0",
         " [v2",
+        " [16",
+        " [24",
+        " [",
         " v0",
         " v2",
         " 320",
+        " {",
     ];
     let end = markers
         .iter()
         .filter_map(|marker| lower.find(marker))
         .min()
         .unwrap_or(value.len());
-    value[..end].trim().trim_end_matches('-').trim().to_owned()
+    let value = value[..end].trim().trim_end_matches('-').trim();
+    value
+        .strip_suffix(" Single")
+        .or_else(|| value.strip_suffix(" single"))
+        .unwrap_or(value)
+        .trim()
+        .to_owned()
 }
 
 fn strip_leading_year(value: &str) -> String {
@@ -884,6 +1023,18 @@ fn strip_leading_year(value: &str) -> String {
     {
         return trimmed[6..].trim().to_owned();
     }
+    if trimmed.len() > 5
+        && trimmed
+            .get(..4)
+            .and_then(|year| year.parse::<i64>().ok())
+            .is_some_and(|year| (1900..=2100).contains(&year))
+        && trimmed
+            .as_bytes()
+            .get(4)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return trimmed[5..].trim().to_owned();
+    }
     trimmed.to_owned()
 }
 
@@ -891,9 +1042,10 @@ fn strip_leading_catalog_code(value: &str) -> &str {
     let trimmed = value.trim();
     if trimmed.starts_with('[')
         && let Some(end) = trimmed.find("] ")
-        && trimmed[1..end]
-            .chars()
-            .all(|character| character.is_ascii_digit())
+        && !trimmed[1..end].is_empty()
+        && trimmed[1..end].chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         return trimmed[end + 2..].trim();
     }
@@ -944,7 +1096,9 @@ async fn resolve_tracker_source(
     source: RecommendationSource,
     preferences: &RuntimePreferences,
 ) -> Result<Option<ChannelPackItem>> {
-    let include_all_release_types = source.id.starts_with("trumped:");
+    if source.id.starts_with("trumped:") {
+        return resolve_trumped_tracker_source(state, source, preferences).await;
+    }
     let mut groups = Vec::new();
     let mut queries = vec![source.title.clone()];
     if let Some(base) = base_edition_title(&source.title)
@@ -977,11 +1131,9 @@ async fn resolve_tracker_source(
                     cache_search_canonical(&state.db, name, &page).await?;
                     assign_search_ids(&state.db, &mut page).await?;
                     groups.extend(page.groups.into_iter().filter(|group| {
-                        include_all_release_types
-                            || group.release_type.as_deref().is_some_and(|value| {
-                                value.eq_ignore_ascii_case("album")
-                                    || value.eq_ignore_ascii_case("ep")
-                            })
+                        group.release_type.as_deref().is_some_and(|value| {
+                            value.eq_ignore_ascii_case("album") || value.eq_ignore_ascii_case("ep")
+                        })
                     }));
                 }
                 Err(error) => {
@@ -1032,6 +1184,313 @@ async fn resolve_tracker_source(
     resolve_release(state, source, release_id, preferences)
         .await
         .map(Some)
+}
+
+async fn resolve_trumped_tracker_source(
+    state: &Arc<AppState>,
+    source: RecommendationSource,
+    preferences: &RuntimePreferences,
+) -> Result<Option<ChannelPackItem>> {
+    let origin = trumped_source_tracker(&source.id).with_context(
+        || "trumped download source has no origin tracker; refresh the channel before replanning",
+    )?;
+    let (tracker_name, tracker) = state
+        .trackers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(origin))
+        .with_context(|| format!("origin tracker {origin} is not configured"))?;
+    let identities = trumped_source_identities(&source);
+    let mut last_error = None;
+    for request in trumped_search_requests(&source, &identities) {
+        match tracker
+            .search_with_class(&request, RequestClass::Scheduled)
+            .await
+        {
+            Ok((mut page, _)) => {
+                cache_search_canonical(&state.db, tracker_name, &page).await?;
+                assign_search_ids(&state.db, &mut page).await?;
+                let mut matches = page
+                    .groups
+                    .into_iter()
+                    .filter_map(|group| {
+                        let score = trumped_group_score(&source, &identities, &group);
+                        (score >= AUTO_MERGE_THRESHOLD).then_some((score, group))
+                    })
+                    .collect::<Vec<_>>();
+                matches
+                    .sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
+                let Some((best_score, best)) = matches.first().cloned() else {
+                    continue;
+                };
+                if let Some((second_score, second)) = matches.get(1)
+                    && best.id != second.id
+                    && best_score - second_score < 0.03
+                {
+                    return Ok(Some(unresolved_item(
+                        source,
+                        RecommendationMatchState::Ambiguous,
+                        PackItemPlanState::Ambiguous,
+                        "Multiple same-tracker releases matched with similar confidence",
+                    )));
+                }
+                let release_id = best
+                    .id
+                    .context("matched tracker release has no canonical id")?;
+                return resolve_release(state, source, release_id, preferences)
+                    .await
+                    .map(Some);
+            }
+            Err(error) => {
+                tracing::warn!(tracker = tracker_name, %error, "trumped replacement lookup failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        bail!("origin tracker lookup incomplete: {tracker_name}: {error}");
+    }
+    Ok(None)
+}
+
+fn trumped_source_tracker(source_id: &str) -> Option<&str> {
+    let remainder = source_id.strip_prefix("trumped:")?;
+    let (tracker, fingerprint) = remainder.split_once(':')?;
+    (!tracker.is_empty() && !fingerprint.is_empty()).then_some(tracker)
+}
+
+fn trumped_search_requests(
+    source: &RecommendationSource,
+    identities: &[(String, String)],
+) -> Vec<SearchRequest> {
+    let mut requests = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |title: &str, artist: Option<&str>, year: Option<i64>| {
+        let title = title.trim();
+        let artist = artist.map(str::trim).filter(|value| !value.is_empty());
+        if title.is_empty() {
+            return;
+        }
+        let key = format!(
+            "{}\0{}\0{}",
+            normalized(title),
+            artist.map(normalized).unwrap_or_default(),
+            year.map(|value| value.to_string()).unwrap_or_default()
+        );
+        if seen.insert(key) {
+            requests.push(SearchRequest {
+                query: Some(title.to_owned()),
+                artist: artist.map(str::to_owned),
+                year,
+                page: Some(1),
+                ..Default::default()
+            });
+        }
+    };
+
+    for (artist, title) in identities {
+        push(title, Some(artist), source.year);
+    }
+    for (artist, title) in identities {
+        push(title, Some(artist), None);
+    }
+    for (_, title) in identities {
+        push(title, None, source.year);
+    }
+    for (_, title) in identities {
+        push(title, None, None);
+    }
+    requests
+}
+
+fn trumped_source_identities(source: &RecommendationSource) -> Vec<(String, String)> {
+    let titles = trumped_title_variants(&source.title);
+    let mut identities = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |artist: String, title: String| {
+        let key = format!("{}\0{}", normalized(&artist), normalized(&title));
+        if !title.trim().is_empty() && seen.insert(key) {
+            identities.push((artist, title));
+        }
+    };
+
+    if !source.artist.trim().is_empty() {
+        let artists = trumped_artist_variants(&source.artist);
+        for title in &titles {
+            for artist in &artists {
+                push(artist.clone(), title.clone());
+            }
+        }
+    } else {
+        for title in &titles {
+            push(String::new(), title.clone());
+        }
+        let words = source
+            .title
+            .split_whitespace()
+            .filter(|word| !is_download_metadata_token(word))
+            .filter(|word| {
+                !word
+                    .trim_matches(|character: char| !character.is_ascii_digit())
+                    .parse::<i64>()
+                    .is_ok_and(|year| (1900..=2100).contains(&year))
+            })
+            .collect::<Vec<_>>();
+        for split in [2usize, 1, 3, 4] {
+            if words.len() <= split + 1 {
+                continue;
+            }
+            let artist = words[..split].join(" ");
+            for title in trumped_title_variants(&words[split..].join(" ")) {
+                push(artist.clone(), title);
+            }
+        }
+    }
+    identities
+}
+
+fn trumped_artist_variants(value: &str) -> Vec<String> {
+    let value = strip_leading_catalog_code(value).trim();
+    let mut values = vec![value.to_owned()];
+    let lower = value.to_ascii_lowercase();
+    let separators = [
+        " feat. ",
+        " feat ",
+        " featuring ",
+        " ft. ",
+        " ft ",
+        ",",
+        " & ",
+    ];
+    if let Some(offset) = separators
+        .iter()
+        .filter_map(|separator| lower.find(separator))
+        .min()
+    {
+        values.push(value[..offset].trim().to_owned());
+    }
+    values.retain(|value| !value.is_empty());
+    values.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    values
+}
+
+fn trumped_title_variants(value: &str) -> Vec<String> {
+    let mut values = vec![value.trim().to_owned()];
+    let without_guest = strip_parenthetical_credit(value);
+    if !without_guest.eq_ignore_ascii_case(value) {
+        values.push(without_guest.clone());
+    }
+    for title in [value, without_guest.as_str()] {
+        if let Some(base) = strip_trumped_title_suffix(title) {
+            values.push(base);
+        }
+    }
+    values.retain(|value| !value.trim().is_empty());
+    values.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    values
+}
+
+fn strip_parenthetical_credit(value: &str) -> String {
+    let mut output = value.to_owned();
+    loop {
+        let lower = output.to_ascii_lowercase();
+        let Some(start) = ["(feat. ", "(feat ", "(featuring ", "(ft. ", "(ft "]
+            .iter()
+            .filter_map(|marker| lower.find(marker))
+            .min()
+        else {
+            break;
+        };
+        let Some(end) = output[start..].find(')').map(|offset| start + offset) else {
+            break;
+        };
+        output.replace_range(start..=end, "");
+        output = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    output
+}
+
+fn strip_trumped_title_suffix(value: &str) -> Option<String> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    for suffix in [
+        " (promo cds)",
+        " (remixes)",
+        " (remix)",
+        " (acoustic)",
+        " (live)",
+        " single",
+    ] {
+        if lower.ends_with(suffix) {
+            return Some(value[..value.len() - suffix.len()].trim().to_owned());
+        }
+    }
+    None
+}
+
+fn trumped_group_score(
+    source: &RecommendationSource,
+    identities: &[(String, String)],
+    group: &crate::model::SearchGroup,
+) -> f64 {
+    let mut score = 0.0_f64;
+    for (artist, title) in identities {
+        for year in [source.year, None] {
+            score = score.max(external_score(
+                title,
+                artist,
+                year,
+                &group.name,
+                group.artist.as_deref(),
+                group.year,
+                group.release_type.as_deref(),
+            ));
+        }
+        if artist.is_empty()
+            && normalized(title) == normalized(&group.name)
+            && source
+                .year
+                .zip(group.year)
+                .is_some_and(|(left, right)| (left - right).abs() <= 1)
+        {
+            score = score.max(0.90);
+        }
+    }
+
+    if let Some(intent) = trumped_release_intent(&source.title) {
+        let matches_intent = normalized(&group.name).contains(intent)
+            || group
+                .release_type
+                .as_deref()
+                .is_some_and(|value| normalized(value).contains(intent))
+            || group.torrents.iter().any(|torrent| {
+                torrent
+                    .remaster_title
+                    .as_deref()
+                    .is_some_and(|value| normalized(value).contains(intent))
+            });
+        if matches_intent {
+            score = (score + 0.08).min(1.0);
+        } else if identities
+            .iter()
+            .any(|(_, title)| normalized(title) == normalized(&group.name))
+        {
+            score = (score - 0.12).max(0.0);
+        }
+    }
+    score
+}
+
+fn trumped_release_intent(value: &str) -> Option<&'static str> {
+    let value = normalized(value);
+    if value.contains("remix") {
+        Some("remix")
+    } else if value.contains("acoustic") {
+        Some("acoustic")
+    } else if value.contains("live") {
+        Some("live")
+    } else {
+        None
+    }
 }
 
 fn tracker_query_title(value: &str) -> Option<String> {
@@ -1305,6 +1764,13 @@ pub async fn resolve_release(
     release_id: uuid::Uuid,
     preferences: &RuntimePreferences,
 ) -> Result<ChannelPackItem> {
+    let trumped_tracker = if source.id.starts_with("trumped:") {
+        Some(trumped_source_tracker(&source.id).with_context(|| {
+            "trumped download source has no origin tracker; refresh the channel before attaching a release"
+        })?)
+    } else {
+        None
+    };
     let detail = state
         .db
         .get_release_detail(release_id)
@@ -1318,6 +1784,22 @@ pub async fn resolve_release(
         bail!("only Album and EP releases can be attached to a channel pack");
     }
     let mut variants = detail.variants;
+    if let Some(tracker) = trumped_tracker {
+        variants.retain(|variant| variant.tracker.eq_ignore_ascii_case(tracker));
+        let downloaded = state
+            .db
+            .downloaded_torrent_ids(
+                tracker,
+                &variants
+                    .iter()
+                    .map(|variant| variant.torrent_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        variants.retain(|variant| !downloaded.contains(&variant.torrent_id));
+    }
     for variant in &mut variants {
         variant.eligibility = Some(preferences.release.eligibility(
             &variant.tracker,
@@ -1329,8 +1811,23 @@ pub async fn resolve_release(
             variant.can_use_token || !variant.token_eligibility_known,
         ));
     }
-    let (owned, downloading) = state.db.release_download_flags(release_id).await?;
-    let (plan_state, plan, reason) = if owned {
+    let (owned, downloading) = if trumped_tracker.is_some() {
+        (false, false)
+    } else {
+        state.db.release_download_flags(release_id).await?
+    };
+    let (plan_state, plan, reason) = if let Some(tracker) = trumped_tracker
+        && variants.is_empty()
+    {
+        (
+            PackItemPlanState::AlreadyOwned,
+            None,
+            Some(format!(
+                "Every current {} torrent for this release has already been downloaded",
+                tracker.to_ascii_uppercase()
+            )),
+        )
+    } else if owned {
         (
             PackItemPlanState::AlreadyOwned,
             None,
@@ -1691,14 +2188,16 @@ mod tests {
         ChannelConfig, ChannelPackItem, CountryChartChannelSettings, DownloadEligibility,
         DownloadEligibilityReason, DownloadProfile, LeechStatus, PackItemPlanState,
         PlannedDownload, RecommendationMatchState, RecommendationSource, ReleasePreferences,
-        RuntimePreferences, TorrentVariant,
+        RuntimePreferences, SearchGroup, TorrentVariant,
     };
 
     use super::{
         apple_chart_url, apple_sources_from_cache, apply_pack_constraints, base_edition_title,
         channel_is_due, compare_variants, get_json_with_retry, lastfm_failure, next_occurrence,
         next_refresh_at, parse_apple_chart, parse_download_release_name, tracker_query_title,
-        trumped_identity_component, validate_channel, validate_channel_refresh,
+        trumped_group_score, trumped_identity_component, trumped_search_requests,
+        trumped_source_identities, trumped_source_tracker, validate_channel,
+        validate_channel_refresh,
     };
 
     #[test]
@@ -1744,6 +2243,133 @@ mod tests {
             trumped_identity_component("Hate That I Love You CDM V0 2007 WRE"),
             trumped_identity_component("Hate That I Love You CDM 320 2007 WRE")
         );
+        assert_eq!(
+            parse_download_release_name(
+                "Himiko Kikuchi (菊池ひみこ) -1987.11.21- Flying Beagle {32DH 810} [CD-FLAC] (1987)"
+            ),
+            (
+                "Himiko Kikuchi (菊池ひみこ)".into(),
+                "Flying Beagle".into(),
+                Some(1987)
+            )
+        );
+        assert_eq!(
+            parse_download_release_name("Steve Aoki. 2015 Darker Than Blood (Remixes) [V0]"),
+            (
+                "Steve Aoki".into(),
+                "Darker Than Blood (Remixes)".into(),
+                Some(2015)
+            )
+        );
+        assert_eq!(
+            parse_download_release_name(
+                "Rihanna_feat._Ne-Yo-Hate_That_I_Love_You-(1753786)-CDM-V0-2007-WRE"
+            ),
+            (
+                "Rihanna feat. Ne-Yo".into(),
+                "Hate That I Love You".into(),
+                Some(2007)
+            )
+        );
+        assert_eq!(
+            parse_download_release_name("[220729] All That Really Matters ~ ILLENIUM - [WEB] (V2)"),
+            ("ILLENIUM".into(), "All That Really Matters".into(), None)
+        );
+        assert_eq!(
+            parse_download_release_name(
+                "2009 Magnificent (Remixes) [US, INTR-12601-2 , U2CDMREMIX] (V0)"
+            ),
+            (String::new(), "Magnificent (Remixes)".into(), Some(2009))
+        );
+        assert_eq!(
+            parse_download_release_name("Masked.Wolf.Never.The.Same.2023.WEB.V0.Single"),
+            (
+                String::new(),
+                "Masked Wolf Never The Same".into(),
+                Some(2023)
+            )
+        );
+    }
+
+    fn trumped_source(artist: &str, title: &str, year: Option<i64>) -> RecommendationSource {
+        RecommendationSource {
+            id: "trumped:ops:0123456789abcdef0123".into(),
+            rank: 1,
+            artist: artist.into(),
+            title: title.into(),
+            year,
+            artwork: None,
+            url: None,
+            mbid: None,
+            score: None,
+            catalog_country: None,
+            substituted_from: None,
+        }
+    }
+
+    fn search_group(name: &str, artist: &str, year: i64, release_type: &str) -> SearchGroup {
+        SearchGroup {
+            id: None,
+            tracker: "ops".into(),
+            group_id: 1,
+            name: name.into(),
+            artist: Some(artist.into()),
+            year: Some(year),
+            release_type: Some(release_type.into()),
+            image: None,
+            tags: Vec::new(),
+            torrents: Vec::new(),
+            sources: Vec::new(),
+            album_coverage: None,
+        }
+    }
+
+    #[test]
+    fn trumped_sources_are_bound_to_their_origin_tracker() {
+        assert_eq!(
+            trumped_source_tracker("trumped:ops:0123456789abcdef0123"),
+            Some("ops")
+        );
+        assert_eq!(trumped_source_tracker("trumped:0123456789abcdef0123"), None);
+    }
+
+    #[test]
+    fn trumped_search_recovers_live_filename_shapes() {
+        let source = trumped_source("", "Ed Sheeran The A Team", None);
+        let identities = trumped_source_identities(&source);
+        let requests = trumped_search_requests(&source, &identities);
+        assert!(requests.iter().any(|request| {
+            request.query.as_deref() == Some("The A Team")
+                && request.artist.as_deref() == Some("Ed Sheeran")
+        }));
+
+        let shivering = trumped_source("ILLENIUM", "Shivering (feat. Spiritbox)", None);
+        let identities = trumped_source_identities(&shivering);
+        assert!(
+            trumped_group_score(
+                &shivering,
+                &identities,
+                &search_group("Shivering", "ILLENIUM", 2022, "Single")
+            ) >= crate::release_matcher::AUTO_MERGE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn trumped_search_prefers_the_release_type_implied_by_the_old_name() {
+        let source = trumped_source("", "Magnificent (Remixes)", Some(2009));
+        let identities = trumped_source_identities(&source);
+        let remix = trumped_group_score(
+            &source,
+            &identities,
+            &search_group("Magnificent", "U2", 2009, "Remix"),
+        );
+        let single = trumped_group_score(
+            &source,
+            &identities,
+            &search_group("Magnificent", "U2", 2009, "Single"),
+        );
+        assert!(remix >= crate::release_matcher::AUTO_MERGE_THRESHOLD);
+        assert!(single < crate::release_matcher::AUTO_MERGE_THRESHOLD);
     }
 
     #[test]

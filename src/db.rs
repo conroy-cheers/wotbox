@@ -1433,6 +1433,45 @@ impl Database {
         Ok(sources)
     }
 
+    pub async fn handled_channel_sources(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<crate::model::RecommendationSource>> {
+        let pack_ids = channel_pack::Entity::find()
+            .filter(channel_pack::Column::ChannelId.eq(channel_id))
+            .filter(channel_pack::Column::Decision.eq("accepted"))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|pack| pack.id)
+            .collect::<Vec<_>>();
+        if pack_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sources_by_job = HashMap::new();
+        for item in channel_pack_item::Entity::find()
+            .filter(channel_pack_item::Column::PackId.is_in(pack_ids))
+            .all(&self.connection)
+            .await?
+        {
+            let item: ChannelPackItem = serde_json::from_value(item.item_json)?;
+            if let Some(job_id) = item.job_id {
+                sources_by_job.insert(job_id.to_string(), item.source);
+            }
+        }
+        if sources_by_job.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(download_job::Entity::find()
+            .filter(download_job::Column::Id.is_in(sources_by_job.keys().cloned()))
+            .filter(download_job::Column::State.ne("failed"))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .filter_map(|job| sources_by_job.remove(&job.id))
+            .collect())
+    }
+
     pub async fn replace_channel_plan(
         &self,
         id: Uuid,
@@ -1506,6 +1545,33 @@ impl Database {
             .iter()
             .any(|link| link.present && link.library_added_at.is_none());
         Ok((owned, downloading))
+    }
+
+    pub async fn downloaded_torrent_ids(
+        &self,
+        tracker: &str,
+        torrent_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        if torrent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let links = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Tracker.eq(tracker.to_ascii_lowercase()))
+            .filter(download_release_link::Column::TorrentId.is_in(torrent_ids.iter().copied()))
+            .filter(
+                Condition::any()
+                    .add(download_release_link::Column::Present.eq(true))
+                    .add(download_release_link::Column::LibraryAddedAt.is_not_null()),
+            )
+            .all(&self.connection)
+            .await?;
+        let mut ids = links
+            .into_iter()
+            .filter_map(|link| link.torrent_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     pub async fn enqueue_track_index(&self, tracker: &str, group_id: i64) -> Result<()> {
@@ -5842,6 +5908,18 @@ mod tests {
         assert_eq!(
             downloads[0].torrent_name.as_deref(),
             Some("Artist - Album (2026) [FLAC]")
+        );
+        assert_eq!(
+            db.downloaded_torrent_ids("ops", &[20, 21])
+                .await
+                .expect("downloaded torrent ids"),
+            vec![20]
+        );
+        assert!(
+            db.downloaded_torrent_ids("red", &[20])
+                .await
+                .expect("other tracker ids")
+                .is_empty()
         );
     }
 
