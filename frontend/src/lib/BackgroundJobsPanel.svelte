@@ -24,7 +24,8 @@
     scan_download_client: "Scan download client",
     canonical_backfill: "Update library identities",
     enrich_library_artists: "Enrich library artists",
-    notify_plex: "Notify Plex"
+    notify_plex: "Notify Plex",
+    submit_download: "Submit download"
   };
   const stateOrder: BackgroundJobState[] = [
     "running",

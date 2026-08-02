@@ -19,7 +19,7 @@ use crate::{
     api::{AppState, cleanup_download_stage, enrich_library_artist_credits, process_download},
     db::{DownloadObservation, EnqueueBackgroundJob, StoredBackgroundJob},
     dedupe::{compute_raw_coverage, track_index_from_group},
-    model::CanonicalTorrent,
+    model::{ArtistCatalogRole, CanonicalTorrent},
     plex::PlexScanTarget,
     provider::{ProviderFailureKind, ProviderRequestError, RequestClass},
 };
@@ -340,6 +340,7 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
     for (tracker, group_id) in state.db.pending_single_coverages().await? {
         enqueue_single_coverage(state, &tracker, group_id, None).await?;
     }
+    state.db.reconcile_waiting_single_coverages().await?;
     Ok(())
 }
 
@@ -771,14 +772,14 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
                 .tracker
                 .eq_ignore_ascii_case(&payload.tracker)
                 && membership.group.release.group_id == payload.group_id
+                && has_primary_role(&membership.group.roles)
         })
         .map(|membership| membership.artist_id)
         .collect::<HashSet<_>>();
     if single_artists.is_empty() {
-        return Ok(JobOutcome::Wait {
-            code: "dependencies_pending",
-            message: "Waiting for artist catalog membership".into(),
-        });
+        // A Single encountered outside an artist catalog has no coverage work yet.
+        // Complete this no-op; a later catalog refresh reactivates the durable job.
+        return Ok(JobOutcome::Complete);
     }
     let albums = memberships
         .iter()
@@ -789,6 +790,7 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
                 .tracker
                 .eq_ignore_ascii_case(&payload.tracker)
                 && single_artists.contains(&membership.artist_id)
+                && has_primary_role(&membership.group.roles)
                 && membership.group.listed_on_tracker
                 && !membership.group.variants.is_empty()
                 && membership
@@ -844,6 +846,10 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
         .put_single_coverage(&payload.tracker, payload.group_id, "ready", Some(&coverage))
         .await?;
     Ok(JobOutcome::Complete)
+}
+
+fn has_primary_role(roles: &[ArtistCatalogRole]) -> bool {
+    roles.contains(&ArtistCatalogRole::Primary)
 }
 
 #[derive(Deserialize)]
@@ -1036,4 +1042,20 @@ fn provider_error_is_admission_or_blocked(error: &anyhow::Error) -> bool {
                     }
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::ArtistCatalogRole;
+
+    use super::has_primary_role;
+
+    #[test]
+    fn coverage_uses_only_primary_artist_catalog_groups() {
+        assert!(has_primary_role(&[ArtistCatalogRole::Primary]));
+        assert!(!has_primary_role(&[
+            ArtistCatalogRole::Guest,
+            ArtistCatalogRole::Remixer,
+        ]));
+    }
 }

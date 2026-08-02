@@ -629,6 +629,8 @@ impl Database {
         let mut active = model.into_active_model();
         if let Some(seconds) = recurring {
             active.state = Set("pending".into());
+            active.attempts = Set(0);
+            active.deferrals = Set(0);
             active.next_run_at = Set(Some(
                 (now + chrono::Duration::seconds(seconds.max(1))).to_rfc3339(),
             ));
@@ -967,6 +969,30 @@ impl Database {
             .col_expr(background_job::Column::UpdatedAt, Expr::value(now))
             .filter(background_job::Column::State.eq("waiting"))
             .filter(background_job::Column::DeduplicationKey.is_in(keys))
+            .exec(&self.connection)
+            .await?
+            .rows_affected)
+    }
+
+    pub async fn reconcile_waiting_single_coverages(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        Ok(background_job::Entity::update_many()
+            .col_expr(background_job::Column::State, Expr::value("pending"))
+            .col_expr(
+                background_job::Column::NextRunAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(
+                background_job::Column::LastErrorCode,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                background_job::Column::LastErrorMessage,
+                Expr::value(None::<String>),
+            )
+            .col_expr(background_job::Column::UpdatedAt, Expr::value(now))
+            .filter(background_job::Column::Kind.eq("compute_single_coverage"))
+            .filter(background_job::Column::State.eq("waiting"))
             .exec(&self.connection)
             .await?
             .rows_affected)
@@ -4913,6 +4939,79 @@ mod tests {
             .expect("second job");
         assert_eq!(first.state, "pending");
         assert_eq!(second.state, "waiting");
+
+        assert_eq!(
+            db.reconcile_waiting_single_coverages()
+                .await
+                .expect("startup reconciliation"),
+            1
+        );
+        let second = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq("single-coverage:ops:2:v2"))
+            .one(&db.connection)
+            .await
+            .expect("second reconciled query")
+            .expect("second reconciled job");
+        assert_eq!(second.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn successful_recurring_jobs_reset_failure_counters() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("recurring-jobs.sqlite"))
+            .await
+            .expect("database");
+        let id = db
+            .enqueue_background_job(EnqueueBackgroundJob {
+                deduplication_key: "test:recurring",
+                kind: "test_job",
+                payload: serde_json::json!({}),
+                provider_id: None,
+                lane: "maintenance",
+                priority: 1,
+                max_attempts: 3,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: Some(60),
+            })
+            .await
+            .expect("enqueue recurring job");
+        background_job::Entity::update_many()
+            .col_expr(
+                background_job::Column::Attempts,
+                sea_orm::sea_query::Expr::value(2),
+            )
+            .col_expr(
+                background_job::Column::Deferrals,
+                sea_orm::sea_query::Expr::value(5),
+            )
+            .filter(background_job::Column::Id.eq(id.to_string()))
+            .exec(&db.connection)
+            .await
+            .expect("seed counters");
+
+        let claimed = db
+            .claim_background_job(
+                "maintenance-worker",
+                "maintenance",
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("claim recurring job")
+            .expect("recurring job");
+        db.complete_background_job(claimed.id, "maintenance-worker")
+            .await
+            .expect("complete recurring job");
+
+        let job = background_job::Entity::find_by_id(id.to_string())
+            .one(&db.connection)
+            .await
+            .expect("query recurring job")
+            .expect("recurring job remains");
+        assert_eq!(job.state, "pending");
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.deferrals, 0);
+        assert!(job.next_run_at.is_some());
     }
 
     #[tokio::test]
