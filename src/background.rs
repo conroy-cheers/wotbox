@@ -337,6 +337,10 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
     for job in state.db.due_track_indexes(100_000).await? {
         enqueue_track_index(state, &job.tracker, job.group_id, 10).await?;
     }
+    state
+        .db
+        .reconcile_waiting_single_coverage_track_indexes()
+        .await?;
     for (tracker, group_id) in state.db.pending_single_coverages().await? {
         enqueue_single_coverage(state, &tracker, group_id, None).await?;
     }

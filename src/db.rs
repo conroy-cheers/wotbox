@@ -998,6 +998,31 @@ impl Database {
             .rows_affected)
     }
 
+    pub async fn reconcile_waiting_single_coverage_track_indexes(&self) -> Result<u64> {
+        let jobs = background_job::Entity::find()
+            .filter(background_job::Column::Kind.eq("compute_single_coverage"))
+            .filter(background_job::Column::State.eq("waiting"))
+            .filter(background_job::Column::LastErrorMessage.contains("Single tracklist"))
+            .all(&self.connection)
+            .await?;
+        let mut reconciled = 0;
+        for job in jobs {
+            let tracker = job
+                .payload_json
+                .get("tracker")
+                .and_then(Value::as_str)
+                .context("waiting Single coverage job is missing its tracker")?;
+            let group_id = job
+                .payload_json
+                .get("groupId")
+                .and_then(Value::as_i64)
+                .context("waiting Single coverage job is missing its group id")?;
+            self.enqueue_track_index(tracker, group_id).await?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
     pub async fn provider_state(&self, id: &str) -> Result<Option<StoredProviderState>> {
         provider_state::Entity::find_by_id(id)
             .one(&self.connection)
@@ -4885,7 +4910,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        entity::{background_job, download_release_link},
+        entity::{background_job, download_release_link, release_track_index},
         model::{
             CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
             ClientDownloadState, LiveDownloadStatus, PackItemPlanState, ProviderCircuitState,
@@ -4953,6 +4978,50 @@ mod tests {
             .expect("second reconciled query")
             .expect("second reconciled job");
         assert_eq!(second.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_ensures_waiting_single_track_indexes() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("coverage-index-recovery.sqlite"))
+            .await
+            .expect("database");
+        db.ensure_single_coverage("ops", 42)
+            .await
+            .expect("single coverage");
+        background_job::Entity::update_many()
+            .col_expr(
+                background_job::Column::State,
+                sea_orm::sea_query::Expr::value("waiting"),
+            )
+            .col_expr(
+                background_job::Column::LastErrorMessage,
+                sea_orm::sea_query::Expr::value("Waiting for the Single tracklist"),
+            )
+            .filter(background_job::Column::Kind.eq("compute_single_coverage"))
+            .exec(&db.connection)
+            .await
+            .expect("park coverage job");
+
+        assert_eq!(
+            db.reconcile_waiting_single_coverage_track_indexes()
+                .await
+                .expect("reconcile track index"),
+            1
+        );
+        let index = release_track_index::Entity::find_by_id(("ops".to_owned(), 42))
+            .one(&db.connection)
+            .await
+            .expect("track index query")
+            .expect("track index");
+        assert_eq!(index.state, "pending");
+        let job = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq("track-index:ops:42:v2"))
+            .one(&db.connection)
+            .await
+            .expect("track index job query")
+            .expect("track index job");
+        assert_eq!(job.state, "pending");
     }
 
     #[tokio::test]
