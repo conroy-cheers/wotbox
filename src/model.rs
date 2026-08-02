@@ -363,6 +363,38 @@ pub struct RuntimePreferences {
     pub release: ReleasePreferences,
     #[serde(default)]
     pub api: ApiPreferences,
+    #[serde(default)]
+    pub imports: ImportPreferences,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreferences {
+    /// What to do with an explicitly superseded torrent after its replacement is complete.
+    #[serde(default)]
+    pub trumped_cleanup: ImportCleanupMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportCleanupMode {
+    /// Keep both the old torrent and its payload. This is the safe application default.
+    #[default]
+    Keep,
+    /// Remove only the old torrent from the client, retaining its payload on disk.
+    RemoveTorrent,
+    /// Remove the old torrent and ask the client to delete its payload.
+    DeleteFiles,
+}
+
+impl ImportCleanupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::RemoveTorrent => "remove_torrent",
+            Self::DeleteFiles => "delete_files",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -837,6 +869,9 @@ pub struct LiveDownloadStatus {
     pub eta: Option<i64>,
     pub ratio: f64,
     pub save_path: String,
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub content_path: Option<String>,
     pub added_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -1049,6 +1084,84 @@ pub struct DownloadsPage {
     pub items: Vec<CanonicalDownload>,
     pub total: i64,
     pub index: DownloadIndexCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportTaskState {
+    Downloading,
+    Resolving,
+    NeedsReview,
+    Ready,
+    Processing,
+    Complete,
+    Blocked,
+    Failed,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSupersession {
+    pub source_client: String,
+    pub source_info_hash: String,
+    pub tracker: String,
+    pub source_name: String,
+    pub cleanup_mode: ImportCleanupMode,
+    pub cleanup_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<LiveDownloadStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTask {
+    pub id: Uuid,
+    pub state: ImportTaskState,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<ReleaseSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub baseline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<LiveDownloadStatus>,
+    #[serde(default)]
+    pub supersessions: Vec<ImportSupersession>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTaskCounts {
+    pub active: i64,
+    pub review: i64,
+    pub complete: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportsPage {
+    pub items: Vec<ImportTask>,
+    pub total: i64,
+    pub counts: ImportTaskCounts,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1498,6 +1611,7 @@ pub enum RecommendationMatchState {
 #[serde(rename_all = "snake_case")]
 pub enum PackItemPlanState {
     Executable,
+    CleanupReady,
     AlreadyOwned,
     AlreadyDownloading,
     Duplicate,
@@ -1533,10 +1647,22 @@ pub struct RecommendationSource {
     pub catalog_country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub substituted_from: Option<RecommendationSubstitution>,
+    /// Exact client torrents represented by a grouped trumped-download recommendation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trumped_downloads: Vec<TrumpedDownloadRef>,
     /// Local qBittorrent file metadata used only while resolving a trumped download.
     #[serde(skip)]
     #[schema(ignore)]
     pub lookup_files: Vec<DownloadFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct TrumpedDownloadRef {
+    pub client: String,
+    pub info_hash: String,
+    pub name: String,
+    pub tracker: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1569,6 +1695,32 @@ pub struct PlannedDownload {
     pub media: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementTargetState {
+    Missing,
+    Downloading,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementTarget {
+    pub tracker: String,
+    pub torrent_id: i64,
+    pub state: ReplacementTargetState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(default)]
+    pub downloads: Vec<ReleaseDownload>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelPackItem {
@@ -1586,6 +1738,8 @@ pub struct ChannelPackItem {
     pub plan_state: PackItemPlanState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlannedDownload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<ReplacementTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -28,7 +28,7 @@ use crate::{
     background::{self, BackgroundJobNotifier},
     channel,
     config::{Config, DownloadClientKind, TrackerKind, read_secret},
-    db::{Cached, Database, DownloadObservation},
+    db::{Cached, CreateReplacementImport, Database, DownloadObservation},
     dedupe::track_index_from_group,
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
@@ -37,11 +37,12 @@ use crate::{
         ChannelConfig, ChannelKind, ChannelOverview, ChannelPack, ChannelPackDecision,
         ChannelPackSummary, ChannelRun, ChannelRunStatus, ChannelRunTrigger, ClientDownloadState,
         CreateDownload, DecideChannelPack, DeduplicationIndexStatus, DownloadJob, DownloadProfile,
-        DownloadState, DownloadsPage, LibraryArtistPage, LibraryArtistSummary, LibraryArtistsPage,
-        LibraryAvailability, LibraryCopy, LibraryIndexStatus, LibraryRelease, LibraryVariantState,
-        LiveDownloadStatus, PlexIntegrationStatus, PlexScanQueued, Provenance, ProviderStatus,
-        PublicConfig, ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage,
-        TorrentMetadata, TorrentVariant, value_i64,
+        DownloadState, DownloadsPage, ImportTaskState, ImportsPage, LibraryArtistPage,
+        LibraryArtistSummary, LibraryArtistsPage, LibraryAvailability, LibraryCopy,
+        LibraryIndexStatus, LibraryRelease, LibraryVariantState, LiveDownloadStatus,
+        PlexIntegrationStatus, PlexScanQueued, Provenance, ProviderStatus, PublicConfig,
+        ReleaseDetail, ReleaseSummary, RuntimePreferences, SearchPage, TorrentMetadata,
+        TorrentVariant, value_i64,
     },
     plex::PlexIntegration,
     provider::{
@@ -205,6 +206,7 @@ impl AppState {
         state.db.recover_channel_runs().await?;
         state.db.recover_resolving_links().await?;
         state.db.recover_track_indexes().await?;
+        state.db.sync_import_tasks().await?;
         seed_existing_job_links(&state).await?;
         cleanup_orphaned_download_stages(&state).await?;
         Ok(state)
@@ -300,6 +302,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/library/artists", get(library_artists))
         .route("/api/v1/library/artists/{id}", get(library_artist))
         .route("/api/v1/downloads", get(downloads).post(create_download))
+        .route("/api/v1/imports", get(imports))
+        .route(
+            "/api/v1/imports/{id}/retry",
+            axum::routing::post(retry_import),
+        )
+        .route(
+            "/api/v1/imports/{id}/dismiss",
+            axum::routing::post(dismiss_import),
+        )
         .route(
             "/api/v1/downloads/{client}/{info_hash}",
             get(download_detail_compatibility),
@@ -802,8 +813,8 @@ async fn accept_channel_pack(
     Path(id): Path<Uuid>,
     Json(request): Json<DecideChannelPack>,
 ) -> Result<(StatusCode, Json<ChannelBatchResult>), AppError> {
-    let fingerprint =
-        channel::preference_fingerprint(&state, &state.db.get_runtime_preferences().await?)?;
+    let preferences = state.db.get_runtime_preferences().await?;
+    let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
     let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
     let selected = request
         .ordinals
@@ -815,25 +826,22 @@ async fn accept_channel_pack(
         ));
     }
     if let Some(selected) = &selected {
-        let executable = pack
+        let actionable = pack
             .items
             .iter()
-            .filter(|item| {
-                item.plan_state == crate::model::PackItemPlanState::Executable
-                    && selected.contains(&item.ordinal)
-            })
+            .filter(|item| channel_item_is_actionable(item) && selected.contains(&item.ordinal))
             .count();
-        if executable != selected.len() {
+        if actionable != selected.len() {
             return Err(AppError::bad_request(
                 "invalid_channel_selection",
-                "The selection contains an item that is not executable",
+                "The selection contains an item that has no replacement action",
             ));
         }
     }
     let mut jobs = Vec::new();
     let mut submitted = 0;
     for item in &mut pack.items {
-        if item.plan_state != crate::model::PackItemPlanState::Executable {
+        if !channel_item_is_actionable(item) {
             continue;
         }
         if selected
@@ -846,25 +854,52 @@ async fn accept_channel_pack(
             state.db.update_channel_pack_item(pack.id, item).await?;
             continue;
         }
-        let Some(plan) = &item.plan else {
-            continue;
-        };
-        let request = CreateDownload {
-            tracker: plan.tracker.clone(),
-            torrent_id: plan.torrent_id,
-            profile: plan.profile.clone(),
-            use_token: plan.use_token,
-        };
-        let key = format!(
-            "channel-pack:{}:item:{}:plan:{}",
-            pack.id, item.ordinal, pack.plan_version
-        );
-        let job = enqueue_download(state.clone(), request, Some(&key)).await?;
+        let mut job = None;
+        if let Some(plan) = &item.plan {
+            let request = CreateDownload {
+                tracker: plan.tracker.clone(),
+                torrent_id: plan.torrent_id,
+                profile: plan.profile.clone(),
+                use_token: plan.use_token,
+            };
+            let key = format!(
+                "channel-pack:{}:item:{}:plan:{}",
+                pack.id, item.ordinal, pack.plan_version
+            );
+            job = Some(enqueue_download(state.clone(), request, Some(&key)).await?);
+        }
+        if let Some(replacement) = item.replacement.as_ref() {
+            let target_download = replacement
+                .downloads
+                .iter()
+                .find(|download| download.live.progress >= 1.0)
+                .or_else(|| replacement.downloads.first());
+            let import_id = state
+                .db
+                .create_replacement_import(CreateReplacementImport {
+                    download_job_id: job.as_ref().map(|job| job.id),
+                    target_client: target_download.map(|download| download.live.client.as_str()),
+                    target_info_hash: target_download
+                        .map(|download| download.live.info_hash.as_str()),
+                    release_id: item.release.as_ref().and_then(|release| release.id),
+                    tracker: &replacement.tracker,
+                    torrent_id: replacement.torrent_id,
+                    display_name: &item.source.title,
+                    target_complete: target_download
+                        .is_some_and(|download| download.live.progress >= 1.0),
+                    sources: &item.source.trumped_downloads,
+                    cleanup_mode: preferences.imports.trumped_cleanup,
+                })
+                .await?;
+            background::enqueue_import_processing(&state, import_id).await?;
+        }
         item.plan_state = crate::model::PackItemPlanState::Submitted;
-        item.job_id = Some(job.id);
-        item.job = Some(job.clone());
+        item.job_id = job.as_ref().map(|job| job.id);
+        item.job = job.clone();
         state.db.update_channel_pack_item(pack.id, item).await?;
-        jobs.push(job);
+        if let Some(job) = job {
+            jobs.push(job);
+        }
         submitted += 1;
     }
     state
@@ -880,6 +915,16 @@ async fn accept_channel_pack(
             jobs,
         }),
     ))
+}
+
+fn channel_item_is_actionable(item: &crate::model::ChannelPackItem) -> bool {
+    item.plan_state == crate::model::PackItemPlanState::Executable
+        || (item.replacement.is_some()
+            && matches!(
+                item.plan_state,
+                crate::model::PackItemPlanState::CleanupReady
+                    | crate::model::PackItemPlanState::AlreadyDownloading
+            ))
 }
 
 async fn hydrate_pack_jobs(state: &AppState, pack: &mut ChannelPack) -> Result<(), AppError> {
@@ -2998,6 +3043,101 @@ async fn downloads(
         total,
         index: state.db.index_counts().await?,
     }))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/imports", params(DownloadsQuery),
+    responses((status = 200, body = ImportsPage))
+)]
+async fn imports(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DownloadsQuery>,
+) -> Result<Json<ImportsPage>, AppError> {
+    let mut page = state
+        .db
+        .list_imports(
+            u64::from(query.limit.clamp(1, 500)),
+            u64::from(query.offset.min(10_000)),
+        )
+        .await?;
+    let hashes = page
+        .items
+        .iter()
+        .flat_map(|task| {
+            task.info_hash.iter().cloned().chain(
+                task.supersessions
+                    .iter()
+                    .map(|source| source.source_info_hash.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let live = live_downloads_by_hash(&state, &hashes).await;
+    for task in &mut page.items {
+        if let (Some(client), Some(info_hash)) = (&task.client, &task.info_hash) {
+            task.download = live
+                .get(&info_hash.to_ascii_lowercase())
+                .and_then(|downloads| downloads.iter().find(|download| download.client == *client))
+                .cloned()
+                .or_else(|| task.download.clone());
+        }
+        for source in &mut task.supersessions {
+            source.download = live
+                .get(&source.source_info_hash.to_ascii_lowercase())
+                .and_then(|downloads| {
+                    downloads
+                        .iter()
+                        .find(|download| download.client == source.source_client)
+                })
+                .cloned()
+                .or_else(|| source.download.clone());
+        }
+    }
+    Ok(Json(page))
+}
+
+async fn retry_import(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if state.db.import_task_models(id).await?.is_none() {
+        return Err(AppError::not_found(
+            "import_not_found",
+            "Import task was not found",
+        ));
+    }
+    state
+        .db
+        .set_import_state(id, ImportTaskState::Ready, Some("Retry requested"), None)
+        .await?;
+    let key = format!("process-import:{id}:v1");
+    if !state.db.retry_background_job_by_key(&key).await? {
+        background::enqueue_import_processing(&state, id).await?;
+    } else {
+        state.background_jobs.wake();
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn dismiss_import(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if state.db.import_task_models(id).await?.is_none() {
+        return Err(AppError::not_found(
+            "import_not_found",
+            "Import task was not found",
+        ));
+    }
+    state
+        .db
+        .set_import_state(
+            id,
+            ImportTaskState::Dismissed,
+            Some("Dismissed by the user"),
+            None,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn retry_download_link(
@@ -5128,7 +5268,7 @@ fn truncate(value: &str, max: usize) -> String {
         live, ready, preferences, update_preferences, providers, pause_provider, resume_provider,
         plex_status, scan_plex,
         background_jobs, cancel_background_job, retry_background_job,
-        account, accounts, search, release, cross_seed_plans, downloads, download_detail_compatibility, create_download,
+        account, accounts, search, release, cross_seed_plans, downloads, imports, download_detail_compatibility, create_download,
         download_job,
         library_artists, library_artist, artist_catalog, channels, update_channel, refresh_channel,
         channel_run, channel_packs, channel_pack, replan_channel_pack, attach_channel_pack_item,
@@ -5136,6 +5276,7 @@ fn truncate(value: &str, max: usize) -> String {
     ),
     components(schemas(
         Health, Account, crate::model::TrackerAccount, Provenance, RuntimePreferences,
+        crate::model::ImportPreferences, crate::model::ImportCleanupMode,
         crate::model::ApiPreferences, crate::model::ProviderPolicyOverride,
         crate::model::ProviderCircuitState, crate::model::ProviderQueueCounts, ProviderStatus,
         crate::model::BackgroundJobState, crate::model::BackgroundJobStatus,
@@ -5150,7 +5291,9 @@ fn truncate(value: &str, max: usize) -> String {
         PublicConfig, ArtistRole, ArtistCreditSource, ArtistCredit, ReleaseSummary,
         TorrentVariant, ReleaseDetail, CanonicalDownload, crate::model::ReleaseSource,
         crate::model::DownloadFile, crate::model::CrossSeedPlan,
-        DownloadsPage, LibraryAvailability, LibraryCopy, LibraryVariantState, LibraryRelease,
+        DownloadsPage, ImportsPage, crate::model::ImportTask, crate::model::ImportTaskState,
+        crate::model::ImportTaskCounts, crate::model::ImportSupersession,
+        LibraryAvailability, LibraryCopy, LibraryVariantState, LibraryRelease,
         LibraryArtistSummary, LibraryIndexStatus, LibraryArtistsPage, LibraryArtistPage,
         ArtistCatalogRole, crate::model::ArtistCatalogArtist, ArtistCatalogRelease,
         ArtistCatalogPage,
@@ -5158,7 +5301,9 @@ fn truncate(value: &str, max: usize) -> String {
         crate::model::LastfmChannelSettings, ChannelConfig, ChannelRunStatus, ChannelRunTrigger,
         ChannelRun, ChannelPackDecision, crate::model::RecommendationMatchState,
         crate::model::PackItemPlanState, crate::model::RecommendationSource,
-        crate::model::PlannedDownload, crate::model::ChannelPackItem,
+        crate::model::TrumpedDownloadRef, crate::model::PlannedDownload,
+        crate::model::ReplacementTargetState, crate::model::ReplacementTarget,
+        crate::model::ChannelPackItem,
         crate::model::ChannelPlanSummary, ChannelPack, ChannelPackSummary, ChannelOverview,
         DecideChannelPack, AttachChannelPackItem, ChannelBatchResult,
         ErrorBody, ErrorDetail

@@ -51,6 +51,7 @@ pub trait DownloadClient: Send + Sync {
         Ok(Vec::new())
     }
     async fn files(&self, info_hash: &str) -> Result<Vec<DownloadFile>>;
+    async fn delete_torrent(&self, info_hash: &str, delete_files: bool) -> Result<()>;
     async fn add_torrent(
         &self,
         bytes: Vec<u8>,
@@ -205,6 +206,8 @@ struct QbitTorrent {
     #[serde(default)]
     save_path: String,
     #[serde(default)]
+    content_path: String,
+    #[serde(default)]
     tracker: String,
     #[serde(default)]
     added_on: i64,
@@ -272,6 +275,7 @@ impl QbitTorrent {
                 eta: (self.eta >= 0 && self.eta < 8_640_000).then_some(self.eta),
                 ratio: self.ratio,
                 save_path: self.save_path,
+                content_path: (!self.content_path.trim().is_empty()).then_some(self.content_path),
                 added_at: unix_timestamp(self.added_on),
                 completed_at: unix_timestamp(self.completion_on),
             },
@@ -454,6 +458,24 @@ impl DownloadClient for QbittorrentClient {
         .await
     }
 
+    async fn delete_torrent(&self, info_hash: &str, delete_files: bool) -> Result<()> {
+        let info_hash = info_hash.to_ascii_lowercase();
+        self.execute(RequestClass::Manual, || async {
+            let response = self
+                .request(reqwest::Method::POST, "/api/v2/torrents/delete")
+                .form(&[
+                    ("hashes", info_hash.as_str()),
+                    ("deleteFiles", if delete_files { "true" } else { "false" }),
+                ])
+                .send()
+                .await
+                .map_err(transient)?;
+            successful(response, "qBittorrent delete").await?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn add_torrent(
         &self,
         bytes: Vec<u8>,
@@ -503,7 +525,7 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path, query_param},
+        matchers::{body_string, header, method, path, query_param},
     };
 
     use super::{
@@ -582,6 +604,7 @@ mod tests {
                     "eta": 90,
                     "ratio": 0.5,
                     "save_path": "/downloads/ops",
+                    "content_path": "/downloads/ops/A tracker download",
                     "category": "music",
                     "tags": "ops, flac",
                     "tracker": "https://tracker.invalid/announce",
@@ -614,6 +637,10 @@ mod tests {
         assert_eq!(download.live.info_hash, info_hash);
         assert_eq!(download.live.state, ClientDownloadState::Downloading);
         assert_eq!(download.live.downloaded, 1024);
+        assert_eq!(
+            download.live.content_path.as_deref(),
+            Some("/downloads/ops/A tracker download")
+        );
         assert!(download.live.added_at.is_some());
         assert_eq!(download.announce_host.as_deref(), Some("tracker.invalid"));
         let public_json = serde_json::to_string(&download.live).expect("serialize live status");
@@ -652,6 +679,28 @@ mod tests {
         assert_eq!(files[0].name, "Album/01 Track.flac");
         assert_eq!(files[0].size, 2048);
         assert_eq!(files[0].progress, 1.0);
+    }
+
+    #[tokio::test]
+    async fn deletes_only_the_explicit_torrent_and_payload_policy() {
+        let server = MockServer::start().await;
+        let info_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/delete"))
+            .and(header(
+                "authorization",
+                "Bearer qbt_0123456789012345678901234567",
+            ))
+            .and(body_string(format!("hashes={info_hash}&deleteFiles=true")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_client(&server)
+            .delete_torrent(&info_hash.to_uppercase(), true)
+            .await
+            .expect("guarded qBittorrent delete");
     }
 
     #[tokio::test]

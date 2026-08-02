@@ -8,9 +8,9 @@ use crate::entity::{
     artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
     canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
     channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
-    download_client_scan, download_event, download_job, download_release_link, match_candidate,
-    provider_state, release_source, release_track_index, runtime_preference, single_album_coverage,
-    tracker_snapshot,
+    download_client_scan, download_event, download_job, download_release_link, import_supersession,
+    import_task, match_candidate, provider_state, release_source, release_track_index,
+    runtime_preference, single_album_coverage, tracker_snapshot,
 };
 
 pub struct Migrator;
@@ -29,7 +29,63 @@ impl MigratorTrait for Migrator {
             Box::new(BackgroundTerminalNormalizationSchema),
             Box::new(QueryPerformanceSchema),
             Box::new(OpsTorrentDiagnosisSchema),
+            Box::new(ImportQueueSchema),
         ]
+    }
+}
+
+struct ImportQueueSchema;
+
+impl MigrationName for ImportQueueSchema {
+    fn name(&self) -> &str {
+        "m20260802_000011_import_queue"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ImportQueueSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, import_task::Entity).await?;
+        create_entity(manager, &schema, import_supersession::Entity).await?;
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .unique()
+                .name("idx_import_tasks_client_hash")
+                .table(import_task::Entity)
+                .col(import_task::Column::Client)
+                .col(import_task::Column::InfoHash)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .unique()
+                .name("idx_import_tasks_download_job")
+                .table(import_task::Entity)
+                .col(import_task::Column::DownloadJobId)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_import_tasks_state_updated")
+                .table(import_task::Entity)
+                .col(import_task::Column::State)
+                .col(import_task::Column::UpdatedAt)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_import_supersessions_state")
+                .table(import_supersession::Entity)
+                .col(import_supersession::Column::CleanupState)
+                .col(import_supersession::Column::UpdatedAt)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

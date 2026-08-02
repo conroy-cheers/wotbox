@@ -6,6 +6,7 @@
     api,
     appPath,
     type ChannelConfig,
+    type ImportCleanupMode,
     type ChannelOverview,
     type PlexIntegrationStatus,
     type PlexScanQueued,
@@ -73,6 +74,7 @@
   let channelSaveState = $state<"idle" | "pending" | "saving" | "error">("idle");
   let channelSaveInFlight = false;
   let apiPolicies = $state<Record<string, ProviderPolicyOverride>>({});
+  let importCleanup = $state<ImportCleanupMode>("keep");
   let providerAction = $state("");
   let providerError = $state("");
   let plexScanning = $state(false);
@@ -81,6 +83,7 @@
 
   type PreferenceSection =
     | "download-planning"
+    | "imports-cleanup"
     | "quality-media"
     | "api-safety"
     | "plex"
@@ -95,7 +98,8 @@
       label: "Downloads",
       items: [
         { id: "download-planning", label: "Trackers & cost", description: "Priority, profiles, and tokens" },
-        { id: "quality-media", label: "Quality & ranking", description: "Formats, cutoffs, and tie-breaks" }
+        { id: "quality-media", label: "Quality & ranking", description: "Formats, cutoffs, and tie-breaks" },
+        { id: "imports-cleanup", label: "Imports & cleanup", description: "Trumped replacement lifecycle" }
       ]
     },
     {
@@ -191,6 +195,7 @@
     trackerOrder = [...value.release.trackerOrder];
     trackerPolicies = structuredClone(value.release.trackerPolicies);
     apiPolicies = structuredClone(value.api?.providers ?? {});
+    importCleanup = value.imports?.trumpedCleanup ?? "keep";
   }
 
   function moveTracker(index: number, delta: number) {
@@ -239,7 +244,8 @@
       variantSortOrder,
       trackerOrder,
       trackerPolicies: trackerOrder.map((tracker) => trackerPolicy(tracker)),
-      apiPolicies
+      apiPolicies,
+      importCleanup
     });
   }
 
@@ -275,7 +281,8 @@
     }
     load({
       release: structuredClone(defaultReleasePreferences),
-      api: { providers: {} }
+      api: { providers: {} },
+      imports: { trumpedCleanup: "keep" }
     });
   }
 
@@ -554,6 +561,41 @@
         </article>
       {/each}
     </div>
+  </section>
+
+  {:else if activeSection === "imports-cleanup"}
+  <section class="preferences-panel" id="imports-cleanup">
+    <div class="section-heading">
+      <div><p class="eyebrow">Replacement lifecycle</p><h2>Imports and trumped cleanup</h2></div>
+    </div>
+    <p class="settings-help">
+      Every observed download appears in the Import queue. For a confirmed trumped torrent,
+      Wotbox follows the exact preferred current torrent from the same tracker and waits until it
+      is complete before considering the old copy.
+    </p>
+    <label class="dialog-field cleanup-policy-field">
+      <span>After a replacement is complete</span>
+      <select bind:value={importCleanup}>
+        <option value="keep">Keep the old torrent and files</option>
+        <option value="remove_torrent">Remove the old torrent; keep its files</option>
+        <option value="delete_files">Remove the old torrent and delete its files</option>
+      </select>
+      <small>This preference applies only to newly accepted replacement imports.</small>
+    </label>
+    <div class="notice-banner compact">
+      <span>
+        <strong>Cleanup is fail-closed.</strong> Wotbox requires a complete replacement, an explicit
+        same-tracker unregistered response, Plex-managed paths, and proof that no active torrent
+        shares either path. If any check is uncertain, both copies are kept and the task moves to
+        Needs review.
+      </span>
+    </div>
+    {#if importCleanup === "delete_files"}
+      <div class="error-panel compact">
+        File deletion is enabled for future accepted replacements. Existing imports and baseline
+        library entries are never retroactively converted into deletion tasks.
+      </div>
+    {/if}
   </section>
 
   {:else if activeSection === "quality-media"}
@@ -840,7 +882,7 @@
               {/if}
               {#if channel.kind === "trumped_downloads"}
                 <div class="notice-banner compact">
-                  Includes completed downloads only when OPS rejects their hash and qBittorrent explicitly reports the torrent as unregistered. Refreshing searches for current replacement releases but never removes the old torrent.
+                  Includes completed downloads only when their original tracker explicitly reports the torrent as unregistered. Refreshing searches that same tracker for the exact preferred current replacement; cleanup follows the separate import policy only after acceptance and guarded verification.
                 </div>
               {/if}
             </div>

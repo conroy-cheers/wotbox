@@ -689,3 +689,60 @@ pub mod background_job {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod import_task {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "import_tasks")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub client: Option<String>,
+        pub info_hash: Option<String>,
+        pub download_job_id: Option<String>,
+        pub release_id: Option<String>,
+        pub tracker: Option<String>,
+        pub torrent_id: Option<i64>,
+        pub display_name: String,
+        pub state: String,
+        pub reason: Option<String>,
+        pub error_message: Option<String>,
+        #[sea_orm(default_value = false)]
+        pub baseline: bool,
+        pub created_at: String,
+        pub updated_at: String,
+        pub completed_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod import_supersession {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "import_supersessions")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub import_task_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_client: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_info_hash: String,
+        pub tracker: String,
+        pub source_name: String,
+        pub cleanup_mode: String,
+        pub cleanup_state: String,
+        pub reason: Option<String>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

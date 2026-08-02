@@ -1133,7 +1133,7 @@ mod tests {
                 display_name: "Test".into(),
                 kind: "test".into(),
                 safe_minimum_interval: Duration::ZERO,
-                safe_background_minimum_interval: Duration::from_millis(100),
+                safe_background_minimum_interval: Duration::from_secs(60),
                 safe_max_concurrency: 1,
             }],
             &ApiPreferences::default(),
@@ -1158,7 +1158,7 @@ mod tests {
         ));
         let status = governor.status("test").await.expect("status");
         assert_eq!(status.queued.background, 0);
-        assert_eq!(status.background_minimum_interval_ms, 100);
+        assert_eq!(status.background_minimum_interval_ms, 60_000);
         assert!(status.last_background_request_at.is_some());
     }
 }

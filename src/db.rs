@@ -19,9 +19,9 @@ use crate::{
         artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
         channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
-        download_client_scan, download_event, download_job, download_release_link, match_candidate,
-        provider_state, release_source, release_track_index, runtime_preference,
-        single_album_coverage, tracker_snapshot,
+        download_client_scan, download_event, download_job, download_release_link,
+        import_supersession, import_task, match_candidate, provider_state, release_source,
+        release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
     },
     migration::Migrator,
     model::{
@@ -29,8 +29,9 @@ use crate::{
         BackgroundJobStatus, BackgroundJobsOverview, CanonicalTorrent, ChannelConfig, ChannelPack,
         ChannelPackDecision, ChannelPackItem, ChannelPackSummary, ChannelRun, ChannelRunPhase,
         ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob, DownloadState,
-        LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseSummary,
-        RuntimePreferences,
+        ImportCleanupMode, ImportSupersession, ImportTask, ImportTaskCounts, ImportTaskState,
+        ImportsPage, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseDownload,
+        ReleaseSummary, RuntimePreferences, TrumpedDownloadRef,
     },
     plex::PlexScanTarget,
 };
@@ -90,6 +91,19 @@ pub struct UnlinkedDownload {
     pub tracker: Option<String>,
     pub in_library: bool,
     pub live: LiveDownloadStatus,
+}
+
+pub struct CreateReplacementImport<'a> {
+    pub download_job_id: Option<Uuid>,
+    pub target_client: Option<&'a str>,
+    pub target_info_hash: Option<&'a str>,
+    pub release_id: Option<Uuid>,
+    pub tracker: &'a str,
+    pub torrent_id: i64,
+    pub display_name: &'a str,
+    pub target_complete: bool,
+    pub sources: &'a [TrumpedDownloadRef],
+    pub cleanup_mode: ImportCleanupMode,
 }
 
 #[derive(Debug, Clone)]
@@ -1457,6 +1471,7 @@ impl Database {
             return Ok(Vec::new());
         }
         let mut sources_by_job = HashMap::new();
+        let mut handled_directly = Vec::new();
         for item in channel_pack_item::Entity::find()
             .filter(channel_pack_item::Column::PackId.is_in(pack_ids))
             .all(&self.connection)
@@ -1465,19 +1480,23 @@ impl Database {
             let item: ChannelPackItem = serde_json::from_value(item.item_json)?;
             if let Some(job_id) = item.job_id {
                 sources_by_job.insert(job_id.to_string(), item.source);
+            } else if item.plan_state == crate::model::PackItemPlanState::Submitted {
+                handled_directly.push(item.source);
             }
         }
         if sources_by_job.is_empty() {
-            return Ok(Vec::new());
+            return Ok(handled_directly);
         }
-        Ok(download_job::Entity::find()
-            .filter(download_job::Column::Id.is_in(sources_by_job.keys().cloned()))
-            .filter(download_job::Column::State.ne("failed"))
-            .all(&self.connection)
-            .await?
-            .into_iter()
-            .filter_map(|job| sources_by_job.remove(&job.id))
-            .collect())
+        handled_directly.extend(
+            download_job::Entity::find()
+                .filter(download_job::Column::Id.is_in(sources_by_job.keys().cloned()))
+                .filter(download_job::Column::State.ne("failed"))
+                .all(&self.connection)
+                .await?
+                .into_iter()
+                .filter_map(|job| sources_by_job.remove(&job.id)),
+        );
+        Ok(handled_directly)
     }
 
     pub async fn replace_channel_plan(
@@ -1586,6 +1605,7 @@ impl Database {
             .collect()
     }
 
+    #[cfg(test)]
     pub async fn downloaded_torrent_ids(
         &self,
         tracker: &str,
@@ -1611,6 +1631,530 @@ impl Database {
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
+    }
+
+    pub async fn torrent_downloads(
+        &self,
+        tracker: &str,
+        torrent_id: i64,
+    ) -> Result<Vec<ReleaseDownload>> {
+        let links = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Tracker.eq(tracker.to_ascii_lowercase()))
+            .filter(download_release_link::Column::TorrentId.eq(torrent_id))
+            .filter(download_release_link::Column::Present.eq(true))
+            .all(&self.connection)
+            .await?;
+        release_downloads_from_links(links)
+    }
+
+    pub async fn downloads_for_refs(
+        &self,
+        refs: &[TrumpedDownloadRef],
+    ) -> Result<Vec<ReleaseDownload>> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let clients = refs
+            .iter()
+            .map(|value| value.client.clone())
+            .collect::<Vec<_>>();
+        let hashes = refs
+            .iter()
+            .map(|value| value.info_hash.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let wanted = refs
+            .iter()
+            .map(|value| (value.client.as_str(), value.info_hash.to_ascii_lowercase()))
+            .collect::<std::collections::HashSet<_>>();
+        let links = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Client.is_in(clients))
+            .filter(download_release_link::Column::InfoHash.is_in(hashes))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .filter(|link| {
+                wanted.contains(&(link.client.as_str(), link.info_hash.to_ascii_lowercase()))
+            })
+            .collect();
+        release_downloads_from_links(links)
+    }
+
+    /// Ensure every observed torrent has a durable logical import record. Existing completed,
+    /// linked torrents are retained as baseline history and are never cleanup candidates.
+    pub async fn sync_import_tasks(&self) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        let supersessions = import_supersession::Entity::find()
+            .all(&transaction)
+            .await?;
+        let explicit = supersessions
+            .iter()
+            .map(|value| value.import_task_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let superseded_downloads = supersessions
+            .iter()
+            .map(|value| {
+                (
+                    value.source_client.clone(),
+                    value.source_info_hash.to_ascii_lowercase(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let links = download_release_link::Entity::find()
+            .order_by_asc(download_release_link::Column::FirstSeenAt)
+            .all(&transaction)
+            .await?;
+        let mut existing_by_download = import_task::Entity::find()
+            .filter(import_task::Column::Client.is_not_null())
+            .filter(import_task::Column::InfoHash.is_not_null())
+            .all(&transaction)
+            .await?
+            .into_iter()
+            .filter_map(|task| Some(((task.client.clone()?, task.info_hash.clone()?), task)))
+            .collect::<HashMap<_, _>>();
+        for link in links {
+            let existing =
+                existing_by_download.remove(&(link.client.clone(), link.info_hash.clone()));
+            if existing
+                .as_ref()
+                .is_some_and(|task| explicit.contains(&task.id))
+                || (existing.is_some()
+                    && superseded_downloads
+                        .contains(&(link.client.clone(), link.info_hash.to_ascii_lowercase())))
+            {
+                continue;
+            }
+            let live = link
+                .observed_json
+                .clone()
+                .map(serde_json::from_value::<LiveDownloadStatus>)
+                .transpose()?;
+            let (state, reason) = import_state_for_link(&link, live.as_ref());
+            let now = Utc::now().to_rfc3339();
+            if let Some(model) = existing {
+                let mut active = model.into_active_model();
+                active.release_id = Set(link.release_id.clone());
+                active.tracker = Set(link.tracker.clone());
+                active.torrent_id = Set(link.torrent_id);
+                active.display_name = Set(link
+                    .torrent_name
+                    .clone()
+                    .unwrap_or_else(|| link.info_hash.clone()));
+                active.state = Set(import_task_state_name(&state).into());
+                active.reason = Set(reason);
+                active.error_message = Set(link.error_message.clone());
+                active.updated_at = Set(now);
+                active.completed_at = Set(matches!(state, ImportTaskState::Complete).then(|| {
+                    link.completed_at
+                        .clone()
+                        .unwrap_or_else(|| Utc::now().to_rfc3339())
+                }));
+                active.update(&transaction).await?;
+            } else {
+                let baseline = matches!(state, ImportTaskState::Complete)
+                    && link.release_id.is_some()
+                    && link.completed_at.is_some();
+                import_task::ActiveModel {
+                    id: Set(Uuid::new_v4().to_string()),
+                    client: Set(Some(link.client)),
+                    info_hash: Set(Some(link.info_hash.clone())),
+                    download_job_id: Set(None),
+                    release_id: Set(link.release_id),
+                    tracker: Set(link.tracker),
+                    torrent_id: Set(link.torrent_id),
+                    display_name: Set(link.torrent_name.unwrap_or(link.info_hash)),
+                    state: Set(import_task_state_name(&state).into()),
+                    reason: Set(reason),
+                    error_message: Set(link.error_message),
+                    baseline: Set(baseline),
+                    created_at: Set(link.first_seen_at),
+                    updated_at: Set(now),
+                    completed_at: Set(matches!(state, ImportTaskState::Complete)
+                        .then(|| link.completed_at.unwrap_or_else(|| Utc::now().to_rfc3339()))),
+                }
+                .insert(&transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn create_replacement_import(
+        &self,
+        request: CreateReplacementImport<'_>,
+    ) -> Result<Uuid> {
+        let existing = if let Some(job_id) = request.download_job_id {
+            import_task::Entity::find()
+                .filter(import_task::Column::DownloadJobId.eq(job_id.to_string()))
+                .one(&self.connection)
+                .await?
+        } else if let (Some(client), Some(info_hash)) =
+            (request.target_client, request.target_info_hash)
+        {
+            import_task::Entity::find()
+                .filter(import_task::Column::Client.eq(client))
+                .filter(import_task::Column::InfoHash.eq(info_hash.to_ascii_lowercase()))
+                .one(&self.connection)
+                .await?
+        } else {
+            None
+        };
+        let now = Utc::now().to_rfc3339();
+        let state = if request.target_complete {
+            ImportTaskState::Ready
+        } else {
+            ImportTaskState::Downloading
+        };
+        let id = if let Some(model) = existing {
+            let id = Uuid::parse_str(&model.id)?;
+            let mut active = model.into_active_model();
+            active.client = Set(request.target_client.map(str::to_owned));
+            active.info_hash = Set(request
+                .target_info_hash
+                .map(|value| value.to_ascii_lowercase()));
+            active.download_job_id = Set(request.download_job_id.map(|value| value.to_string()));
+            active.release_id = Set(request.release_id.map(|value| value.to_string()));
+            active.tracker = Set(Some(request.tracker.to_ascii_lowercase()));
+            active.torrent_id = Set(Some(request.torrent_id));
+            active.display_name = Set(request.display_name.into());
+            active.state = Set(import_task_state_name(&state).into());
+            active.reason = Set(None);
+            active.error_message = Set(None);
+            active.baseline = Set(false);
+            active.updated_at = Set(now.clone());
+            active.completed_at = Set(None);
+            active.update(&self.connection).await?;
+            id
+        } else {
+            let id = Uuid::new_v4();
+            import_task::ActiveModel {
+                id: Set(id.to_string()),
+                client: Set(request.target_client.map(str::to_owned)),
+                info_hash: Set(request
+                    .target_info_hash
+                    .map(|value| value.to_ascii_lowercase())),
+                download_job_id: Set(request.download_job_id.map(|value| value.to_string())),
+                release_id: Set(request.release_id.map(|value| value.to_string())),
+                tracker: Set(Some(request.tracker.to_ascii_lowercase())),
+                torrent_id: Set(Some(request.torrent_id)),
+                display_name: Set(request.display_name.into()),
+                state: Set(import_task_state_name(&state).into()),
+                reason: Set(None),
+                error_message: Set(None),
+                baseline: Set(false),
+                created_at: Set(now.clone()),
+                updated_at: Set(now.clone()),
+                completed_at: Set(None),
+            }
+            .insert(&self.connection)
+            .await?;
+            id
+        };
+        for source in request.sources {
+            let key = (
+                id.to_string(),
+                source.client.clone(),
+                source.info_hash.to_ascii_lowercase(),
+            );
+            if let Some(model) = import_supersession::Entity::find_by_id(key.clone())
+                .one(&self.connection)
+                .await?
+            {
+                let mut active = model.into_active_model();
+                active.cleanup_mode = Set(request.cleanup_mode.as_str().into());
+                active.cleanup_state = Set("pending".into());
+                active.reason = Set(None);
+                active.updated_at = Set(now.clone());
+                active.update(&self.connection).await?;
+            } else {
+                import_supersession::ActiveModel {
+                    import_task_id: Set(key.0),
+                    source_client: Set(key.1),
+                    source_info_hash: Set(key.2),
+                    tracker: Set(source.tracker.to_ascii_lowercase()),
+                    source_name: Set(source.name.clone()),
+                    cleanup_mode: Set(request.cleanup_mode.as_str().into()),
+                    cleanup_state: Set("pending".into()),
+                    reason: Set(None),
+                    updated_at: Set(now.clone()),
+                }
+                .insert(&self.connection)
+                .await?;
+            }
+            import_task::Entity::update_many()
+                .col_expr(import_task::Column::State, Expr::value("processing"))
+                .col_expr(
+                    import_task::Column::Reason,
+                    Expr::value(Some(format!("Superseded by replacement import {id}"))),
+                )
+                .col_expr(import_task::Column::UpdatedAt, Expr::value(now.clone()))
+                .filter(import_task::Column::Client.eq(&source.client))
+                .filter(import_task::Column::InfoHash.eq(source.info_hash.to_ascii_lowercase()))
+                .filter(import_task::Column::Id.ne(id.to_string()))
+                .exec(&self.connection)
+                .await?;
+        }
+        Ok(id)
+    }
+
+    pub async fn set_superseded_source_states(
+        &self,
+        import_id: Uuid,
+        state: ImportTaskState,
+        reason: &str,
+    ) -> Result<()> {
+        let sources = import_supersession::Entity::find()
+            .filter(import_supersession::Column::ImportTaskId.eq(import_id.to_string()))
+            .all(&self.connection)
+            .await?;
+        let now = Utc::now().to_rfc3339();
+        for source in sources {
+            import_task::Entity::update_many()
+                .col_expr(
+                    import_task::Column::State,
+                    Expr::value(import_task_state_name(&state)),
+                )
+                .col_expr(
+                    import_task::Column::Reason,
+                    Expr::value(Some(reason.to_owned())),
+                )
+                .col_expr(import_task::Column::UpdatedAt, Expr::value(now.clone()))
+                .col_expr(
+                    import_task::Column::CompletedAt,
+                    Expr::value(matches!(state, ImportTaskState::Complete).then(|| now.clone())),
+                )
+                .filter(import_task::Column::Client.eq(source.source_client))
+                .filter(import_task::Column::InfoHash.eq(source.source_info_hash))
+                .filter(import_task::Column::Id.ne(import_id.to_string()))
+                .exec(&self.connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn bind_import_target(&self, id: Uuid, client: &str, info_hash: &str) -> Result<()> {
+        if let Some(model) = import_task::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.client = Set(Some(client.into()));
+            active.info_hash = Set(Some(info_hash.to_ascii_lowercase()));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn set_import_state(
+        &self,
+        id: Uuid,
+        state: ImportTaskState,
+        reason: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if let Some(model) = import_task::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set(import_task_state_name(&state).into());
+            active.reason = Set(reason.map(str::to_owned));
+            active.error_message = Set(error.map(str::to_owned));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.completed_at =
+                Set(matches!(state, ImportTaskState::Complete).then(|| Utc::now().to_rfc3339()));
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn set_supersession_state(
+        &self,
+        import_id: Uuid,
+        client: &str,
+        info_hash: &str,
+        state: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if let Some(model) = import_supersession::Entity::find_by_id((
+            import_id.to_string(),
+            client.to_owned(),
+            info_hash.to_ascii_lowercase(),
+        ))
+        .one(&self.connection)
+        .await?
+        {
+            let mut active = model.into_active_model();
+            active.cleanup_state = Set(state.into());
+            active.reason = Set(reason.map(str::to_owned));
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn import_task_models(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(import_task::Model, Vec<import_supersession::Model>)>> {
+        let Some(task) = import_task::Entity::find_by_id(id.to_string())
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let sources = import_supersession::Entity::find()
+            .filter(import_supersession::Column::ImportTaskId.eq(id.to_string()))
+            .all(&self.connection)
+            .await?;
+        Ok(Some((task, sources)))
+    }
+
+    pub async fn list_imports(&self, limit: u64, offset: u64) -> Result<ImportsPage> {
+        let total = import_task::Entity::find().count(&self.connection).await? as i64;
+        let models = import_task::Entity::find()
+            .order_by_desc(import_task::Column::UpdatedAt)
+            .limit(limit.min(500))
+            .offset(offset)
+            .all(&self.connection)
+            .await?;
+        let ids = models
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let supersessions = if ids.is_empty() {
+            Vec::new()
+        } else {
+            import_supersession::Entity::find()
+                .filter(import_supersession::Column::ImportTaskId.is_in(ids.clone()))
+                .all(&self.connection)
+                .await?
+        };
+        let mut supersessions_by_task = HashMap::<String, Vec<_>>::new();
+        for value in supersessions {
+            supersessions_by_task
+                .entry(value.import_task_id.clone())
+                .or_default()
+                .push(value);
+        }
+        let mut observed_clients = Vec::new();
+        let mut observed_hashes = Vec::new();
+        for task in &models {
+            if let (Some(client), Some(info_hash)) = (&task.client, &task.info_hash) {
+                observed_clients.push(client.clone());
+                observed_hashes.push(info_hash.clone());
+            }
+        }
+        for sources in supersessions_by_task.values() {
+            for source in sources {
+                observed_clients.push(source.source_client.clone());
+                observed_hashes.push(source.source_info_hash.clone());
+            }
+        }
+        observed_clients.sort();
+        observed_clients.dedup();
+        observed_hashes.sort();
+        observed_hashes.dedup();
+        let mut observed_by_ref = if observed_clients.is_empty() || observed_hashes.is_empty() {
+            HashMap::new()
+        } else {
+            download_release_link::Entity::find()
+                .filter(download_release_link::Column::Client.is_in(observed_clients))
+                .filter(download_release_link::Column::InfoHash.is_in(observed_hashes))
+                .filter(download_release_link::Column::ObservedJson.is_not_null())
+                .all(&self.connection)
+                .await?
+                .into_iter()
+                .filter_map(|link| {
+                    let live = serde_json::from_value(link.observed_json?).ok()?;
+                    Some(((link.client, link.info_hash), live))
+                })
+                .collect::<HashMap<_, LiveDownloadStatus>>()
+        };
+        let release_ids = models
+            .iter()
+            .filter_map(|task| task.release_id.as_deref())
+            .filter_map(|value| Uuid::parse_str(value).ok())
+            .collect::<Vec<_>>();
+        let release_details = self.get_release_details(&release_ids).await?;
+        let mut items = Vec::with_capacity(models.len());
+        for task in models {
+            let download = task.client.as_ref().zip(task.info_hash.as_ref()).and_then(
+                |(client, info_hash)| {
+                    observed_by_ref
+                        .get(&(client.clone(), info_hash.clone()))
+                        .cloned()
+                },
+            );
+            let mut task_supersessions = Vec::new();
+            for source in supersessions_by_task.remove(&task.id).unwrap_or_default() {
+                let source_download = observed_by_ref.remove(&(
+                    source.source_client.clone(),
+                    source.source_info_hash.clone(),
+                ));
+                task_supersessions.push(ImportSupersession {
+                    source_client: source.source_client,
+                    source_info_hash: source.source_info_hash,
+                    tracker: source.tracker,
+                    source_name: source.source_name,
+                    cleanup_mode: parse_cleanup_mode(&source.cleanup_mode)?,
+                    cleanup_state: source.cleanup_state,
+                    reason: source.reason,
+                    download: source_download,
+                });
+            }
+            let release = task
+                .release_id
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .and_then(|id| release_details.get(&id))
+                .map(|detail| detail.release.clone());
+            items.push(ImportTask {
+                id: Uuid::parse_str(&task.id)?,
+                state: parse_import_task_state(&task.state)?,
+                display_name: task.display_name,
+                client: task.client,
+                info_hash: task.info_hash,
+                download_job_id: task
+                    .download_job_id
+                    .as_deref()
+                    .map(Uuid::parse_str)
+                    .transpose()?,
+                tracker: task.tracker,
+                torrent_id: task.torrent_id,
+                release,
+                reason: task.reason,
+                error: task.error_message,
+                baseline: task.baseline,
+                download,
+                supersessions: task_supersessions,
+                created_at: parse_timestamp(&task.created_at)?,
+                updated_at: parse_timestamp(&task.updated_at)?,
+                completed_at: task
+                    .completed_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?,
+            });
+        }
+        let review = import_task::Entity::find()
+            .filter(import_task::Column::State.is_in(["needs_review", "blocked", "failed"]))
+            .count(&self.connection)
+            .await? as i64;
+        let complete = import_task::Entity::find()
+            .filter(import_task::Column::State.is_in(["complete", "dismissed"]))
+            .count(&self.connection)
+            .await? as i64;
+        Ok(ImportsPage {
+            items,
+            total,
+            counts: ImportTaskCounts {
+                active: total.saturating_sub(review).saturating_sub(complete),
+                review,
+                complete,
+            },
+        })
     }
 
     pub async fn enqueue_track_index(&self, tracker: &str, group_id: i64) -> Result<()> {
@@ -4871,13 +5415,21 @@ fn channel_pack_from_model(
         if matches!(
             item.plan_state,
             crate::model::PackItemPlanState::Executable
+                | crate::model::PackItemPlanState::CleanupReady
                 | crate::model::PackItemPlanState::Submitted
-        ) {
+        ) || (item.replacement.is_some()
+            && item.plan_state == crate::model::PackItemPlanState::AlreadyDownloading)
+        {
             summary.executable += 1;
             if let Some(plan) = &item.plan {
                 summary.total_size += plan.size.unwrap_or_default();
                 summary.token_uses += plan.token_cost as usize;
                 *summary.by_tracker.entry(plan.tracker.clone()).or_default() += 1;
+            } else if let Some(replacement) = &item.replacement {
+                *summary
+                    .by_tracker
+                    .entry(replacement.tracker.clone())
+                    .or_default() += 1;
             }
         } else {
             summary.skipped += 1;
@@ -5000,6 +5552,26 @@ fn link_from_model(model: download_release_link::Model) -> DownloadReleaseLink {
     }
 }
 
+fn release_downloads_from_links(
+    links: Vec<download_release_link::Model>,
+) -> Result<Vec<ReleaseDownload>> {
+    links
+        .into_iter()
+        .filter_map(|link| {
+            let observed = link.observed_json.clone()?;
+            Some((link, observed))
+        })
+        .map(|(link, observed)| {
+            Ok(ReleaseDownload {
+                name: link.torrent_name.unwrap_or_else(|| link.info_hash.clone()),
+                tracker: link.tracker,
+                in_library: link.library_added_at.is_some(),
+                live: serde_json::from_value(observed)?,
+            })
+        })
+        .collect()
+}
+
 fn artist_sort_name(name: &str) -> String {
     let normalized = name.trim().to_lowercase();
     normalized
@@ -5034,6 +5606,71 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
+fn import_state_for_link(
+    link: &download_release_link::Model,
+    live: Option<&LiveDownloadStatus>,
+) -> (ImportTaskState, Option<String>) {
+    if link.present && live.is_some_and(|value| value.progress < 1.0) {
+        return (ImportTaskState::Downloading, None);
+    }
+    if matches!(link.resolution_state.as_str(), "pending" | "resolving") {
+        return (
+            ImportTaskState::Resolving,
+            Some("Resolving the tracker release".into()),
+        );
+    }
+    if link.error_code.is_some() || link.release_id.is_none() {
+        return (
+            ImportTaskState::NeedsReview,
+            link.error_message
+                .clone()
+                .or_else(|| Some("The download is not linked to a canonical release".into())),
+        );
+    }
+    if link.completed_at.is_some() || link.library_added_at.is_some() {
+        return (ImportTaskState::Complete, None);
+    }
+    (ImportTaskState::Ready, None)
+}
+
+fn import_task_state_name(state: &ImportTaskState) -> &'static str {
+    match state {
+        ImportTaskState::Downloading => "downloading",
+        ImportTaskState::Resolving => "resolving",
+        ImportTaskState::NeedsReview => "needs_review",
+        ImportTaskState::Ready => "ready",
+        ImportTaskState::Processing => "processing",
+        ImportTaskState::Complete => "complete",
+        ImportTaskState::Blocked => "blocked",
+        ImportTaskState::Failed => "failed",
+        ImportTaskState::Dismissed => "dismissed",
+    }
+}
+
+fn parse_import_task_state(value: &str) -> Result<ImportTaskState> {
+    Ok(match value {
+        "downloading" => ImportTaskState::Downloading,
+        "resolving" => ImportTaskState::Resolving,
+        "needs_review" => ImportTaskState::NeedsReview,
+        "ready" => ImportTaskState::Ready,
+        "processing" => ImportTaskState::Processing,
+        "complete" => ImportTaskState::Complete,
+        "blocked" => ImportTaskState::Blocked,
+        "failed" => ImportTaskState::Failed,
+        "dismissed" => ImportTaskState::Dismissed,
+        _ => anyhow::bail!("unknown import task state {value}"),
+    })
+}
+
+fn parse_cleanup_mode(value: &str) -> Result<ImportCleanupMode> {
+    Ok(match value {
+        "keep" => ImportCleanupMode::Keep,
+        "remove_torrent" => ImportCleanupMode::RemoveTorrent,
+        "delete_files" => ImportCleanupMode::DeleteFiles,
+        _ => anyhow::bail!("unknown import cleanup mode {value}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
@@ -5046,14 +5683,58 @@ mod tests {
         entity::{background_job, download_release_link, release_track_index},
         model::{
             CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
-            ClientDownloadState, LiveDownloadStatus, PackItemPlanState, ProviderCircuitState,
-            RecommendationMatchState, RecommendationSource, ReleaseSummary, TorrentVariant,
+            ClientDownloadState, ImportCleanupMode, ImportTaskState, LiveDownloadStatus,
+            PackItemPlanState, ProviderCircuitState, RecommendationMatchState,
+            RecommendationSource, ReleaseSummary, TorrentVariant, TrumpedDownloadRef,
         },
         plex::PlexScanTarget,
         tracker::fallback_artist_credit,
     };
 
-    use super::{Database, EnqueueBackgroundJob, StoredProviderState};
+    use super::{CreateReplacementImport, Database, EnqueueBackgroundJob, StoredProviderState};
+
+    #[tokio::test]
+    async fn replacement_imports_persist_exact_supersessions_without_backfill_cleanup() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("imports.sqlite"))
+            .await
+            .expect("database");
+        let source = TrumpedDownloadRef {
+            client: "music".into(),
+            info_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            name: "Artist - Old Album".into(),
+            tracker: "ops".into(),
+        };
+        let id = db
+            .create_replacement_import(CreateReplacementImport {
+                download_job_id: None,
+                target_client: Some("music"),
+                target_info_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                release_id: None,
+                tracker: "ops",
+                torrent_id: 42,
+                display_name: "Album",
+                target_complete: true,
+                sources: &[source],
+                cleanup_mode: ImportCleanupMode::DeleteFiles,
+            })
+            .await
+            .expect("replacement import");
+
+        let page = db.list_imports(100, 0).await.expect("imports page");
+        let task = page.items.iter().find(|task| task.id == id).expect("task");
+        assert_eq!(task.state, ImportTaskState::Ready);
+        assert!(!task.baseline);
+        assert_eq!(task.supersessions.len(), 1);
+        assert_eq!(
+            task.supersessions[0].cleanup_mode,
+            ImportCleanupMode::DeleteFiles
+        );
+        assert_eq!(
+            task.supersessions[0].source_info_hash,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
 
     #[tokio::test]
     async fn dependency_events_resume_only_affected_coverage_jobs() {
@@ -5505,6 +6186,7 @@ mod tests {
             eta: Some(60),
             ratio: 0.0,
             save_path: "/downloads/ops/Artist/Album".into(),
+            content_path: Some("/downloads/ops/Artist/Album".into()),
             added_at: None,
             completed_at: None,
         };
@@ -5617,6 +6299,7 @@ mod tests {
                 score: None,
                 catalog_country: None,
                 substituted_from: None,
+                trumped_downloads: Vec::new(),
                 lookup_files: Vec::new(),
             },
             match_state: RecommendationMatchState::Unmatched,
@@ -5626,6 +6309,7 @@ mod tests {
             downloads: Vec::new(),
             plan_state: PackItemPlanState::Unmatched,
             plan: None,
+            replacement: None,
             reason: Some("Unavailable".into()),
             job_id: None,
             job: None,
@@ -5826,6 +6510,7 @@ mod tests {
                     eta: Some(50),
                     ratio: 0.0,
                     save_path: "/downloads/ops".into(),
+                    content_path: Some(format!("/downloads/ops/{hash}")),
                     added_at: Some(base + Duration::minutes(index as i64)),
                     completed_at: None,
                 },
@@ -5852,6 +6537,7 @@ mod tests {
                 eta: Some(90),
                 ratio: 0.0,
                 save_path: "/downloads/other".into(),
+                content_path: Some("/downloads/other/unconfigured".into()),
                 added_at: Some(Utc::now()),
                 completed_at: None,
             },
@@ -6058,6 +6744,7 @@ mod tests {
                 eta: None,
                 ratio: 0.25,
                 save_path: "/downloads/ops".into(),
+                content_path: Some("/downloads/ops/A Complete Release".into()),
                 added_at: None,
                 completed_at: Some(completed_at),
             },

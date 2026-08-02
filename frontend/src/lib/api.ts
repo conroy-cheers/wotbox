@@ -170,6 +170,7 @@ export type LiveDownloadStatus = {
   eta?: number;
   ratio: number;
   savePath: string;
+  contentPath?: string;
   addedAt?: string;
   completedAt?: string;
 };
@@ -303,6 +304,55 @@ export type DownloadsPage = {
     failed: number;
     unconfigured: number;
   };
+};
+
+export type ImportCleanupMode = "keep" | "remove_torrent" | "delete_files";
+export type ImportTaskState =
+  | "downloading"
+  | "resolving"
+  | "needs_review"
+  | "ready"
+  | "processing"
+  | "complete"
+  | "blocked"
+  | "failed"
+  | "dismissed";
+
+export type ImportSupersession = {
+  sourceClient: string;
+  sourceInfoHash: string;
+  tracker: string;
+  sourceName: string;
+  cleanupMode: ImportCleanupMode;
+  cleanupState: string;
+  reason?: string;
+  download?: LiveDownloadStatus;
+};
+
+export type ImportTask = {
+  id: string;
+  state: ImportTaskState;
+  displayName: string;
+  client?: string;
+  infoHash?: string;
+  downloadJobId?: string;
+  tracker?: string;
+  torrentId?: number;
+  release?: ReleaseSummary;
+  reason?: string;
+  error?: string;
+  baseline: boolean;
+  download?: LiveDownloadStatus;
+  supersessions: ImportSupersession[];
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+};
+
+export type ImportsPage = {
+  items: ImportTask[];
+  total: number;
+  counts: { active: number; review: number; complete: number };
 };
 
 export type CrossSeedPlan = {
@@ -463,6 +513,9 @@ export type TrackerPreference = {
 export type RuntimePreferences = {
   release: ReleasePreferences;
   api: ApiPreferences;
+  imports: {
+    trumpedCleanup: ImportCleanupMode;
+  };
 };
 
 export type ApiPreferences = {
@@ -645,6 +698,12 @@ export type ChannelPackItem = {
       mbid?: string;
       releaseType: string;
     };
+    trumpedDownloads?: {
+      client: string;
+      infoHash: string;
+      name: string;
+      tracker: string;
+    }[];
   };
   matchState: "matched" | "unmatched" | "ambiguous" | "error";
   release?: ReleaseSummary;
@@ -653,6 +712,7 @@ export type ChannelPackItem = {
   downloads: ReleaseDownload[];
   planState:
     | "executable"
+    | "cleanup_ready"
     | "already_owned"
     | "already_downloading"
     | "duplicate"
@@ -675,6 +735,16 @@ export type ChannelPackItem = {
     format?: string;
     encoding?: string;
     media?: string;
+  };
+  replacement?: {
+    tracker: string;
+    torrentId: number;
+    state: "missing" | "downloading" | "complete";
+    format?: string;
+    encoding?: string;
+    media?: string;
+    size?: number;
+    downloads: ReleaseDownload[];
   };
   reason?: string;
   jobId?: string;

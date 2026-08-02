@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { createQuery } from "@tanstack/svelte-query";
+  import { createMutation, createQuery, useQueryClient } from "@tanstack/svelte-query";
   import { ArrowDownToLine, ArrowRight, Clock3, RefreshCw } from "@lucide/svelte";
   import { derived, writable } from "svelte/store";
-  import { api, formatBytes, formatSpeed, relativeTime, type DownloadsPage } from "../lib/api";
+  import { api, formatBytes, formatSpeed, relativeTime, type DownloadsPage, type ImportsPage, type ImportTask } from "../lib/api";
+  import DownloadStatusRow from "../lib/DownloadStatusRow.svelte";
   import DownloadDiagnostic from "../lib/DownloadDiagnostic.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
@@ -10,6 +11,9 @@
   import { positiveInteger, releaseViewPath, replaceView } from "../lib/routing";
 
   const initial = new URLSearchParams(location.search);
+  const queryClient = useQueryClient();
+  let view = $state<"imports" | "transfers">(initial.get("view") === "transfers" ? "transfers" : "imports");
+  let importFilter = $state<"active" | "review" | "history">("active");
   const limit = writable(Math.min(positiveInteger(initial, "limit", 100), 500));
   let urlSyncReady = false;
   const queryOptions = derived(limit, ($limit) => ({
@@ -18,11 +22,24 @@
     refetchInterval: 15_000
   }));
   const downloads = createQuery(queryOptions);
+  const imports = createQuery({
+    queryKey: ["imports"],
+    queryFn: () => api<ImportsPage>("/api/v1/imports?limit=500"),
+    refetchInterval: 10_000
+  });
+  const importAction = createMutation({
+    mutationFn: ({ id, action }: { id: string; action: "retry" | "dismiss" }) =>
+      api<void>(`/api/v1/imports/${id}/${action}`, { method: "POST" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["imports"] })
+  });
 
   $effect(() => {
     const value = $limit;
     if (urlSyncReady) {
-      replaceView("/downloads", { limit: value === 100 ? undefined : value });
+      replaceView("/downloads", {
+        view: view === "imports" ? undefined : view,
+        limit: value === 100 ? undefined : value
+      });
     } else {
       urlSyncReady = true;
     }
@@ -45,6 +62,16 @@
       showClientDetails
     );
   }
+
+  function importBucket(item: ImportTask): "active" | "review" | "history" {
+    if (["needs_review", "blocked", "failed"].includes(item.state)) return "review";
+    if (["complete", "dismissed"].includes(item.state)) return "history";
+    return "active";
+  }
+
+  function visibleImports(): ImportTask[] {
+    return ($imports.data?.items ?? []).filter((item) => importBucket(item) === importFilter);
+  }
 </script>
 
 <svelte:head><title>Downloads · Wotbox</title></svelte:head>
@@ -53,12 +80,88 @@
   <div>
     <p class="eyebrow">Tracker releases</p>
     <h1>Downloads</h1>
-    <p>Canonical releases with source provenance and live transfer state attached.</p>
+    <p>Follow downloads from transfer through release matching, library import, and guarded replacement cleanup.</p>
   </div>
   <button class="icon-button" aria-label="Refresh downloads" onclick={() => $downloads.refetch()}>
     <span class:spin={$downloads.isFetching}><RefreshCw size={18} /></span>
   </button>
 </header>
+
+<div class="page-tabs" role="tablist" aria-label="Downloads view">
+  <button role="tab" class:active={view === "imports"} aria-selected={view === "imports"} onclick={() => view = "imports"}>Import queue</button>
+  <button role="tab" class:active={view === "transfers"} aria-selected={view === "transfers"} onclick={() => view = "transfers"}>All transfers</button>
+</div>
+
+{#if view === "imports"}
+  {#if $imports.isError}
+    <div class="error-panel">{$imports.error.message}</div>
+  {:else if $imports.isPending}
+    <div class="download-grid">{#each [1, 2, 3] as _}<div class="download-card skeleton-card"></div>{/each}</div>
+  {:else if $imports.data}
+    <div class="import-overview">
+      <div><strong>{$imports.data.counts.active}</strong><span>Active</span></div>
+      <div><strong>{$imports.data.counts.review}</strong><span>Needs review</span></div>
+      <div><strong>{$imports.data.counts.complete}</strong><span>History</span></div>
+    </div>
+    <div class="segmented-tabs import-filter-tabs" role="tablist" aria-label="Import status">
+      {#each [["active", "Active"], ["review", "Needs review"], ["history", "History"]] as tab}
+        <button role="tab" class:active={importFilter === tab[0]} aria-selected={importFilter === tab[0]} onclick={() => importFilter = tab[0] as typeof importFilter}>{tab[1]}</button>
+      {/each}
+    </div>
+    {#if visibleImports().length}
+      <div class="import-task-list">
+        {#each visibleImports() as item}
+          <article class="import-task-card">
+            <header>
+              <div>
+                <p class="eyebrow">{item.tracker?.toUpperCase() ?? "Unlinked"}{item.torrentId ? ` · torrent #${item.torrentId}` : ""}</p>
+                <h2>{item.release?.title ?? item.displayName}</h2>
+                <span>{item.release?.artist ?? item.client ?? "Download import"}</span>
+                {#if item.release}<TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />{/if}
+              </div>
+              <span class={`status-pill ${item.state}`}>{item.state.replaceAll("_", " ")}</span>
+            </header>
+            {#if item.download}
+              <DownloadStatusRow name={item.displayName} download={item.download} eyebrow="Current torrent" />
+            {:else if item.state === "downloading"}
+              <div class="import-pending-line">Waiting for the download client to report the replacement torrent.</div>
+            {/if}
+            {#if item.supersessions.length}
+              <details class="import-supersessions" open={item.state === "blocked" || item.state === "needs_review"}>
+                <summary>{item.supersessions.length} superseded {item.supersessions.length === 1 ? "torrent" : "torrents"}</summary>
+                {#each item.supersessions as source}
+                  {#if source.download}
+                    <DownloadStatusRow
+                      name={source.sourceName}
+                      download={source.download}
+                      eyebrow={`${source.tracker.toUpperCase()} · ${source.cleanupState.replaceAll("_", " ")}`}
+                      note={source.reason}
+                      compact
+                    />
+                  {:else}
+                    <div class="import-source-line"><strong>{source.sourceName}</strong><span>{source.cleanupState.replaceAll("_", " ")}</span></div>
+                  {/if}
+                {/each}
+              </details>
+            {/if}
+            {#if item.reason || item.error}<p class="import-task-reason">{item.error ?? item.reason}</p>{/if}
+            <footer>
+              <span>{item.baseline ? "Existing library baseline" : `Updated ${relativeTime(item.updatedAt)}`}</span>
+              {#if ["blocked", "failed", "needs_review"].includes(item.state)}
+                <div>
+                  <button class="secondary-button compact-button" disabled={$importAction.isPending} onclick={() => $importAction.mutate({ id: item.id, action: "retry" })}>Retry checks</button>
+                  <button class="text-button" disabled={$importAction.isPending} onclick={() => $importAction.mutate({ id: item.id, action: "dismiss" })}>Dismiss</button>
+                </div>
+              {/if}
+            </footer>
+          </article>
+        {/each}
+      </div>
+    {:else}
+      <div class="search-welcome"><ArrowDownToLine size={32} /><h2>No {importFilter.replaceAll("_", " ")} imports</h2><p>Tasks move here automatically as downloads and replacement cleanup progress.</p></div>
+    {/if}
+  {/if}
+{:else}
 
 {#if $downloads.isError}
   <div class="error-panel">{$downloads.error.message}</div>
@@ -133,4 +236,5 @@
       <p>No configured-tracker torrents have been linked to canonical releases.</p>
     {/if}
   </div>
+{/if}
 {/if}

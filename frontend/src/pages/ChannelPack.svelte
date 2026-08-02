@@ -24,11 +24,13 @@
   let selectedTracker = $state("");
   let selectedOrdinals = $state<Set<number>>(new Set());
   let selectionVersion = $state(-1);
+  type PackView = "actionable" | "waiting" | "cleanup" | "review" | "resolved";
+  let activeView = $state<PackView>("actionable");
 
   const pack = createQuery({
     queryKey: ["channel-pack", initialId],
     queryFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}`),
-    refetchInterval: 3_000
+    refetchInterval: 15_000
   });
   const replan = createMutation({
     mutationFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}/replan`, { method: "POST" }),
@@ -96,6 +98,32 @@
     selectedOrdinals = next;
   }
 
+  function itemView(item: ChannelPack["items"][number]): PackView {
+    if (item.planState === "cleanup_ready") return "cleanup";
+    if (item.planState === "already_downloading" || (item.job && item.job.state !== "complete" && item.job.state !== "failed")) return "waiting";
+    if (item.planState === "executable") return "actionable";
+    if (["already_owned", "excluded", "submitted"].includes(item.planState) || item.job?.state === "complete") return "resolved";
+    return "review";
+  }
+
+  function selectable(item: ChannelPack["items"][number]): boolean {
+    return item.planState === "executable"
+      || (Boolean(item.replacement)
+        && ["cleanup_ready", "already_downloading"].includes(item.planState));
+  }
+
+  function visibleItems(current: ChannelPack): ChannelPack["items"] {
+    return current.items.filter((item) => itemView(item) === activeView);
+  }
+
+  function viewCount(current: ChannelPack, view: PackView): number {
+    return current.items.filter((item) => itemView(item) === view).length;
+  }
+
+  function selectAll(current: ChannelPack) {
+    selectedOrdinals = executableOrdinals(current.items);
+  }
+
   $effect(() => {
     const current = $pack.data;
     if (!current || current.planVersion === selectionVersion) return;
@@ -152,11 +180,36 @@
     <div><strong>{visibleSummary.skipped}</strong><span>Skipped</span></div>
   </section>
 
+  <div class="pack-toolbar">
+    <div class="segmented-tabs" role="tablist" aria-label="Pack status">
+      {#each [
+        ["actionable", "Actionable"],
+        ["waiting", "Waiting"],
+        ["cleanup", "Cleanup"],
+        ["review", "Needs review"],
+        ["resolved", "Resolved"]
+      ] as tab}
+        <button
+          role="tab"
+          aria-selected={activeView === tab[0]}
+          class:active={activeView === tab[0]}
+          onclick={() => activeView = tab[0] as PackView}
+        >{tab[1]} <span>{viewCount(current, tab[0] as PackView)}</span></button>
+      {/each}
+    </div>
+    {#if current.decision === "open"}
+      <div class="selection-actions">
+        <button class="text-button" onclick={() => selectAll(current)}>Select all actions</button>
+        <button class="text-button" onclick={() => selectedOrdinals = new Set()}>Select none</button>
+      </div>
+    {/if}
+  </div>
+
   <div class="result-list pack-items">
-    {#each current.items as item}
+    {#each visibleItems(current) as item}
       <article class="release-card pack-item">
         <div class="pack-rank">
-          {#if current.decision === "open" && item.planState === "executable"}
+          {#if current.decision === "open" && selectable(item)}
             <input
               type="checkbox"
               aria-label={`Include ${item.source.title}`}
@@ -168,7 +221,7 @@
           {/if}
         </div>
         <div class="cover">
-          {#if item.source.artwork}<img src={item.source.artwork} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
+          {#if item.source.artwork ?? item.release?.artwork}<img src={item.source.artwork ?? item.release?.artwork} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
         </div>
         <div class="release-content">
           <div class="release-heading">
@@ -199,7 +252,27 @@
               · mapped to this containing release
             </div>
           {/if}
-          <ReleaseDownloads downloads={item.downloads} />
+          {#if item.downloads.length}
+            <details class="pack-source-downloads">
+              <summary>{item.downloads.length} trumped {item.downloads.length === 1 ? "download" : "downloads"}</summary>
+              <ReleaseDownloads downloads={item.downloads} />
+            </details>
+          {/if}
+          {#if item.replacement}
+            <section class="replacement-target" aria-label="Preferred replacement">
+              <div>
+                <p class="eyebrow">Preferred current replacement</p>
+                <strong>{[item.replacement.format, item.replacement.encoding, item.replacement.media].filter(Boolean).join(" · ")}</strong>
+                <span>{item.replacement.tracker.toUpperCase()} torrent #{item.replacement.torrentId} · {formatBytes(item.replacement.size)}</span>
+              </div>
+              <span class={`status-pill ${item.replacement.state === "complete" ? "complete" : item.replacement.state === "downloading" ? "downloading" : "queued"}`}>
+                {item.replacement.state}
+              </span>
+            </section>
+            {#if item.replacement.downloads.length}
+              <ReleaseDownloads downloads={item.replacement.downloads} />
+            {/if}
+          {/if}
           {#if item.release}
             <PreferredVariants
               variants={item.variants}
@@ -208,7 +281,8 @@
               groupId={item.release.groupId}
               title={item.release.title}
               source="channels"
-              onadd={(variant) => choose(item, variant)}
+              requestedTorrentId={item.replacement?.torrentId ?? item.plan?.torrentId}
+              onadd={item.replacement ? undefined : (variant) => choose(item, variant)}
             />
           {:else if item.candidates.length}
             <ReleaseCandidatePicker
@@ -245,6 +319,12 @@
         </div>
       </article>
     {/each}
+    {#if visibleItems(current).length === 0}
+      <div class="pack-empty-view">
+        <strong>Nothing in this view</strong>
+        <span>Choose another status tab to review the rest of the pack.</span>
+      </div>
+    {/if}
   </div>
 
   <AddDownloadDialog

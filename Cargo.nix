@@ -7944,7 +7944,7 @@ rec {
           "system-proxy" = [ "hyper-util/client-proxy-system" ];
           "zstd" = [ "tower-http/decompression-zstd" ];
         };
-        resolvedDefaultFeatures = [ "__rustls" "__rustls-aws-lc-rs" "__tls" "json" "multipart" "query" "rustls" "stream" ];
+        resolvedDefaultFeatures = [ "__rustls" "__rustls-aws-lc-rs" "__tls" "form" "json" "multipart" "query" "rustls" "stream" ];
       };
       "ring" = rec {
         crateName = "ring";
@@ -15226,7 +15226,7 @@ rec {
             name = "reqwest";
             packageId = "reqwest";
             usesDefaultFeatures = false;
-            features = [ "json" "multipart" "query" "rustls" "stream" ];
+            features = [ "form" "json" "multipart" "query" "rustls" "stream" ];
           }
           {
             name = "sea-orm";

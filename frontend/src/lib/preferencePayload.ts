@@ -3,7 +3,8 @@ import type {
   QualityPreference,
   RuntimePreferences,
   TrackerPreference,
-  VariantSortCriterion
+  VariantSortCriterion,
+  ImportCleanupMode
 } from "./api";
 
 export interface PreferencePayloadDraft {
@@ -15,6 +16,7 @@ export interface PreferencePayloadDraft {
   trackerOrder: string[];
   trackerPolicies: TrackerPreference[];
   apiPolicies: Record<string, ProviderPolicyOverride>;
+  importCleanup?: ImportCleanupMode;
 }
 
 export function buildPreferencePayload(draft: PreferencePayloadDraft): RuntimePreferences {
@@ -39,6 +41,9 @@ export function buildPreferencePayload(draft: PreferencePayloadDraft): RuntimePr
           { ...policy }
         ])
       )
+    },
+    imports: {
+      trumpedCleanup: draft.importCleanup ?? "keep"
     }
   };
 }

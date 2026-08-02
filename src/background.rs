@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -19,7 +20,9 @@ use crate::{
     api::{AppState, cleanup_download_stage, enrich_library_artist_credits, process_download},
     db::{DownloadObservation, EnqueueBackgroundJob, StoredBackgroundJob},
     dedupe::{compute_raw_coverage, track_index_from_group},
-    model::{ArtistCatalogRole, CanonicalTorrent},
+    model::{
+        ArtistCatalogRole, CanonicalTorrent, DownloadState, ImportCleanupMode, ImportTaskState,
+    },
     plex::PlexScanTarget,
     provider::{ProviderFailureKind, ProviderRequestError, RequestClass},
 };
@@ -32,6 +35,7 @@ pub const CANONICAL_BACKFILL: &str = "canonical_backfill";
 pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
 pub const NOTIFY_PLEX: &str = "notify_plex";
 pub const SUBMIT_DOWNLOAD: &str = "submit_download";
+pub const PROCESS_IMPORT: &str = "process_import";
 
 const WORKER_LANES: [&str; 6] = [
     "event",
@@ -160,6 +164,34 @@ pub async fn enqueue_hash_resolution(
     info_hash: &str,
 ) -> Result<Uuid> {
     enqueue_hash_resolution_at(state, tracker, info_hash, None).await
+}
+
+pub async fn enqueue_import_processing(state: &AppState, import_id: Uuid) -> Result<Uuid> {
+    let key = format!("process-import:{import_id}:v1");
+    if state.db.retry_background_job_by_key(&key).await? {
+        state.background_jobs.wake();
+        return state
+            .db
+            .background_job_id_by_key(&key)
+            .await?
+            .context("reactivated import processor disappeared");
+    }
+    enqueue(
+        state,
+        EnqueueBackgroundJob {
+            deduplication_key: &key,
+            kind: PROCESS_IMPORT,
+            payload: json!({ "importId": import_id }),
+            provider_id: None,
+            lane: "maintenance",
+            priority: 40,
+            max_attempts: 20,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: None,
+        },
+    )
+    .await
 }
 
 pub async fn retry_hash_resolution(
@@ -525,6 +557,7 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
         }
         NOTIFY_PLEX => notify_plex(state, &job.payload).await,
         SUBMIT_DOWNLOAD => submit_download(state, &job.payload).await,
+        PROCESS_IMPORT => process_import(state, &job.payload).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
     }
 }
@@ -554,6 +587,409 @@ async fn submit_download(state: &Arc<AppState>, payload: &Value) -> Result<JobOu
     }
     process_download(state.clone(), job).await?;
     Ok(JobOutcome::Complete)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProcessingPayload {
+    import_id: Uuid,
+}
+
+async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+    let payload: ImportProcessingPayload = serde_json::from_value(payload.clone())?;
+    let Some((task, supersessions)) = state.db.import_task_models(payload.import_id).await? else {
+        return Ok(JobOutcome::Fail {
+            code: "import_missing",
+            message: "The durable import task no longer exists".into(),
+        });
+    };
+    if matches!(task.state.as_str(), "complete" | "dismissed") {
+        return Ok(JobOutcome::Complete);
+    }
+
+    let mut target_client = task.client.clone();
+    let mut target_hash = task.info_hash.clone();
+    if (target_client.is_none() || target_hash.is_none())
+        && let Some(job_id) = task
+            .download_job_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()?
+        && let Some(job) = state.db.get_job(job_id).await?
+    {
+        if job.state == DownloadState::Failed {
+            state
+                .db
+                .set_import_state(
+                    payload.import_id,
+                    ImportTaskState::Failed,
+                    Some("The replacement download failed"),
+                    job.error_message.as_deref(),
+                )
+                .await?;
+            state
+                .db
+                .set_superseded_source_states(
+                    payload.import_id,
+                    ImportTaskState::NeedsReview,
+                    "The replacement download failed",
+                )
+                .await?;
+            return Ok(JobOutcome::Fail {
+                code: "replacement_failed",
+                message: job
+                    .error_message
+                    .unwrap_or_else(|| "The replacement download failed".into()),
+            });
+        }
+        target_client = state
+            .profiles
+            .get(&job.profile)
+            .map(|profile| profile.client.clone());
+        target_hash = job.info_hash;
+    }
+    let (Some(target_client), Some(target_hash)) = (target_client, target_hash) else {
+        state
+            .db
+            .set_import_state(
+                payload.import_id,
+                ImportTaskState::Downloading,
+                Some("Waiting for the replacement torrent to be submitted"),
+                None,
+            )
+            .await?;
+        return Ok(JobOutcome::Retry {
+            delay: Duration::from_secs(15),
+            increment_attempt: false,
+            code: "replacement_pending",
+            message: "Waiting for the replacement torrent to be submitted".into(),
+        });
+    };
+    state
+        .db
+        .bind_import_target(payload.import_id, &target_client, &target_hash)
+        .await?;
+    let Some(target_qbit) = state.download_clients.get(&target_client) else {
+        return block_import(
+            state,
+            payload.import_id,
+            "The replacement download client is no longer configured",
+        )
+        .await;
+    };
+    let Some(target) = target_qbit
+        .download_with_class(&target_hash, RequestClass::Background)
+        .await?
+    else {
+        return Ok(JobOutcome::Retry {
+            delay: Duration::from_secs(30),
+            increment_attempt: false,
+            code: "replacement_not_visible",
+            message: "Waiting for the replacement torrent to appear in qBittorrent".into(),
+        });
+    };
+    if target.live.progress < 1.0 {
+        state
+            .db
+            .set_import_state(
+                payload.import_id,
+                ImportTaskState::Downloading,
+                Some("Waiting for the replacement download to complete"),
+                None,
+            )
+            .await?;
+        return Ok(JobOutcome::Retry {
+            delay: Duration::from_secs(30),
+            increment_attempt: false,
+            code: "replacement_downloading",
+            message: format!(
+                "Replacement is {}% complete",
+                (target.live.progress * 100.0).round()
+            ),
+        });
+    }
+    if supersessions
+        .iter()
+        .all(|source| source.cleanup_mode == ImportCleanupMode::Keep.as_str())
+    {
+        for source in &supersessions {
+            state
+                .db
+                .set_supersession_state(
+                    payload.import_id,
+                    &source.source_client,
+                    &source.source_info_hash,
+                    "retained",
+                    Some("Retained by the import cleanup preference"),
+                )
+                .await?;
+        }
+        state
+            .db
+            .set_import_state(
+                payload.import_id,
+                ImportTaskState::Complete,
+                Some("Replacement import completed; old torrents were retained"),
+                None,
+            )
+            .await?;
+        state
+            .db
+            .set_superseded_source_states(
+                payload.import_id,
+                ImportTaskState::Complete,
+                "Replacement completed and the old torrent was retained by policy",
+            )
+            .await?;
+        return Ok(JobOutcome::Complete);
+    }
+    let Some(plex) = state.plex.as_ref() else {
+        return block_import(
+            state,
+            payload.import_id,
+            "Cleanup is blocked because Plex integration is not configured",
+        )
+        .await;
+    };
+    let Some(target_path) = target.live.content_path.as_deref() else {
+        return block_import(
+            state,
+            payload.import_id,
+            "Cleanup is blocked because qBittorrent did not report the replacement content path",
+        )
+        .await;
+    };
+    let Some(target_scan) = plex.target_for_path(target_path) else {
+        return block_import(
+            state,
+            payload.import_id,
+            "Cleanup is blocked because the replacement is outside a configured Plex music root",
+        )
+        .await;
+    };
+
+    state
+        .db
+        .set_import_state(
+            payload.import_id,
+            ImportTaskState::Processing,
+            Some("Verifying the superseded torrents before cleanup"),
+            None,
+        )
+        .await?;
+
+    struct CleanupPlan {
+        client: Arc<dyn crate::qbittorrent::DownloadClient>,
+        client_name: String,
+        info_hash: String,
+        delete_files: bool,
+        scan_target: PlexScanTarget,
+    }
+    let mut cleanup = Vec::new();
+    for source in supersessions {
+        if source.cleanup_state == "removed" || source.cleanup_state == "retained" {
+            continue;
+        }
+        let cleanup_mode = match source.cleanup_mode.as_str() {
+            "keep" => ImportCleanupMode::Keep,
+            "remove_torrent" => ImportCleanupMode::RemoveTorrent,
+            "delete_files" => ImportCleanupMode::DeleteFiles,
+            _ => {
+                return block_import(
+                    state,
+                    payload.import_id,
+                    "Cleanup is blocked by an unknown cleanup policy",
+                )
+                .await;
+            }
+        };
+        if cleanup_mode == ImportCleanupMode::Keep {
+            state
+                .db
+                .set_supersession_state(
+                    payload.import_id,
+                    &source.source_client,
+                    &source.source_info_hash,
+                    "retained",
+                    Some("Retained by the import cleanup preference"),
+                )
+                .await?;
+            continue;
+        }
+        if !task
+            .tracker
+            .as_deref()
+            .is_some_and(|tracker| tracker.eq_ignore_ascii_case(&source.tracker))
+        {
+            return block_import(
+                state,
+                payload.import_id,
+                "Cleanup is blocked because the old and replacement torrents are not from the same tracker",
+            )
+            .await;
+        }
+        let Some(client) = state.download_clients.get(&source.source_client).cloned() else {
+            return block_import(
+                state,
+                payload.import_id,
+                "Cleanup is blocked because an old torrent's client is not configured",
+            )
+            .await;
+        };
+        let Some(old) = client
+            .download_with_class(&source.source_info_hash, RequestClass::Background)
+            .await?
+        else {
+            state
+                .db
+                .set_supersession_state(
+                    payload.import_id,
+                    &source.source_client,
+                    &source.source_info_hash,
+                    "removed",
+                    Some("The old torrent was already absent from qBittorrent"),
+                )
+                .await?;
+            continue;
+        };
+        let statuses = client
+            .tracker_statuses_with_class(&source.source_info_hash, RequestClass::Background)
+            .await?;
+        if !statuses.iter().any(|status| {
+            status
+                .message
+                .as_deref()
+                .is_some_and(tracker_message_reports_unregistered)
+                && status
+                    .announce_host
+                    .as_deref()
+                    .and_then(|host| state.announce_hosts.get(host))
+                    .is_some_and(|tracker| tracker.eq_ignore_ascii_case(&source.tracker))
+        }) {
+            return block_import(
+                state,
+                payload.import_id,
+                "Cleanup is blocked because the tracker no longer explicitly reports an old torrent as unregistered",
+            )
+            .await;
+        }
+        let Some(old_path) = old.live.content_path.as_deref() else {
+            return block_import(
+                state,
+                payload.import_id,
+                "Cleanup is blocked because qBittorrent did not report an old torrent's content path",
+            )
+            .await;
+        };
+        let Some(old_scan) = plex.target_for_path(old_path) else {
+            return block_import(
+                state,
+                payload.import_id,
+                "Cleanup is blocked because an old torrent is outside a configured Plex music root",
+            )
+            .await;
+        };
+        if paths_overlap(old_path, target_path) {
+            return block_import(
+                state,
+                payload.import_id,
+                "Cleanup is blocked because the old and replacement content paths overlap",
+            )
+            .await;
+        }
+        for (other_client_name, other_client) in &state.download_clients {
+            let active = other_client
+                .downloads_with_class(100_000, 0, RequestClass::Background)
+                .await?;
+            if active.iter().any(|other| {
+                !(other_client_name == &source.source_client
+                    && other
+                        .live
+                        .info_hash
+                        .eq_ignore_ascii_case(&source.source_info_hash))
+                    && other
+                        .live
+                        .content_path
+                        .as_deref()
+                        .is_some_and(|path| paths_overlap(path, old_path))
+            }) {
+                return block_import(
+                    state,
+                    payload.import_id,
+                    "Cleanup is blocked because another active torrent shares the old content path",
+                )
+                .await;
+            }
+        }
+        cleanup.push(CleanupPlan {
+            client,
+            client_name: source.source_client,
+            info_hash: source.source_info_hash,
+            delete_files: cleanup_mode == ImportCleanupMode::DeleteFiles,
+            scan_target: old_scan,
+        });
+    }
+
+    // The replacement must be visible to Plex before any old payload can be removed.
+    plex.scan(&state.source_client, &state.providers, &target_scan)
+        .await?;
+    for plan in cleanup {
+        plan.client
+            .delete_torrent(&plan.info_hash, plan.delete_files)
+            .await?;
+        state
+            .db
+            .set_supersession_state(
+                payload.import_id,
+                &plan.client_name,
+                &plan.info_hash,
+                "removed",
+                Some(if plan.delete_files {
+                    "Removed the trumped torrent and its payload after guarded verification"
+                } else {
+                    "Removed the trumped torrent and retained its payload"
+                }),
+            )
+            .await?;
+        plex.scan(&state.source_client, &state.providers, &plan.scan_target)
+            .await?;
+    }
+    state
+        .db
+        .set_import_state(
+            payload.import_id,
+            ImportTaskState::Complete,
+            Some("Replacement import and supersession cleanup completed"),
+            None,
+        )
+        .await?;
+    state
+        .db
+        .set_superseded_source_states(
+            payload.import_id,
+            ImportTaskState::Complete,
+            "Supersession workflow completed",
+        )
+        .await?;
+    Ok(JobOutcome::Complete)
+}
+
+async fn block_import(state: &AppState, import_id: Uuid, reason: &str) -> Result<JobOutcome> {
+    state
+        .db
+        .set_import_state(import_id, ImportTaskState::Blocked, Some(reason), None)
+        .await?;
+    state
+        .db
+        .set_superseded_source_states(import_id, ImportTaskState::NeedsReview, reason)
+        .await?;
+    Ok(JobOutcome::Complete)
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    left.starts_with(right) || right.starts_with(left)
 }
 
 #[derive(Deserialize)]
@@ -1004,6 +1440,7 @@ async fn scan_download_client(state: &Arc<AppState>, payload: &Value) -> Result<
         .db
         .complete_client_scan(&payload.client, scan_started_at)
         .await?;
+    state.db.sync_import_tasks().await?;
     Ok(JobOutcome::Complete)
 }
 
@@ -1154,7 +1591,7 @@ fn provider_error_is_admission_or_blocked(error: &anyhow::Error) -> bool {
 mod tests {
     use crate::model::ArtistCatalogRole;
 
-    use super::{has_primary_role, tracker_message_reports_unregistered};
+    use super::{has_primary_role, paths_overlap, tracker_message_reports_unregistered};
 
     #[test]
     fn coverage_uses_only_primary_artist_catalog_groups() {
@@ -1176,6 +1613,18 @@ mod tests {
         ));
         assert!(!tracker_message_reports_unregistered(
             "No peers are currently available"
+        ));
+    }
+
+    #[test]
+    fn cleanup_path_guard_rejects_parent_child_sharing_but_not_siblings() {
+        assert!(paths_overlap(
+            "/music/ops/Artist/Album",
+            "/music/ops/Artist/Album/disc1"
+        ));
+        assert!(!paths_overlap(
+            "/music/ops/Artist/Album",
+            "/music/ops/Artist/Album Deluxe"
         ));
     }
 }

@@ -19,8 +19,9 @@ use crate::{
         ChannelConfig, ChannelKind, ChannelPackItem, ChannelRunPhase, ChannelRunStatus,
         DownloadFile, LastfmChannelSettings, PackItemPlanState, PlannedDownload,
         RecommendationMatchState, RecommendationSource, RecommendationSubstitution,
-        ReleaseDownload, ReleasePreferences, ReleaseSummary, RuntimePreferences, SearchGroup,
-        TorrentVariant, value_i64,
+        ReleaseDownload, ReleasePreferences, ReleaseSummary, ReplacementTarget,
+        ReplacementTargetState, RuntimePreferences, SearchGroup, TorrentVariant,
+        TrumpedDownloadRef, value_i64,
     },
     provider::{
         ProviderFailure, ProviderFailureKind, RequestClass, is_provider_unavailable, retry_after,
@@ -36,6 +37,14 @@ const LASTFM_ROOT: &str = "https://ws.audioscrobbler.com/2.0/";
 #[derive(Default)]
 struct ReleaseDownloadIndex {
     downloads: Vec<UnlinkedDownload>,
+}
+
+struct TrumpedSourceGroup {
+    tracker: String,
+    artist: String,
+    title: String,
+    year: Option<i64>,
+    links: Vec<crate::db::DownloadReleaseLink>,
 }
 
 impl ReleaseDownloadIndex {
@@ -357,6 +366,7 @@ pub async fn refresh_channel(
                     downloads: Vec::new(),
                     plan_state: PackItemPlanState::SourceError,
                     plan: None,
+                    replacement: None,
                     reason: Some(format!("Tracker lookup failed: {error}")),
                     job_id: None,
                     job: None,
@@ -427,10 +437,23 @@ pub async fn hydrate_pack_downloads(
 ) -> Result<()> {
     let download_index = ReleaseDownloadIndex::load(state).await?;
     for item in items.iter_mut() {
-        item.downloads = item.release.as_ref().map_or_else(
-            || download_index.matching_source(&item.source),
-            |release| download_index.matching(&item.source, release),
-        );
+        item.downloads = if item.source.trumped_downloads.is_empty() {
+            item.release.as_ref().map_or_else(
+                || download_index.matching_source(&item.source),
+                |release| download_index.matching(&item.source, release),
+            )
+        } else {
+            state
+                .db
+                .downloads_for_refs(&item.source.trumped_downloads)
+                .await?
+        };
+        if let Some(replacement) = &mut item.replacement {
+            replacement.downloads = state
+                .db
+                .torrent_downloads(&replacement.tracker, replacement.torrent_id)
+                .await?;
+        }
     }
     let hashes = items
         .iter()
@@ -443,6 +466,12 @@ pub async fn hydrate_pack_downloads(
                         .iter()
                         .map(|download| download.live.info_hash.clone()),
                 )
+                .chain(item.replacement.iter().flat_map(|replacement| {
+                    replacement
+                        .downloads
+                        .iter()
+                        .map(|download| download.live.info_hash.clone())
+                }))
         })
         .collect::<Vec<_>>();
     let live = crate::api::live_downloads_by_hash(state, &hashes).await;
@@ -466,6 +495,20 @@ pub async fn hydrate_pack_downloads(
                 download.live = status.clone();
             }
         }
+        if let Some(replacement) = &mut item.replacement {
+            for download in &mut replacement.downloads {
+                if let Some(status) = live
+                    .get(&download.live.info_hash.to_ascii_lowercase())
+                    .and_then(|statuses| {
+                        statuses
+                            .iter()
+                            .find(|status| status.client == download.live.client)
+                    })
+                {
+                    download.live = status.clone();
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -474,7 +517,7 @@ pub fn preference_fingerprint(
     state: &AppState,
     preferences: &RuntimePreferences,
 ) -> Result<String> {
-    const PLAN_COST_MODEL: &str = "token-cost-v2-ops-320-mib";
+    const PLAN_COST_MODEL: &str = "exact-replacement-import-v3";
     let mut profiles = state.profiles.values().cloned().collect::<Vec<_>>();
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
     let value = serde_json::to_vec(&(PLAN_COST_MODEL, preferences, profiles))?;
@@ -530,6 +573,7 @@ fn parse_apple_chart(body: &Value) -> Result<Vec<RecommendationSource>> {
                 score: None,
                 catalog_country: None,
                 substituted_from: None,
+                trumped_downloads: Vec::new(),
                 lookup_files: Vec::new(),
             })
         })
@@ -718,6 +762,7 @@ async fn fetch_lastfm_recommendations(
             score: Some(artist_score),
             catalog_country: Some(settings.catalog_country.to_ascii_uppercase()),
             substituted_from: None,
+            trumped_downloads: Vec::new(),
             lookup_files: Vec::new(),
         });
     }
@@ -879,23 +924,25 @@ async fn get_json_with_retry(request: reqwest::RequestBuilder) -> Result<Value> 
 }
 
 async fn trumped_download_sources(state: &AppState) -> Result<Vec<RecommendationSource>> {
-    let mut sources = Vec::new();
-    let mut seen = HashSet::new();
-    let handled = state
+    let mut groups: Vec<TrumpedSourceGroup> = Vec::new();
+    let mut group_indexes: HashMap<String, usize> = HashMap::new();
+    let handled_sources = state
         .db
         .handled_channel_sources("trumped_downloads")
-        .await?
-        .into_iter()
-        .filter_map(|source| {
-            let tracker = trumped_source_tracker(&source.id)?;
-            Some(trumped_source_identity(
-                tracker,
-                &source.artist,
-                &source.title,
-            ))
-        })
+        .await?;
+    let handled = handled_sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<HashSet<_>>();
+    let handled_downloads = handled_sources
+        .iter()
+        .flat_map(|source| &source.trumped_downloads)
+        .map(|source| (source.client.clone(), source.info_hash.to_ascii_lowercase()))
         .collect::<HashSet<_>>();
     for link in state.db.unregistered_downloads().await? {
+        if handled_downloads.contains(&(link.client.clone(), link.info_hash.to_ascii_lowercase())) {
+            continue;
+        }
         let Some(tracker) = link.tracker.as_deref() else {
             continue;
         };
@@ -903,15 +950,72 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
             continue;
         };
         let (artist, title, year) = parse_download_release_name(name);
-        let identity = trumped_source_identity(tracker, &artist, &title);
-        if title.is_empty() || !seen.insert(identity) {
+        let identity = trumped_source_identity(tracker, &artist, &title, year);
+        if title.is_empty() {
             continue;
         }
-        if handled.contains(&trumped_source_identity(tracker, &artist, &title)) {
+        if let Some(index) = group_indexes.get(&identity).copied() {
+            groups[index].links.push(link);
+        } else {
+            group_indexes.insert(identity, groups.len());
+            groups.push(TrumpedSourceGroup {
+                tracker: tracker.to_owned(),
+                artist,
+                title,
+                year,
+                links: vec![link],
+            });
+        }
+    }
+
+    let mut sources = Vec::with_capacity(groups.len());
+    for group in groups {
+        let TrumpedSourceGroup {
+            tracker,
+            artist,
+            title,
+            year,
+            mut links,
+        } = group;
+        links.sort_by(|left, right| {
+            left.client
+                .cmp(&right.client)
+                .then_with(|| left.info_hash.cmp(&right.info_hash))
+        });
+        let fingerprint = links
+            .iter()
+            .map(|link| format!("{}\0{}", link.client, link.info_hash.to_ascii_lowercase()))
+            .collect::<Vec<_>>()
+            .join("\0");
+        let digest = Sha256::digest(fingerprint.as_bytes());
+        let id = format!(
+            "trumped:{}:{}",
+            tracker.to_ascii_lowercase(),
+            &hex::encode(digest)[..20]
+        );
+        if handled.contains(&id) {
             continue;
         }
-        let digest = Sha256::digest(format!("{}\0{}", link.client, link.info_hash).as_bytes());
-        let lookup_files = if let Some(client) = state.download_clients.get(&link.client) {
+        let mut lookup_files = Vec::new();
+        let mut trumped_downloads = Vec::with_capacity(links.len());
+        for link in links {
+            let name = link
+                .torrent_name
+                .clone()
+                .unwrap_or_else(|| link.info_hash.clone());
+            trumped_downloads.push(TrumpedDownloadRef {
+                client: link.client.clone(),
+                info_hash: link.info_hash.to_ascii_lowercase(),
+                name,
+                tracker: tracker.to_ascii_lowercase(),
+            });
+            let Some(client) = state.download_clients.get(&link.client) else {
+                tracing::warn!(
+                    client = link.client,
+                    "trumped download client is not configured"
+                );
+                continue;
+            };
             match client.files(&link.info_hash).await {
                 Ok(files) => files,
                 Err(error) => {
@@ -923,19 +1027,11 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
                     Vec::new()
                 }
             }
-        } else {
-            tracing::warn!(
-                client = link.client,
-                "trumped download client is not configured"
-            );
-            Vec::new()
-        };
+            .into_iter()
+            .for_each(|file| lookup_files.push(file));
+        }
         sources.push(RecommendationSource {
-            id: format!(
-                "trumped:{}:{}",
-                tracker.to_ascii_lowercase(),
-                &hex::encode(digest)[..20]
-            ),
+            id,
             rank: sources.len() as u32 + 1,
             artist,
             title,
@@ -946,18 +1042,20 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
             score: None,
             catalog_country: None,
             substituted_from: None,
+            trumped_downloads,
             lookup_files,
         });
     }
     Ok(sources)
 }
 
-fn trumped_source_identity(tracker: &str, artist: &str, title: &str) -> String {
+fn trumped_source_identity(tracker: &str, artist: &str, title: &str, year: Option<i64>) -> String {
     format!(
-        "{}\0{}\0{}",
+        "{}\0{}\0{}\0{}",
         tracker.to_ascii_lowercase(),
         trumped_identity_component(artist),
-        trumped_identity_component(title)
+        trumped_identity_component(title),
+        year.map(|value| value.to_string()).unwrap_or_default()
     )
 }
 
@@ -2166,6 +2264,7 @@ fn apple_sources_from_cache(
                 mbid: source.mbid.clone(),
                 release_type: "single".into(),
             }),
+            trumped_downloads: Vec::new(),
             lookup_files: Vec::new(),
         })
         .collect())
@@ -2222,23 +2321,14 @@ async fn resolve_release_with_index(
             variant.can_use_token || !variant.token_eligibility_known,
         ));
     }
-    let mut planning_variants = variants.clone();
-    if let Some(tracker) = trumped_tracker {
-        let downloaded = state
+    let downloads = if trumped_tracker.is_some() {
+        state
             .db
-            .downloaded_torrent_ids(
-                tracker,
-                &planning_variants
-                    .iter()
-                    .map(|variant| variant.torrent_id)
-                    .collect::<Vec<_>>(),
-            )
+            .downloads_for_refs(&source.trumped_downloads)
             .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        planning_variants.retain(|variant| !downloaded.contains(&variant.torrent_id));
-    }
-    let downloads = download_index.matching(&source, &detail.release);
+    } else {
+        download_index.matching(&source, &detail.release)
+    };
     let (mut owned, mut downloading) = if trumped_tracker.is_some() {
         (false, false)
     } else {
@@ -2250,37 +2340,89 @@ async fn resolve_release_with_index(
             .iter()
             .any(|download| !download.in_library && download.live.progress < 1.0);
     }
-    let (plan_state, plan, reason) = if let Some(tracker) = trumped_tracker
-        && planning_variants.is_empty()
-    {
-        (
-            PackItemPlanState::AlreadyOwned,
-            None,
-            Some(format!(
-                "Every current {} torrent for this release has already been downloaded",
-                tracker.to_ascii_uppercase()
-            )),
-        )
+    let (plan_state, plan, reason, replacement) = if let Some(tracker) = trumped_tracker {
+        let preferred = preferred_eligible_variant(&variants, &preferences.release, &source.title);
+        if let Some(preferred) = preferred {
+            let target_downloads = state
+                .db
+                .torrent_downloads(tracker, preferred.torrent_id)
+                .await?;
+            let target_state = if target_downloads
+                .iter()
+                .any(|download| download.live.progress >= 1.0)
+            {
+                ReplacementTargetState::Complete
+            } else if target_downloads.is_empty() {
+                ReplacementTargetState::Missing
+            } else {
+                ReplacementTargetState::Downloading
+            };
+            let replacement = ReplacementTarget {
+                tracker: preferred.tracker.clone(),
+                torrent_id: preferred.torrent_id,
+                state: target_state.clone(),
+                format: preferred.format.clone(),
+                encoding: preferred.encoding.clone(),
+                media: preferred.media.clone(),
+                size: preferred.size,
+                downloads: target_downloads,
+            };
+            let (state_value, plan, reason) = match target_state {
+                ReplacementTargetState::Complete => (
+                    PackItemPlanState::CleanupReady,
+                    None,
+                    Some(format!(
+                        "The preferred current {} torrent is complete; the trumped copy is ready for guarded cleanup",
+                        tracker.to_ascii_uppercase()
+                    )),
+                ),
+                ReplacementTargetState::Downloading => (
+                    PackItemPlanState::AlreadyDownloading,
+                    None,
+                    Some(format!(
+                        "The preferred current {} torrent is already downloading; cleanup will wait for completion",
+                        tracker.to_ascii_uppercase()
+                    )),
+                ),
+                ReplacementTargetState::Missing => {
+                    plan_exact_variant(&state.profiles, preferred, &preferences.release)
+                }
+            };
+            (state_value, plan, reason, Some(replacement))
+        } else {
+            (
+                PackItemPlanState::PolicyBlocked,
+                None,
+                Some(format!(
+                    "No current {} torrent satisfies the configured quality and media rules",
+                    tracker.to_ascii_uppercase()
+                )),
+                None,
+            )
+        }
     } else if owned {
         (
             PackItemPlanState::AlreadyOwned,
             None,
             Some("Already present in the Library".into()),
+            None,
         )
     } else if downloading {
         (
             PackItemPlanState::AlreadyDownloading,
             None,
             Some("A download for this release is already active".into()),
+            None,
         )
     } else {
-        plan_variant(
+        let (state_value, plan, reason) = plan_variant(
             &state.profiles,
-            &planning_variants,
+            &variants,
             &preferences.release,
             u32::MAX,
             &source.title,
-        )
+        );
+        (state_value, plan, reason, None)
     };
     Ok(ChannelPackItem {
         ordinal: source.rank,
@@ -2292,10 +2434,84 @@ async fn resolve_release_with_index(
         downloads,
         plan_state,
         plan,
+        replacement,
         reason,
         job_id: None,
         job: None,
     })
+}
+
+fn preferred_eligible_variant<'a>(
+    variants: &'a [TorrentVariant],
+    preferences: &ReleasePreferences,
+    edition_intent: &str,
+) -> Option<&'a TorrentVariant> {
+    let mut eligible = variants
+        .iter()
+        .filter(|variant| {
+            variant
+                .eligibility
+                .as_ref()
+                .is_some_and(|eligibility| eligibility.eligible)
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by(|left, right| compare_variants(left, right, preferences, edition_intent));
+    eligible.into_iter().next()
+}
+
+fn plan_exact_variant(
+    profiles: &HashMap<String, crate::model::DownloadProfile>,
+    variant: &TorrentVariant,
+    preferences: &ReleasePreferences,
+) -> (PackItemPlanState, Option<PlannedDownload>, Option<String>) {
+    let Some(eligibility) = variant.eligibility.as_ref() else {
+        return (
+            PackItemPlanState::PolicyBlocked,
+            None,
+            Some("The preferred replacement has no eligibility result".into()),
+        );
+    };
+    let policy = preferences.tracker_policy(&variant.tracker);
+    if eligibility.requires_token && !policy.auto_use_tokens {
+        return (
+            PackItemPlanState::PolicyBlocked,
+            None,
+            Some(format!(
+                "The preferred replacement requires a {} token, but automatic token use is disabled",
+                variant.tracker.to_ascii_uppercase()
+            )),
+        );
+    }
+    let Some(profile) = policy
+        .download_profile
+        .filter(|profile| profiles.contains_key(profile))
+    else {
+        return (
+            PackItemPlanState::NoProfile,
+            None,
+            Some("No download profile is configured for the preferred replacement".into()),
+        );
+    };
+    let token_cost = if eligibility.requires_token {
+        eligibility.token_cost.unwrap_or_default()
+    } else {
+        0
+    };
+    (
+        PackItemPlanState::Executable,
+        Some(PlannedDownload {
+            tracker: variant.tracker.clone(),
+            torrent_id: variant.torrent_id,
+            profile,
+            use_token: eligibility.requires_token,
+            token_cost,
+            size: variant.size,
+            format: variant.format.clone(),
+            encoding: variant.encoding.clone(),
+            media: variant.media.clone(),
+        }),
+        None,
+    )
 }
 
 fn plan_variant(
@@ -2413,19 +2629,7 @@ fn apply_pack_constraints(
         let policy = preferences.release.tracker_policy(&plan.tracker);
         let used = token_uses.get(&plan.tracker).copied().unwrap_or_default();
         if plan.use_token && used.saturating_add(plan.token_cost) > policy.auto_token_limit {
-            let remaining = policy.auto_token_limit.saturating_sub(used);
-            let (state_value, replacement, reason) = plan_variant(
-                profiles,
-                &item.variants,
-                &preferences.release,
-                remaining,
-                &item.source.title,
-            );
-            if let Some(replacement) = replacement {
-                plan = replacement;
-                item.plan_state = state_value;
-                item.reason = reason;
-            } else {
+            if item.replacement.is_some() {
                 item.plan_state = PackItemPlanState::TokenBudgetExceeded;
                 item.plan = None;
                 item.reason = Some(format!(
@@ -2437,6 +2641,32 @@ fn apply_pack_constraints(
                     policy.auto_token_limit,
                 ));
                 continue;
+            } else {
+                let remaining = policy.auto_token_limit.saturating_sub(used);
+                let (state_value, replacement, reason) = plan_variant(
+                    profiles,
+                    &item.variants,
+                    &preferences.release,
+                    remaining,
+                    &item.source.title,
+                );
+                if let Some(replacement) = replacement {
+                    plan = replacement;
+                    item.plan_state = state_value;
+                    item.reason = reason;
+                } else {
+                    item.plan_state = PackItemPlanState::TokenBudgetExceeded;
+                    item.plan = None;
+                    item.reason = Some(format!(
+                        "{} requires {} token{}; {} of {} already allocated for this pack",
+                        plan.tracker.to_ascii_uppercase(),
+                        plan.token_cost,
+                        if plan.token_cost == 1 { "" } else { "s" },
+                        used,
+                        policy.auto_token_limit,
+                    ));
+                    continue;
+                }
             }
         }
 
@@ -2574,6 +2804,7 @@ fn unresolved_item(
         downloads: Vec::new(),
         plan_state,
         plan: None,
+        replacement: None,
         reason: Some(reason.into()),
         job_id: None,
         job: None,
@@ -2595,6 +2826,7 @@ fn ambiguous_item(
         downloads: Vec::new(),
         plan_state: PackItemPlanState::Ambiguous,
         plan: None,
+        replacement: None,
         reason: Some(reason.into()),
         job_id: None,
         job: None,
@@ -2668,7 +2900,8 @@ mod tests {
         ChannelConfig, ChannelPackItem, CountryChartChannelSettings, DownloadEligibility,
         DownloadEligibilityReason, DownloadFile, DownloadProfile, LeechStatus, PackItemPlanState,
         PlannedDownload, RecommendationMatchState, RecommendationSource, ReleasePreferences,
-        RuntimePreferences, SearchGroup, SearchTorrent, TorrentVariant,
+        ReplacementTarget, ReplacementTargetState, RuntimePreferences, SearchGroup, SearchTorrent,
+        TorrentVariant,
     };
 
     use super::{
@@ -2788,6 +3021,7 @@ mod tests {
             score: None,
             catalog_country: None,
             substituted_from: None,
+            trumped_downloads: Vec::new(),
             lookup_files: Vec::new(),
         }
     }
@@ -3143,6 +3377,7 @@ mod tests {
             score: Some(1.0),
             catalog_country: Some("AU".into()),
             substituted_from: None,
+            trumped_downloads: Vec::new(),
             lookup_files: Vec::new(),
         };
         let candidates = apple_sources_from_cache(
@@ -3277,6 +3512,7 @@ mod tests {
                     score: None,
                     catalog_country: None,
                     substituted_from: None,
+                    trumped_downloads: Vec::new(),
                     lookup_files: Vec::new(),
                 },
                 match_state: RecommendationMatchState::Matched,
@@ -3296,6 +3532,7 @@ mod tests {
                     encoding: Some("Lossless".into()),
                     media: Some("WEB".into()),
                 }),
+                replacement: None,
                 reason: None,
                 job_id: None,
                 job: None,
@@ -3349,5 +3586,33 @@ mod tests {
         assert_eq!(items[2].plan_state, PackItemPlanState::TokenBudgetExceeded);
         assert_eq!(items[3].plan_state, PackItemPlanState::CapacityBlocked);
         assert_eq!(items[4].plan_state, PackItemPlanState::Duplicate);
+
+        let mut fixed = item(6, 6, 10, 2);
+        let mut lower_ranked = fixed.variants[0].clone();
+        lower_ranked.torrent_id = 66;
+        lower_ranked
+            .eligibility
+            .as_mut()
+            .expect("eligibility")
+            .token_cost = Some(1);
+        fixed.variants.push(lower_ranked);
+        fixed.replacement = Some(ReplacementTarget {
+            tracker: "ops".into(),
+            torrent_id: 6,
+            state: ReplacementTargetState::Missing,
+            format: Some("FLAC".into()),
+            encoding: Some("Lossless".into()),
+            media: Some("WEB".into()),
+            size: Some(10),
+            downloads: Vec::new(),
+        });
+        let mut fixed_items = vec![item(1, 10, 60, 2), fixed];
+        let mut capacities = HashMap::from([("music".into(), Some(150))]);
+        apply_pack_constraints(&profiles, &mut fixed_items, &preferences, &mut capacities);
+        assert_eq!(
+            fixed_items[1].plan_state,
+            PackItemPlanState::TokenBudgetExceeded
+        );
+        assert!(fixed_items[1].plan.is_none());
     }
 }

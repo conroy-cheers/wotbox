@@ -39,6 +39,19 @@ describe("channel pack selection", () => {
     ])]).toEqual([1, 3]);
   });
 
+  it("includes accepted replacement watchers and cleanup-only actions", () => {
+    const waiting = item(2, "already_downloading");
+    waiting.replacement = {
+      tracker: "ops", torrentId: 20, state: "downloading", downloads: []
+    };
+    const cleanup = item(3, "cleanup_ready");
+    cleanup.replacement = {
+      tracker: "ops", torrentId: 30, state: "complete", downloads: []
+    };
+    expect([...executableOrdinals([item(1, "already_downloading"), waiting, cleanup])])
+      .toEqual([2, 3]);
+  });
+
   it("summarizes only the approved subset", () => {
     const summary = summarizeSelection(
       [
