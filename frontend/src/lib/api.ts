@@ -558,6 +558,7 @@ export type ChannelConfig = {
   };
   countryChart?: {
     country: string;
+    albumCount: number;
   };
   lastfm?: {
     username: string;

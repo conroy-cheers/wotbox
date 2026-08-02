@@ -1280,12 +1280,19 @@ impl Default for ChannelSchedule {
 #[serde(rename_all = "camelCase")]
 pub struct CountryChartChannelSettings {
     pub country: String,
+    #[serde(default = "default_country_chart_album_count")]
+    pub album_count: u16,
+}
+
+fn default_country_chart_album_count() -> u16 {
+    100
 }
 
 impl Default for CountryChartChannelSettings {
     fn default() -> Self {
         Self {
             country: "AU".into(),
+            album_count: default_country_chart_album_count(),
         }
     }
 }

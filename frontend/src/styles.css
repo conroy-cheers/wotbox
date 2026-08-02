@@ -828,6 +828,9 @@ a.download-diagnostic:hover { border-color: #965159; background: rgba(147,55,63,
 }
 .channel-setting-group > .dialog-field { margin-bottom: 10px; }
 .channel-setting-group .schedule-row { margin-bottom: 14px; }
+.chart-size-presets { display: flex; align-items: center; gap: 7px; margin: -3px 0 10px; }
+.chart-size-presets > span { margin-right: 3px; color: var(--muted); font-size: 9px; }
+.chart-size-presets button.active { color: var(--accent-strong); border-color: #6f62a8; background: rgba(168,149,255,.08); }
 .connection-status {
   display: inline-flex; align-items: center; gap: 6px; width: fit-content; margin: -2px 0 10px;
   color: #e2c77d; font-size: 9px; font-weight: 700;

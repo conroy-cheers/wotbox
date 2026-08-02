@@ -201,8 +201,8 @@ changes a torrent.
 
 Recommendation Channels turn external album discovery into reviewable,
 historical packs. The country chart channel reads Apple's country-specific Top
-100 Albums feed; the Last.fm channel expands recent top artists through
-similar artists and their leading albums. Each channel has its own weekly,
+Albums feed with a configurable 1–100 release count; the Last.fm channel expands
+recent top artists through similar artists and their leading albums. Each channel has its own weekly,
 timezone-aware schedule and is disabled until explicitly enabled or manually
 refreshed. Refreshing resolves Albums and EPs against configured
 trackers and creates a plan under the normal quality, tracker, freeleech, and

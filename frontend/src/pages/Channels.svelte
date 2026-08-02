@@ -38,8 +38,10 @@
     }
   });
 
-  function label(id: string): string {
-    return id === "country_chart" ? "Country Top 100" : "Last.fm Discovery";
+  function label(channel: ChannelOverview["channel"]): string {
+    return channel.id === "country_chart"
+      ? `Country Top ${channel.countryChart?.albumCount ?? 100}`
+      : "Last.fm Discovery";
   }
 
   function schedule(channel: ChannelOverview["channel"]): string {
@@ -108,7 +110,7 @@
           <div class="channel-icon"><Radio size={22} /></div>
           <div>
             <p class="eyebrow">{overview.channel.enabled ? "Scheduled" : "Disabled"}</p>
-            <h2>{label(overview.channel.id)}</h2>
+            <h2>{label(overview.channel)}</h2>
           </div>
           <button
             class="secondary-button compact-button"

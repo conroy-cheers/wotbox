@@ -255,8 +255,14 @@
     }
   }
 
-  function channelLabel(id: string): string {
-    return id === "country_chart" ? "Country Top 100" : "Last.fm Discovery";
+  function channelLabel(channel: ChannelConfig): string {
+    return channel.id === "country_chart"
+      ? `Country Top ${channel.countryChart?.albumCount ?? 100}`
+      : "Last.fm Discovery";
+  }
+
+  function setCountryChartAlbumCount(channel: ChannelConfig, count: number) {
+    if (channel.countryChart) channel.countryChart.albumCount = count;
   }
 
   function modeHelp(mode: TrackerPreference["mode"]): string {
@@ -608,7 +614,7 @@
         {#each channelDrafts as channel}
           <div class="channel-setting-card">
             <header>
-              <div><p class="eyebrow">{channel.kind.replace("_", " ")}</p><h3>{channelLabel(channel.id)}</h3></div>
+              <div><p class="eyebrow">{channel.kind.replace("_", " ")}</p><h3>{channelLabel(channel)}</h3></div>
               <label class="inline-check"><input type="checkbox" bind:checked={channel.enabled} /> Enabled</label>
             </header>
             <div class="channel-setting-group">
@@ -619,6 +625,22 @@
                   <input maxlength="2" bind:value={channel.countryChart.country} placeholder="AU" />
                   <small>Two-letter country code, such as AU, GB, or US.</small>
                 </label>
+                <label class="dialog-field">
+                  <span>Albums per pack</span>
+                  <input type="number" min="1" max="100" bind:value={channel.countryChart.albumCount} />
+                  <small>Choose any chart size from 1 to 100.</small>
+                </label>
+                <div class="chart-size-presets" aria-label="Album count presets">
+                  <span>Quick choices</span>
+                  {#each [10, 25, 50, 100] as count}
+                    <button
+                      type="button"
+                      class="secondary-button compact-button"
+                      class:active={channel.countryChart.albumCount === count}
+                      onclick={() => setCountryChartAlbumCount(channel, count)}
+                    >{count}</button>
+                  {/each}
+                </div>
               {/if}
               {#if channel.lastfm}
                 <div class="connection-status" class:good={channel.credentialConfigured}>

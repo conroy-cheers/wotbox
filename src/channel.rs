@@ -47,14 +47,16 @@ pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Res
             if channel.id != "country_chart" {
                 bail!("country chart channel id must be country_chart");
             }
-            let country = channel
+            let settings = channel
                 .country_chart
                 .as_ref()
-                .context("country chart settings are required")?
-                .country
-                .trim();
+                .context("country chart settings are required")?;
+            let country = settings.country.trim();
             if country.len() != 2 || !country.chars().all(|value| value.is_ascii_alphabetic()) {
                 bail!("country must be a two-letter code");
+            }
+            if !(1..=100).contains(&settings.album_count) {
+                bail!("country chart album count must be between 1 and 100");
             }
         }
         ChannelKind::Lastfm => {
@@ -202,9 +204,13 @@ pub async fn refresh_channel(
                 .as_ref()
                 .context("country chart settings disappeared")?;
             (
-                fetch_apple_chart(&state, &settings.country).await?,
+                fetch_apple_chart(&state, &settings.country, settings.album_count).await?,
                 false,
-                format!("{} Top 100 Albums", settings.country.to_ascii_uppercase()),
+                format!(
+                    "{} Top {} Albums",
+                    settings.country.to_ascii_uppercase(),
+                    settings.album_count
+                ),
             )
         }
         ChannelKind::Lastfm => {
@@ -329,9 +335,12 @@ pub fn preference_fingerprint(
     Ok(hex::encode(Sha256::digest(value)))
 }
 
-async fn fetch_apple_chart(state: &AppState, country: &str) -> Result<Vec<RecommendationSource>> {
-    let country = country.trim().to_ascii_lowercase();
-    let url = format!("{APPLE_FEED_ROOT}/{country}/music/most-played/100/albums.json");
+async fn fetch_apple_chart(
+    state: &AppState,
+    country: &str,
+    album_count: u16,
+) -> Result<Vec<RecommendationSource>> {
+    let url = apple_chart_url(country, album_count);
     let body = provider_json(
         state,
         "apple",
@@ -340,6 +349,11 @@ async fn fetch_apple_chart(state: &AppState, country: &str) -> Result<Vec<Recomm
     )
     .await?;
     parse_apple_chart(&body)
+}
+
+fn apple_chart_url(country: &str, album_count: u16) -> String {
+    let country = country.trim().to_ascii_lowercase();
+    format!("{APPLE_FEED_ROOT}/{country}/music/most-played/{album_count}/albums.json")
 }
 
 fn parse_apple_chart(body: &Value) -> Result<Vec<RecommendationSource>> {
@@ -1486,15 +1500,17 @@ mod tests {
     };
 
     use crate::model::{
-        ChannelConfig, ChannelPackItem, DownloadEligibility, DownloadEligibilityReason,
-        DownloadProfile, LeechStatus, PackItemPlanState, PlannedDownload, RecommendationMatchState,
-        RecommendationSource, ReleasePreferences, RuntimePreferences, TorrentVariant,
+        ChannelConfig, ChannelPackItem, CountryChartChannelSettings, DownloadEligibility,
+        DownloadEligibilityReason, DownloadProfile, LeechStatus, PackItemPlanState,
+        PlannedDownload, RecommendationMatchState, RecommendationSource, ReleasePreferences,
+        RuntimePreferences, TorrentVariant,
     };
 
     use super::{
-        apple_sources_from_cache, apply_pack_constraints, base_edition_title, channel_is_due,
-        compare_variants, get_json_with_retry, lastfm_failure, next_occurrence, next_refresh_at,
-        parse_apple_chart, tracker_query_title, validate_channel, validate_channel_refresh,
+        apple_chart_url, apple_sources_from_cache, apply_pack_constraints, base_edition_title,
+        channel_is_due, compare_variants, get_json_with_retry, lastfm_failure, next_occurrence,
+        next_refresh_at, parse_apple_chart, tracker_query_title, validate_channel,
+        validate_channel_refresh,
     };
 
     #[test]
@@ -1540,6 +1556,40 @@ mod tests {
         let error = validate_channel(&channel, false).expect_err("missing credential");
         assert!(error.to_string().contains("API key"));
         validate_channel(&channel, true).expect("valid channel");
+    }
+
+    #[test]
+    fn validates_configurable_country_chart_size_and_migrates_legacy_settings() {
+        let legacy: CountryChartChannelSettings =
+            serde_json::from_value(json!({ "country": "GB" })).expect("legacy settings");
+        assert_eq!(legacy.album_count, 100);
+
+        let mut channel = ChannelConfig::country_chart_default(Utc::now());
+        for album_count in [10, 25, 37, 50, 100] {
+            channel
+                .country_chart
+                .as_mut()
+                .expect("settings")
+                .album_count = album_count;
+            validate_channel(&channel, false).expect("valid chart size");
+        }
+        channel
+            .country_chart
+            .as_mut()
+            .expect("settings")
+            .album_count = 0;
+        assert!(validate_channel(&channel, false).is_err());
+        channel
+            .country_chart
+            .as_mut()
+            .expect("settings")
+            .album_count = 101;
+        assert!(validate_channel(&channel, false).is_err());
+
+        assert_eq!(
+            apple_chart_url(" AU ", 37),
+            "https://rss.applemarketingtools.com/api/v2/au/music/most-played/37/albums.json"
+        );
     }
 
     #[test]
