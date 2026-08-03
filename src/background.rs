@@ -36,6 +36,7 @@ pub const INDEX_TRACKLIST: &str = "index_tracklist";
 pub const COMPUTE_SINGLE_COVERAGE: &str = "compute_single_coverage";
 pub const SCAN_DOWNLOAD_CLIENT: &str = "scan_download_client";
 pub const CANONICAL_BACKFILL: &str = "canonical_backfill";
+pub const RECONCILE_CANONICAL_RELEASES: &str = "reconcile_canonical_releases";
 pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
 pub const NOTIFY_PLEX: &str = "notify_plex";
 pub const SUBMIT_DOWNLOAD: &str = "submit_download";
@@ -392,6 +393,25 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
     enqueue(
         state,
         EnqueueBackgroundJob {
+            deduplication_key: &format!(
+                "reconcile-canonical-releases:v{}",
+                crate::release_matcher::MATCHER_VERSION
+            ),
+            kind: RECONCILE_CANONICAL_RELEASES,
+            payload: json!({ "matcherVersion": crate::release_matcher::MATCHER_VERSION }),
+            provider_id: None,
+            lane: "maintenance",
+            priority: -19,
+            max_attempts: 20,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: None,
+        },
+    )
+    .await?;
+    enqueue(
+        state,
+        EnqueueBackgroundJob {
             deduplication_key: "enrich-library-artists:v1",
             kind: ENRICH_LIBRARY_ARTISTS,
             payload: json!({}),
@@ -617,6 +637,7 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
         COMPUTE_SINGLE_COVERAGE => compute_single_coverage(state, &job.payload).await,
         SCAN_DOWNLOAD_CLIENT => scan_download_client(state, &job.payload).await,
         CANONICAL_BACKFILL => canonical_backfill(state).await,
+        RECONCILE_CANONICAL_RELEASES => reconcile_canonical_releases(state).await,
         ENRICH_LIBRARY_ARTISTS => {
             enrich_library_artist_credits(state).await?;
             Ok(JobOutcome::Complete)
@@ -1681,6 +1702,18 @@ async fn canonical_backfill(state: &Arc<AppState>) -> Result<JobOutcome> {
             increment_attempt: false,
             code: "more_work",
             message: "Continuing canonical identity backfill".into(),
+        }),
+    }
+}
+
+async fn reconcile_canonical_releases(state: &Arc<AppState>) -> Result<JobOutcome> {
+    match state.db.reconcile_canonical_release_identities(50).await? {
+        0 => Ok(JobOutcome::Complete),
+        _ => Ok(JobOutcome::Retry {
+            delay: Duration::from_millis(250),
+            increment_attempt: false,
+            code: "more_work",
+            message: "Continuing cross-tracker release reconciliation".into(),
         }),
     }
 }

@@ -1427,6 +1427,24 @@ mod tests {
         assert!(catalog.groups[1].variants[0].freeleech);
     }
 
+    #[test]
+    fn decodes_gazelle_entities_for_every_tracker_kind() {
+        for kind in [TrackerKind::Ops, TrackerKind::Red] {
+            let summary = normalize_release_summary(
+                "tracker",
+                kind,
+                42,
+                &serde_json::json!({
+                    "groupName": "That&#39;s the Spirit &amp; S&atilde;o Paulo",
+                    "artist": "Bring Me &amp; Friends",
+                    "releaseType": 1
+                }),
+            );
+            assert_eq!(summary.title, "That's the Spirit & São Paulo");
+            assert_eq!(summary.artist.as_deref(), Some("Bring Me & Friends"));
+        }
+    }
+
     #[tokio::test]
     async fn requests_artist_catalog_by_stable_id() {
         let server = MockServer::start().await;

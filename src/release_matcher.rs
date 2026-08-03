@@ -2,10 +2,14 @@ use std::{cmp::Ordering, collections::HashSet};
 
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-use crate::model::{ReleaseDetail, ReleaseSource, ReleaseSummary, SearchGroup};
+use crate::model::{
+    ReleaseDetail, ReleaseSource, ReleaseSummary, SearchGroup, decode_tracker_text,
+};
 
-pub const MATCHER_VERSION: i32 = 2;
+pub const MATCHER_VERSION: i32 = 3;
 pub const AUTO_MERGE_THRESHOLD: f64 = 0.88;
+pub const AUTO_MERGE_MARGIN: f64 = 0.035;
+pub const REVIEW_THRESHOLD: f64 = 0.80;
 pub const DOWNLOAD_MATCH_THRESHOLD: f64 = 0.90;
 pub const DOWNLOAD_MATCH_MARGIN: f64 = 0.035;
 
@@ -39,7 +43,7 @@ pub enum DownloadMatchResult {
 }
 
 pub fn normalized(value: &str) -> String {
-    value
+    decode_tracker_text(value)
         .replace(['&', '+'], " and ")
         .replace(['æ', 'Æ'], "ae")
         .replace(['ø', 'Ø'], "o")
@@ -222,7 +226,12 @@ fn identity_score(
     let release_type = match (left_type, right_type) {
         (Some(left), Some(right)) if normalized(left) == normalized(right) => 1.0,
         (None, _) | (_, None) => 0.5,
-        _ => 0.0,
+        (Some(left), Some(right))
+            if compatible_release_types(left, right, left_title, right_title) =>
+        {
+            0.8
+        }
+        _ => return 0.0,
     };
     let year = match (left_year, right_year) {
         (Some(left), Some(right)) if left == right => 1.0,
@@ -230,10 +239,6 @@ fn identity_score(
         (None, _) | (_, None) => 0.5,
         _ => 0.0,
     };
-    if matches!((left_type, right_type), (Some(left), Some(right)) if normalized(left) != normalized(right))
-    {
-        return 0.0;
-    }
     let generic_artist = [left_artist, right_artist]
         .into_iter()
         .flatten()
@@ -254,6 +259,21 @@ fn identity_score(
         return 0.0;
     }
     title * 0.52 + artist * 0.30 + release_type * 0.10 + year * 0.08
+}
+
+fn compatible_release_types(left: &str, right: &str, left_title: &str, right_title: &str) -> bool {
+    let left = normalized(left);
+    let right = normalized(right);
+    let pair = [left.as_str(), right.as_str()];
+    if pair.contains(&"compilation") && pair.contains(&"sampler") {
+        return true;
+    }
+    if !pair.contains(&"remix") {
+        return false;
+    }
+    let counterpart = if left == "remix" { &right } else { &left };
+    matches!(counterpart.as_str(), "album" | "ep" | "single")
+        && normalized(left_title) == normalized(right_title)
 }
 
 pub fn parse_download_release_name(value: &str) -> DownloadReleaseIdentity {
@@ -729,6 +749,11 @@ mod tests {
     #[test]
     fn normalizes_cross_tracker_spelling_noise() {
         assert_eq!(normalized("Beyoncé & Jay-Z"), "beyonce and jay z");
+        assert_eq!(normalized("That&#39;s the Spirit"), "that s the spirit");
+        assert_eq!(
+            normalized("L.I.V.E. In S&atilde;o Paulo"),
+            normalized("L.I.V.E. In São Paulo")
+        );
     }
 
     #[test]

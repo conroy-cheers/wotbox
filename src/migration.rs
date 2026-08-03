@@ -31,7 +31,52 @@ impl MigratorTrait for Migrator {
             Box::new(OpsTorrentDiagnosisSchema),
             Box::new(ImportQueueSchema),
             Box::new(ChannelProviderWaitSchema),
+            Box::new(CanonicalReleaseReconciliationSchema),
         ]
+    }
+}
+
+struct CanonicalReleaseReconciliationSchema;
+
+impl MigrationName for CanonicalReleaseReconciliationSchema {
+    fn name(&self) -> &str {
+        "m20260803_000013_canonical_release_reconciliation"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for CanonicalReleaseReconciliationSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        add_column_if_missing(
+            manager,
+            &schema,
+            release_source::Entity,
+            release_source::Column::MatcherVersion,
+        )
+        .await?;
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .name("idx_release_sources_matcher_version")
+                .table(release_source::Entity)
+                .col(release_source::Column::MatcherVersion)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_release_sources_artist_year")
+                .table(release_source::Entity)
+                .col(release_source::Column::NormalizedArtist)
+                .col(release_source::Column::Year)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

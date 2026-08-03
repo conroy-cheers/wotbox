@@ -1903,7 +1903,21 @@ pub fn value_f64(value: &Value, keys: &[&str]) -> Option<f64> {
 
 pub fn value_string(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
-        .find_map(|key| value.get(*key)?.as_str().map(ToOwned::to_owned))
+        .find_map(|key| value.get(*key)?.as_str().map(decode_tracker_text))
+}
+
+pub fn decode_tracker_text(value: &str) -> String {
+    html_escape::decode_html_entities(value).into_owned()
+}
+
+pub fn decode_release_summary_text(release: &mut ReleaseSummary) {
+    release.title = decode_tracker_text(&release.title);
+    release.artist = release.artist.as_deref().map(decode_tracker_text);
+    release.artwork = release.artwork.as_deref().map(decode_tracker_text);
+    release.release_type = release.release_type.as_deref().map(decode_tracker_text);
+    for artist in &mut release.artists {
+        artist.name = decode_tracker_text(&artist.name);
+    }
 }
 
 pub fn value_bool(value: &Value, keys: &[&str]) -> bool {

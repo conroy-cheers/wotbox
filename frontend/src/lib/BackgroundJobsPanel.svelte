@@ -23,6 +23,7 @@
     compute_single_coverage: "Match Single to Album",
     scan_download_client: "Scan download client",
     canonical_backfill: "Update library identities",
+    reconcile_canonical_releases: "Merge tracker releases",
     enrich_library_artists: "Enrich library artists",
     notify_plex: "Notify Plex",
     submit_download: "Submit download",

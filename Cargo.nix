@@ -4318,6 +4318,20 @@ rec {
           "zeroize" = [ "digest/zeroize" ];
         };
       };
+      "html-escape" = rec {
+        crateName = "html-escape";
+        version = "0.2.15";
+        edition = "2021";
+        sha256 = "1i8k6hkpvrz2d0px2rcgc7d2qyc22l760wr1lfxrf4dlnjan0df9";
+        libName = "html_escape";
+        authors = [
+          "Magic Len <len@magiclen.org>"
+        ];
+        features = {
+          "default" = [ "std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
       "http" = rec {
         crateName = "http";
         version = "1.4.2";
@@ -15213,6 +15227,10 @@ rec {
           {
             name = "hex";
             packageId = "hex";
+          }
+          {
+            name = "html-escape";
+            packageId = "html-escape";
           }
           {
             name = "include_dir";

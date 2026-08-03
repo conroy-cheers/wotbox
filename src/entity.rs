@@ -217,6 +217,8 @@ pub mod release_source {
         pub normalized_artist: String,
         pub year: Option<i64>,
         pub release_type: Option<String>,
+        #[sea_orm(default_value = 0)]
+        pub matcher_version: i32,
         #[sea_orm(column_type = "Json")]
         pub source_json: Json,
         pub fetched_at: String,

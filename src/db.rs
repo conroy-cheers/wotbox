@@ -47,6 +47,13 @@ pub struct Cached<T> {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReleaseIdentityMatch {
+    release_id: Uuid,
+    score: f64,
+    auto_merge: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadReleaseLink {
     pub client: String,
@@ -3298,6 +3305,15 @@ impl Database {
         expires_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut canonical = canonical.clone();
+        crate::model::decode_release_summary_text(&mut canonical.release);
+        canonical.description = canonical
+            .description
+            .as_deref()
+            .map(crate::model::decode_tracker_text);
+        canonical.record_label = canonical
+            .record_label
+            .as_deref()
+            .map(crate::model::decode_tracker_text);
         let existing_torrent = canonical_torrent::Entity::find_by_id((
             canonical.release.tracker.clone(),
             canonical.variant.torrent_id,
@@ -3411,33 +3427,25 @@ impl Database {
         let release_id = if let Some(existing) = &existing {
             Uuid::parse_str(&existing.release_id)?
         } else {
-            let normalized_title = crate::release_matcher::normalized(&release.title);
-            let candidates = release_source::Entity::find()
-                .filter(release_source::Column::NormalizedTitle.eq(&normalized_title))
-                .filter(release_source::Column::Tracker.ne(&tracker))
-                .all(&self.connection)
-                .await?;
-            let mut best: Option<(Uuid, f64)> = None;
-            for candidate in candidates {
-                let Ok(summary) =
-                    serde_json::from_value::<ReleaseSummary>(candidate.source_json.clone())
-                else {
-                    continue;
-                };
-                let score = crate::release_matcher::summary_score(release, &summary);
-                if best.is_none_or(|(_, known)| score > known) {
-                    best = Some((Uuid::parse_str(&candidate.release_id)?, score));
+            match self
+                .find_release_identity_match(release, &tracker, None)
+                .await?
+            {
+                Some(candidate) if candidate.auto_merge => {
+                    self.put_match_candidate(
+                        "release",
+                        candidate.release_id,
+                        candidate.release_id,
+                        candidate.score,
+                        "accepted_auto",
+                        release,
+                    )
+                    .await?;
+                    candidate.release_id
                 }
-            }
-            match best {
-                Some((id, score)) if score >= crate::release_matcher::AUTO_MERGE_THRESHOLD => {
-                    self.put_match_candidate("release", id, id, score, "accepted_auto", release)
-                        .await?;
-                    id
-                }
-                Some((other, score)) if score >= 0.80 => {
+                Some(candidate) => {
                     let id = Uuid::new_v4();
-                    review_match = Some((id, other, score));
+                    review_match = Some((id, candidate.release_id, candidate.score));
                     id
                 }
                 _ => Uuid::new_v4(),
@@ -3496,6 +3504,7 @@ impl Database {
                 normalized_artist: Set(normalized_artist),
                 year: Set(release.year),
                 release_type: Set(release.release_type.clone()),
+                matcher_version: Set(crate::release_matcher::MATCHER_VERSION),
                 source_json: Set(source_json),
                 fetched_at: Set(fetched_at.to_rfc3339()),
                 expires_at: Set(expires_at.to_rfc3339()),
@@ -3532,6 +3541,103 @@ impl Database {
             .exec(&self.connection)
             .await?;
         Ok(release_id)
+    }
+
+    async fn find_release_identity_match(
+        &self,
+        release: &ReleaseSummary,
+        tracker: &str,
+        current_release_id: Option<Uuid>,
+    ) -> Result<Option<ReleaseIdentityMatch>> {
+        let normalized_title = crate::release_matcher::normalized(&release.title);
+        let normalized_artist = release
+            .artist
+            .as_deref()
+            .map(crate::release_matcher::normalized)
+            .unwrap_or_default();
+        let generic_artist = matches!(
+            normalized_artist.as_str(),
+            "" | "various artists" | "unknown artist"
+        );
+        let mut candidate_scope =
+            Condition::any().add(release_source::Column::NormalizedTitle.eq(&normalized_title));
+        if !generic_artist && let Some(year) = release.year {
+            candidate_scope = candidate_scope.add(
+                Condition::all()
+                    .add(release_source::Column::NormalizedArtist.eq(&normalized_artist))
+                    .add(release_source::Column::Year.gte(year - 1))
+                    .add(release_source::Column::Year.lte(year + 1)),
+            );
+        }
+        let candidates = release_source::Entity::find()
+            .filter(release_source::Column::Tracker.ne(tracker))
+            .filter(candidate_scope)
+            .limit(256)
+            .all(&self.connection)
+            .await?;
+        let mut by_release = HashMap::<Uuid, f64>::new();
+        for candidate in candidates {
+            let Ok(summary) =
+                serde_json::from_value::<ReleaseSummary>(candidate.source_json.clone())
+            else {
+                continue;
+            };
+            let candidate_id = self
+                .resolve_alias("release", Uuid::parse_str(&candidate.release_id)?)
+                .await?;
+            if let Some(current_release_id) = current_release_id
+                && candidate_id != current_release_id
+                && self
+                    .match_pair_was_rejected("release", current_release_id, candidate_id)
+                    .await?
+            {
+                continue;
+            }
+            let score = crate::release_matcher::summary_score(release, &summary);
+            by_release
+                .entry(candidate_id)
+                .and_modify(|known| *known = known.max(score))
+                .or_insert(score);
+        }
+        let mut ranked = by_release.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.as_u128().cmp(&right.0.as_u128()))
+        });
+        let Some((release_id, score)) = ranked.first().copied() else {
+            return Ok(None);
+        };
+        if score < crate::release_matcher::REVIEW_THRESHOLD {
+            return Ok(None);
+        }
+        let margin = ranked
+            .get(1)
+            .map(|(_, runner_up)| score - runner_up)
+            .unwrap_or(f64::INFINITY);
+        Ok(Some(ReleaseIdentityMatch {
+            release_id,
+            score,
+            auto_merge: score >= crate::release_matcher::AUTO_MERGE_THRESHOLD
+                && margin >= crate::release_matcher::AUTO_MERGE_MARGIN,
+        }))
+    }
+
+    async fn match_pair_was_rejected(&self, kind: &str, left: Uuid, right: Uuid) -> Result<bool> {
+        let (left, right) = if left.as_bytes() <= right.as_bytes() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        Ok(match_candidate::Entity::find()
+            .filter(match_candidate::Column::Kind.eq(kind))
+            .filter(match_candidate::Column::LeftId.eq(left.to_string()))
+            .filter(match_candidate::Column::RightId.eq(right.to_string()))
+            .filter(match_candidate::Column::Status.eq("rejected"))
+            .one(&self.connection)
+            .await?
+            .is_some())
     }
 
     async fn ensure_release_artists(
@@ -4267,6 +4373,101 @@ impl Database {
             .await?;
         }
         Ok(processed as usize)
+    }
+
+    pub async fn reconcile_canonical_release_identities(&self, limit: u64) -> Result<usize> {
+        let unnormalized = release_source::Entity::find()
+            .filter(release_source::Column::MatcherVersion.eq(0))
+            .order_by_asc(release_source::Column::Tracker)
+            .order_by_asc(release_source::Column::GroupId)
+            .limit(limit)
+            .all(&self.connection)
+            .await?;
+        if !unnormalized.is_empty() {
+            let processed = unnormalized.len();
+            let mut affected_releases = std::collections::HashSet::new();
+            for model in unnormalized {
+                let release_id = Uuid::parse_str(&model.release_id)?;
+                let mut summary: ReleaseSummary =
+                    serde_json::from_value(model.source_json.clone())?;
+                crate::model::decode_release_summary_text(&mut summary);
+                affected_releases.insert(release_id);
+                let mut active = model.into_active_model();
+                active.normalized_title = Set(crate::release_matcher::normalized(&summary.title));
+                active.normalized_artist = Set(summary
+                    .artist
+                    .as_deref()
+                    .map(crate::release_matcher::normalized)
+                    .unwrap_or_default());
+                active.release_type = Set(summary.release_type.clone());
+                active.source_json = Set(serde_json::to_value(summary)?);
+                active.matcher_version = Set(-crate::release_matcher::MATCHER_VERSION);
+                active.last_error = Set(None);
+                active.update(&self.connection).await?;
+            }
+            for release_id in affected_releases {
+                self.rebuild_release_metadata(release_id).await?;
+            }
+            return Ok(processed);
+        }
+
+        let sources = release_source::Entity::find()
+            .filter(
+                release_source::Column::MatcherVersion.lt(crate::release_matcher::MATCHER_VERSION),
+            )
+            .order_by_asc(release_source::Column::Tracker)
+            .order_by_asc(release_source::Column::GroupId)
+            .limit(limit)
+            .all(&self.connection)
+            .await?;
+        let processed = sources.len();
+        for model in sources {
+            let source_key = (model.tracker.clone(), model.group_id);
+            let current_release_id = self
+                .resolve_alias("release", Uuid::parse_str(&model.release_id)?)
+                .await?;
+            let mut summary: ReleaseSummary = serde_json::from_value(model.source_json.clone())?;
+            crate::model::decode_release_summary_text(&mut summary);
+            if let Some(candidate) = self
+                .find_release_identity_match(&summary, &model.tracker, Some(current_release_id))
+                .await?
+                && candidate.release_id != current_release_id
+            {
+                if candidate.auto_merge {
+                    self.put_match_candidate(
+                        "release",
+                        current_release_id,
+                        candidate.release_id,
+                        candidate.score,
+                        "accepted_auto",
+                        &summary,
+                    )
+                    .await?;
+                    self.merge_releases(candidate.release_id, current_release_id)
+                        .await?;
+                } else {
+                    self.put_match_candidate(
+                        "release",
+                        current_release_id,
+                        candidate.release_id,
+                        candidate.score,
+                        "pending",
+                        &summary,
+                    )
+                    .await?;
+                }
+            }
+            if let Some(updated) = release_source::Entity::find_by_id(source_key)
+                .one(&self.connection)
+                .await?
+            {
+                let mut active = updated.into_active_model();
+                active.matcher_version = Set(crate::release_matcher::MATCHER_VERSION);
+                active.last_error = Set(None);
+                active.update(&self.connection).await?;
+            }
+        }
+        Ok(processed)
     }
 
     pub async fn canonical_backfill_progress(&self) -> Result<CanonicalBackfillProgress> {
@@ -6034,7 +6235,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        entity::{background_job, download_release_link, release_track_index},
+        entity::{background_job, download_release_link, release_source, release_track_index},
         model::{
             CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
             ClientDownloadState, ImportCleanupMode, ImportTaskState, LiveDownloadStatus,
@@ -6049,6 +6250,174 @@ mod tests {
         CreateReplacementImport, Database, DownloadObservation, EnqueueBackgroundJob,
         StoredProviderState,
     };
+
+    fn tracker_release(
+        tracker: &str,
+        group_id: i64,
+        torrent_id: i64,
+        title: &str,
+        year: i64,
+        release_type: &str,
+    ) -> CanonicalTorrent {
+        CanonicalTorrent {
+            release: ReleaseSummary {
+                id: None,
+                tracker: tracker.into(),
+                group_id,
+                title: title.into(),
+                artist: Some("Bring Me the Horizon".into()),
+                artists: vec![fallback_artist_credit(tracker, "Bring Me the Horizon")],
+                year: Some(year),
+                artwork: None,
+                release_type: Some(release_type.into()),
+                sources: vec![crate::model::ReleaseSource {
+                    tracker: tracker.into(),
+                    group_id,
+                    match_score: 1.0,
+                }],
+                album_coverage: None,
+            },
+            variant: TorrentVariant {
+                tracker: tracker.into(),
+                torrent_id,
+                group_id,
+                info_hash: None,
+                format: Some("FLAC".into()),
+                encoding: Some("Lossless".into()),
+                media: Some("WEB".into()),
+                size: Some(100),
+                seeders: None,
+                leechers: None,
+                snatched: None,
+                freeleech: false,
+                leech_status: crate::model::LeechStatus::Regular,
+                can_use_token: false,
+                token_eligibility_known: false,
+                eligibility: None,
+                remaster_title: None,
+                downloads: Vec::new(),
+                library: None,
+            },
+            tags: Vec::new(),
+            description: None,
+            record_label: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn merges_shared_gazelle_release_variations_at_ingest() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("gazelle-matches.sqlite"))
+            .await
+            .expect("database");
+        let cases = [
+            (
+                tracker_release("ops", 10, 100, "That's the Spirit", 2015, "Album"),
+                tracker_release("red", 20, 200, "That&#39;s the Spirit", 2015, "Album"),
+                "That's the Spirit",
+            ),
+            (
+                tracker_release("ops", 11, 101, "The Chillout Sessions", 2012, "EP"),
+                tracker_release("red", 21, 201, "The Chill Out Sessions", 2012, "EP"),
+                "The Chill Out Sessions",
+            ),
+            (
+                tracker_release("ops", 12, 102, "Lo-files", 2025, "Album"),
+                tracker_release("red", 22, 202, "Lo-files", 2025, "Remix"),
+                "Lo-files",
+            ),
+        ];
+        for (ops, red, expected_title) in cases {
+            db.put_canonical(&ops, Utc::now(), Utc::now() + Duration::hours(1))
+                .await
+                .expect("OPS release");
+            db.put_canonical(&red, Utc::now(), Utc::now() + Duration::hours(1))
+                .await
+                .expect("RED release");
+            let ops_id = db
+                .release_id_for_source("ops", ops.release.group_id)
+                .await
+                .expect("OPS identity")
+                .expect("OPS release");
+            let red_id = db
+                .release_id_for_source("red", red.release.group_id)
+                .await
+                .expect("RED identity")
+                .expect("RED release");
+            assert_eq!(ops_id, red_id, "{} should merge", ops.release.title);
+            let detail = db
+                .get_release_detail(ops_id)
+                .await
+                .expect("release detail")
+                .expect("canonical release");
+            assert_eq!(detail.release.title, expected_title);
+            assert_eq!(detail.release.sources.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repairs_preexisting_split_tracker_identities() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("reconciliation.sqlite"))
+            .await
+            .expect("database");
+        let ops = tracker_release("ops", 30, 300, "That's the Spirit", 2015, "Album");
+        let mut red = tracker_release("red", 40, 400, "Temporary mismatch", 2015, "Album");
+        db.put_canonical(&ops, Utc::now(), Utc::now() + Duration::hours(1))
+            .await
+            .expect("OPS release");
+        db.put_canonical(&red, Utc::now(), Utc::now() + Duration::hours(1))
+            .await
+            .expect("initial RED release");
+        let original_ops_id = db
+            .release_id_for_source("ops", 30)
+            .await
+            .expect("OPS identity")
+            .expect("OPS release");
+        let original_red_id = db
+            .release_id_for_source("red", 40)
+            .await
+            .expect("RED identity")
+            .expect("RED release");
+        assert_ne!(original_ops_id, original_red_id);
+
+        red.release.title = "That&#39;s the Spirit".into();
+        let model = release_source::Entity::find_by_id(("red".to_owned(), 40))
+            .one(&db.connection)
+            .await
+            .expect("source lookup")
+            .expect("RED source");
+        let mut active = model.into_active_model();
+        active.normalized_title = Set("that and 39 s the spirit".into());
+        active.source_json = Set(serde_json::to_value(&red.release).expect("source JSON"));
+        active.matcher_version = Set(0);
+        active.update(&db.connection).await.expect("stale source");
+
+        while db
+            .reconcile_canonical_release_identities(10)
+            .await
+            .expect("reconciliation")
+            > 0
+        {}
+        let repaired_ops_id = db
+            .release_id_for_source("ops", 30)
+            .await
+            .expect("OPS identity")
+            .expect("OPS release");
+        let repaired_red_id = db
+            .release_id_for_source("red", 40)
+            .await
+            .expect("RED identity")
+            .expect("RED release");
+        assert_eq!(repaired_ops_id, repaired_red_id);
+        assert_eq!(repaired_ops_id, original_ops_id);
+        assert!(
+            db.get_release_detail(original_red_id)
+                .await
+                .expect("alias")
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn replacement_imports_persist_exact_supersessions_without_backfill_cleanup() {
