@@ -31,7 +31,7 @@ use crate::{
         ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob, DownloadState,
         ImportCleanupMode, ImportSupersession, ImportTask, ImportTaskCounts, ImportTaskState,
         ImportsPage, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseDownload,
-        ReleaseSummary, RuntimePreferences, TrumpedDownloadRef,
+        ReleaseSummary, RuntimePreferences, TorrentVariant, TrumpedDownloadRef,
     },
     plex::PlexScanTarget,
 };
@@ -3304,6 +3304,76 @@ impl Database {
         fetched_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Result<()> {
+        let (mut canonical, existing_torrent) = self.prepare_canonical(canonical).await?;
+        let release_id = self
+            .ensure_release_identity(&mut canonical.release, fetched_at, expires_at)
+            .await?;
+        self.upsert_canonical_torrent(
+            &canonical,
+            existing_torrent,
+            release_id,
+            fetched_at,
+            expires_at,
+        )
+        .await?;
+        self.replace_release_artists(&canonical).await?;
+        Ok(())
+    }
+
+    pub async fn put_catalog_group(
+        &self,
+        release: &ReleaseSummary,
+        variants: &[TorrentVariant],
+        tags: &[String],
+        fetched_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid> {
+        let Some((first, remaining)) = variants.split_first() else {
+            return self
+                .put_release_summary(release, fetched_at, expires_at)
+                .await;
+        };
+        let first = CanonicalTorrent {
+            release: release.clone(),
+            variant: first.clone(),
+            tags: tags.to_vec(),
+            description: None,
+            record_label: None,
+        };
+        let (mut first, existing_torrent) = self.prepare_canonical(&first).await?;
+        let release_id = self
+            .ensure_release_identity(&mut first.release, fetched_at, expires_at)
+            .await?;
+        self.upsert_canonical_torrent(&first, existing_torrent, release_id, fetched_at, expires_at)
+            .await?;
+        self.replace_release_artists(&first).await?;
+
+        for variant in remaining {
+            let canonical = CanonicalTorrent {
+                release: first.release.clone(),
+                variant: variant.clone(),
+                tags: tags.to_vec(),
+                description: None,
+                record_label: None,
+            };
+            let (mut canonical, existing_torrent) = self.prepare_canonical(&canonical).await?;
+            canonical.release = first.release.clone();
+            self.upsert_canonical_torrent(
+                &canonical,
+                existing_torrent,
+                release_id,
+                fetched_at,
+                expires_at,
+            )
+            .await?;
+        }
+        Ok(release_id)
+    }
+
+    async fn prepare_canonical(
+        &self,
+        canonical: &CanonicalTorrent,
+    ) -> Result<(CanonicalTorrent, Option<canonical_torrent::Model>)> {
         let mut canonical = canonical.clone();
         crate::model::decode_release_summary_text(&mut canonical.release);
         canonical.description = canonical
@@ -3381,11 +3451,18 @@ impl Database {
                 }
             }
         }
+        Ok((canonical, existing_torrent))
+    }
 
-        let release_id = self
-            .ensure_release_identity(&mut canonical.release, fetched_at, expires_at)
-            .await?;
-        let canonical_json = serde_json::to_value(&canonical)?;
+    async fn upsert_canonical_torrent(
+        &self,
+        canonical: &CanonicalTorrent,
+        existing_torrent: Option<canonical_torrent::Model>,
+        release_id: Uuid,
+        fetched_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let canonical_json = serde_json::to_value(canonical)?;
         if let Some(model) = existing_torrent {
             let mut active = model.into_active_model();
             active.group_id = Set(canonical.release.group_id);
@@ -3409,7 +3486,6 @@ impl Database {
             .insert(&self.connection)
             .await?;
         }
-        self.replace_release_artists(&canonical).await?;
         Ok(())
     }
 
@@ -6247,7 +6323,10 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        entity::{background_job, download_release_link, release_source, release_track_index},
+        entity::{
+            background_job, canonical_torrent, download_release_link, release_source,
+            release_track_index,
+        },
         model::{
             CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
             ClientDownloadState, ImportCleanupMode, ImportTaskState, LiveDownloadStatus,
@@ -6408,6 +6487,61 @@ mod tests {
         assert_eq!(detail.release.title, "Kerrang! The Album '09");
         assert_eq!(detail.release.sources.len(), 2);
         assert!(detail.variants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_groups_reconcile_release_identity_once_for_all_variants() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("catalog-group.sqlite"))
+            .await
+            .expect("database");
+        let ops = tracker_release("ops", 10, 100, "That's the Spirit", 2015, "Album");
+        let red = tracker_release("red", 20, 200, "That&#39;s the Spirit", 2015, "Album");
+        let mut ops_variants = vec![ops.variant.clone()];
+        ops_variants.push(TorrentVariant {
+            torrent_id: 101,
+            info_hash: Some("OPS101".into()),
+            ..ops.variant.clone()
+        });
+        let mut red_variants = vec![red.variant.clone()];
+        red_variants.push(TorrentVariant {
+            torrent_id: 201,
+            info_hash: Some("RED201".into()),
+            ..red.variant.clone()
+        });
+
+        let ops_id = db
+            .put_catalog_group(
+                &ops.release,
+                &ops_variants,
+                &[],
+                Utc::now(),
+                Utc::now() + Duration::hours(1),
+            )
+            .await
+            .expect("OPS catalog group");
+        let red_id = db
+            .put_catalog_group(
+                &red.release,
+                &red_variants,
+                &[],
+                Utc::now(),
+                Utc::now() + Duration::hours(1),
+            )
+            .await
+            .expect("RED catalog group");
+
+        assert_eq!(ops_id, red_id);
+        let torrents = canonical_torrent::Entity::find()
+            .filter(canonical_torrent::Column::ReleaseId.eq(ops_id.to_string()))
+            .all(&db.connection)
+            .await
+            .expect("canonical torrents");
+        assert_eq!(torrents.len(), 4);
+        assert!(torrents.iter().all(|torrent| {
+            serde_json::from_value::<CanonicalTorrent>(torrent.canonical_json.clone())
+                .is_ok_and(|canonical| canonical.release.id == Some(ops_id))
+        }));
     }
 
     #[tokio::test]

@@ -4006,24 +4006,14 @@ async fn cache_release_detail(db: &Database, detail: &ReleaseDetail) -> Result<(
 async fn cache_artist_catalog(db: &Database, catalog: &ArtistCatalogPage) -> Result<()> {
     let now = Utc::now();
     for group in &catalog.groups {
-        if group.variants.is_empty() {
-            db.put_release_summary(&group.release, now, now + ChronoDuration::hours(24))
-                .await?;
-        }
-        for variant in &group.variants {
-            db.put_canonical(
-                &CanonicalTorrent {
-                    release: group.release.clone(),
-                    variant: variant.clone(),
-                    tags: group.tags.clone(),
-                    description: None,
-                    record_label: None,
-                },
-                now,
-                now + ChronoDuration::hours(24),
-            )
-            .await?;
-        }
+        db.put_catalog_group(
+            &group.release,
+            &group.variants,
+            &group.tags,
+            now,
+            now + ChronoDuration::hours(24),
+        )
+        .await?;
     }
     Ok(())
 }
