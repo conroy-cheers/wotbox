@@ -2329,8 +2329,20 @@ impl Database {
 
     pub async fn ensure_single_coverage(&self, tracker: &str, group_id: i64) -> Result<()> {
         let transaction = self.begin_write().await?;
+        self.ensure_single_coverage_on(&transaction, tracker, group_id)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn ensure_single_coverage_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        tracker: &str,
+        group_id: i64,
+    ) -> Result<()> {
         let existing = single_album_coverage::Entity::find_by_id((tracker.to_owned(), group_id))
-            .one(&transaction)
+            .one(connection)
             .await?;
         let should_enqueue = existing.as_ref().is_none_or(|model| model.state != "ready");
         if existing.is_none() {
@@ -2341,23 +2353,100 @@ impl Database {
                 coverage_json: Set(None),
                 updated_at: Set(Utc::now().to_rfc3339()),
             }
-            .insert(&transaction)
+            .insert(connection)
             .await?;
         }
         if should_enqueue {
+            let key = format!(
+                "single-coverage:{}:{group_id}:v2",
+                tracker.to_ascii_lowercase()
+            );
             self.enqueue_background_job_on(
-                &transaction,
+                connection,
                 EnqueueBackgroundJob {
-                    deduplication_key: &format!(
-                        "single-coverage:{}:{group_id}:v2",
-                        tracker.to_ascii_lowercase()
-                    ),
+                    deduplication_key: &key,
                     kind: "compute_single_coverage",
                     payload: serde_json::json!({ "tracker": tracker, "groupId": group_id }),
                     provider_id: None,
                     lane: "sync",
                     priority: 5,
                     max_attempts: 20,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn seed_single_deduplications(&self, singles: &[(String, i64)]) -> Result<()> {
+        if singles.is_empty() {
+            return Ok(());
+        }
+        let mut singles = singles.to_vec();
+        singles.sort_unstable();
+        singles.dedup();
+        let transaction = self.begin_write().await?;
+        for (tracker, group_id) in singles {
+            self.ensure_track_index_on(&transaction, &tracker, group_id, 10)
+                .await?;
+            self.ensure_single_coverage_on(&transaction, &tracker, group_id)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn ensure_artist_catalog_refreshes(&self, artists: &[(String, i64)]) -> Result<()> {
+        if artists.is_empty() {
+            return Ok(());
+        }
+        let mut artists = artists.to_vec();
+        artists.sort_unstable();
+        artists.dedup();
+        let keys = artists
+            .iter()
+            .map(|(tracker, artist_id)| {
+                format!(
+                    "refresh-artist-catalog:{}:{artist_id}:v1",
+                    tracker.to_ascii_lowercase()
+                )
+            })
+            .collect::<Vec<_>>();
+        let transaction = self.begin_write().await?;
+        let existing = background_job::Entity::find()
+            .select_only()
+            .column(background_job::Column::DeduplicationKey)
+            .filter(background_job::Column::DeduplicationKey.is_in(keys))
+            .into_tuple::<String>()
+            .all(&transaction)
+            .await?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        for (tracker, artist_id) in artists {
+            let key = format!(
+                "refresh-artist-catalog:{}:{artist_id}:v1",
+                tracker.to_ascii_lowercase()
+            );
+            if existing.contains(&key) {
+                continue;
+            }
+            self.enqueue_background_job_on(
+                &transaction,
+                EnqueueBackgroundJob {
+                    deduplication_key: &key,
+                    kind: "refresh_artist_catalog",
+                    payload: serde_json::json!({
+                        "tracker": tracker,
+                        "artistId": artist_id,
+                        "interactive": false,
+                    }),
+                    provider_id: Some(format!("tracker:{tracker}")),
+                    lane: "sync",
+                    priority: 5,
+                    max_attempts: 8,
                     next_run_at: None,
                     parent_id: None,
                     recurring_interval_seconds: None,
@@ -6490,6 +6579,45 @@ mod tests {
                 .iter()
                 .any(|job| job.kind == "compute_single_coverage")
         );
+    }
+
+    #[tokio::test]
+    async fn library_deduplication_seeding_is_batched_durable_and_idempotent() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("library-deduplication.sqlite"))
+            .await
+            .expect("database");
+        let artists = vec![("ops".to_owned(), 10), ("ops".to_owned(), 20)];
+        let singles = vec![("ops".to_owned(), 100), ("ops".to_owned(), 200)];
+
+        db.ensure_artist_catalog_refreshes(&artists)
+            .await
+            .expect("artist catalogs");
+        db.seed_single_deduplications(&singles)
+            .await
+            .expect("single coverage dependencies");
+        db.ensure_artist_catalog_refreshes(&artists)
+            .await
+            .expect("duplicate artist catalogs");
+        db.seed_single_deduplications(&singles)
+            .await
+            .expect("duplicate single coverage dependencies");
+
+        let overview = db.background_jobs_overview(20).await.expect("overview");
+        assert_eq!(overview.counts.pending, 6);
+        for key in [
+            "refresh-artist-catalog:ops:10:v1",
+            "refresh-artist-catalog:ops:20:v1",
+            "track-index:ops:100:v2",
+            "track-index:ops:200:v2",
+            "single-coverage:ops:100:v2",
+            "single-coverage:ops:200:v2",
+        ] {
+            assert!(
+                overview.jobs.iter().any(|job| job.deduplication_key == key),
+                "missing durable job {key}"
+            );
+        }
     }
 
     #[tokio::test]

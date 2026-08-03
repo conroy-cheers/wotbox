@@ -2783,7 +2783,7 @@ fn sort_library_releases(releases: &mut [LibraryRelease], sort: &str) {
 }
 
 async fn library_index_status(
-    state: &AppState,
+    state: &Arc<AppState>,
     releases: &[LibraryRelease],
 ) -> Result<LibraryIndexStatus, AppError> {
     let mut deduplication = DeduplicationIndexStatus::default();
@@ -2799,6 +2799,8 @@ async fn library_index_status(
         .map(|release| (release.release.tracker.clone(), release.release.group_id))
         .collect::<Vec<_>>();
     let coverages = state.db.get_single_coverages(&single_keys).await?;
+    let mut missing = Vec::new();
+    let mut artists = HashSet::new();
     for release in releases.iter().filter(|release| {
         release
             .release
@@ -2812,15 +2814,42 @@ async fn library_index_status(
             deduplication.hidden += 1;
             continue;
         }
-        match coverages
-            .get(&(release.release.tracker.clone(), release.release.group_id))
-            .map(|stored| stored.state.as_str())
-        {
+        let key = (release.release.tracker.clone(), release.release.group_id);
+        let state_name = coverages.get(&key).map(|stored| stored.state.as_str());
+        match state_name {
             Some("ready") => deduplication.checked += 1,
             Some("resolving") => deduplication.resolving += 1,
             Some("failed") => deduplication.failed += 1,
             _ => deduplication.pending += 1,
         }
+        if state_name != Some("ready") {
+            for artist in release
+                .release
+                .artists
+                .iter()
+                .filter(|artist| artist.role == ArtistRole::Primary)
+            {
+                let Some(artist_id) = artist.artist_id else {
+                    continue;
+                };
+                let tracker = artist.tracker.to_ascii_lowercase();
+                if state.trackers.contains_key(&tracker) {
+                    artists.insert((tracker, artist_id));
+                }
+            }
+        }
+        if state_name.is_none() {
+            missing.push(key);
+        }
+    }
+    let artists = artists.into_iter().collect::<Vec<_>>();
+    if !artists.is_empty() {
+        state.db.ensure_artist_catalog_refreshes(&artists).await?;
+    }
+    if !missing.is_empty() {
+        seed_single_deduplications(state, &missing).await?;
+    } else if !artists.is_empty() {
+        state.background_jobs.wake();
     }
     enrich_deduplication_queue_status(state, &mut deduplication).await?;
     Ok(LibraryIndexStatus {
@@ -3827,8 +3856,11 @@ async fn seed_catalog_deduplication(
 }
 
 async fn seed_single_deduplication(state: &AppState, tracker: &str, group_id: i64) -> Result<()> {
-    state.db.enqueue_track_index(tracker, group_id).await?;
-    state.db.ensure_single_coverage(tracker, group_id).await?;
+    seed_single_deduplications(state, &[(tracker.to_owned(), group_id)]).await
+}
+
+async fn seed_single_deduplications(state: &AppState, singles: &[(String, i64)]) -> Result<()> {
+    state.db.seed_single_deduplications(singles).await?;
     state.background_jobs.wake();
     Ok(())
 }
@@ -4287,25 +4319,11 @@ async fn enrich_artist_deduplication_batched(
             _ => status.pending += 1,
         }
     }
+    if !missing.is_empty() {
+        seed_single_deduplications(state, &missing).await?;
+    }
     enrich_deduplication_queue_status(state, &mut status).await?;
     catalog.deduplication = status;
-    if !missing.is_empty() {
-        let background_state = state.clone();
-        tokio::spawn(async move {
-            for (tracker, group_id) in missing {
-                if let Err(error) =
-                    seed_single_deduplication(&background_state, &tracker, group_id).await
-                {
-                    tracing::warn!(
-                        %tracker,
-                        group_id,
-                        %error,
-                        "could not seed artist deduplication in background"
-                    );
-                }
-            }
-        });
-    }
     Ok(())
 }
 
