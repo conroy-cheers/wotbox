@@ -3413,6 +3413,18 @@ impl Database {
         Ok(())
     }
 
+    pub async fn put_release_summary(
+        &self,
+        release: &ReleaseSummary,
+        fetched_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid> {
+        let mut release = release.clone();
+        crate::model::decode_release_summary_text(&mut release);
+        self.ensure_release_identity(&mut release, fetched_at, expires_at)
+            .await
+    }
+
     async fn ensure_release_identity(
         &self,
         release: &mut ReleaseSummary,
@@ -6353,6 +6365,49 @@ mod tests {
             assert_eq!(detail.release.title, expected_title);
             assert_eq!(detail.release.sources.len(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn merges_release_summaries_without_torrent_variants() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("summary-matches.sqlite"))
+            .await
+            .expect("database");
+        let ops = tracker_release(
+            "ops",
+            1_417_744,
+            1,
+            "Kerrang! The Album '09",
+            2009,
+            "Compilation",
+        );
+        let red = tracker_release(
+            "red",
+            1_147_969,
+            2,
+            "Kerrang! The Album &#39;09",
+            2009,
+            "Compilation",
+        );
+
+        let ops_id = db
+            .put_release_summary(&ops.release, Utc::now(), Utc::now() + Duration::hours(1))
+            .await
+            .expect("OPS release summary");
+        let red_id = db
+            .put_release_summary(&red.release, Utc::now(), Utc::now() + Duration::hours(1))
+            .await
+            .expect("RED release summary");
+
+        assert_eq!(ops_id, red_id);
+        let detail = db
+            .get_release_detail(ops_id)
+            .await
+            .expect("release detail")
+            .expect("canonical release");
+        assert_eq!(detail.release.title, "Kerrang! The Album '09");
+        assert_eq!(detail.release.sources.len(), 2);
+        assert!(detail.variants.is_empty());
     }
 
     #[tokio::test]

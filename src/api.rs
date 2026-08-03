@@ -298,6 +298,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/artists/{id}",
             get(canonical_artist_catalog).put(update_artist_metadata),
         )
+        .route(
+            "/api/v1/artists/{tracker}/{id}/releases",
+            get(artist_catalog),
+        )
         .route("/api/v1/download-profiles", get(download_profiles))
         .route("/api/v1/library/artists", get(library_artists))
         .route("/api/v1/library/artists/{id}", get(library_artist))
@@ -4002,6 +4006,10 @@ async fn cache_release_detail(db: &Database, detail: &ReleaseDetail) -> Result<(
 async fn cache_artist_catalog(db: &Database, catalog: &ArtistCatalogPage) -> Result<()> {
     let now = Utc::now();
     for group in &catalog.groups {
+        if group.variants.is_empty() {
+            db.put_release_summary(&group.release, now, now + ChronoDuration::hours(24))
+                .await?;
+        }
         for variant in &group.variants {
             db.put_canonical(
                 &CanonicalTorrent {
