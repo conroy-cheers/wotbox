@@ -288,6 +288,9 @@
                       {[variant.format, variant.encoding].filter(Boolean).join(" · ") || "Unknown format"}
                     </a>
                   {/each}
+                  {#if item.releaseCopies.length}
+                    <span>{item.releaseCopies.length} release-matched {item.releaseCopies.length === 1 ? "download" : "downloads"}</span>
+                  {/if}
                 </div>
               </div>
               <span class:warning={item.availability !== "present"} class="availability-label">

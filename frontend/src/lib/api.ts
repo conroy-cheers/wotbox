@@ -302,7 +302,7 @@ export type ReleaseDetail = {
 
 export type CanonicalDownload = {
   release: ReleaseSummary;
-  variant: TorrentVariant;
+  variant?: TorrentVariant;
   download: LiveDownloadStatus;
   provenance: Provenance;
   liveObservedAt?: string;
@@ -390,6 +390,7 @@ export type CrossSeedPlan = {
 export type LibraryRelease = {
   release: ReleaseSummary;
   variants: TorrentVariant[];
+  releaseCopies: LibraryCopy[];
   availability: LibraryAvailability;
   addedAt: string;
   provenance: Provenance;

@@ -99,7 +99,7 @@
             <strong>
               <a href={releaseViewPath(
                 item.release.id,
-                item.variant.torrentId,
+                item.variant?.torrentId,
                 "downloads",
                 { client: download.client, infoHash: download.infoHash }
               )}>
@@ -107,7 +107,7 @@
               </a>
             </strong>
             <span>
-              {item.release.artist ?? "Various artists"} · {item.variant.format ?? "Unknown format"} ·
+              {item.release.artist ?? "Various artists"} · {item.variant?.format ?? "Release matched from torrent name"} ·
               {download.diagnostic?.summary ?? (download.addedAt ? relativeTime(download.addedAt) : download.clientState)}
             </span>
             <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />

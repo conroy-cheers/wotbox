@@ -59,7 +59,8 @@ pub struct DownloadReleaseLink {
 }
 
 pub struct LibraryRecord {
-    pub canonical: Cached<CanonicalTorrent>,
+    pub release: Cached<ReleaseSummary>,
+    pub variant: Option<crate::model::TorrentVariant>,
     pub client: String,
     pub info_hash: String,
     pub present: bool,
@@ -70,11 +71,17 @@ pub struct LibraryRecord {
 }
 
 pub struct IndexedDownload {
-    pub canonical: Cached<CanonicalTorrent>,
+    pub release: Cached<ReleaseSummary>,
+    pub variant: Option<crate::model::TorrentVariant>,
     pub client: String,
     pub info_hash: String,
     pub live: Option<LiveDownloadStatus>,
     pub observed_at: Option<DateTime<Utc>>,
+}
+
+struct ResolvedDownloadMetadata {
+    canonical_by_identity: HashMap<(String, i64), canonical_torrent::Model>,
+    release_by_id: HashMap<String, canonical_release::Model>,
 }
 
 pub struct DownloadObservation {
@@ -4808,6 +4815,113 @@ impl Database {
             .collect())
     }
 
+    pub async fn next_download_for_automatic_match(
+        &self,
+        matcher_version: i32,
+    ) -> Result<Option<DownloadReleaseLink>> {
+        let error_prefix = format!("automatic_match_v{matcher_version}_");
+        let now = Utc::now();
+        let models = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Present.eq(true))
+            .filter(download_release_link::Column::ReleaseId.is_null())
+            .filter(download_release_link::Column::TorrentName.is_not_null())
+            .filter(download_release_link::Column::ResolutionState.eq("unconfigured"))
+            .order_by_asc(download_release_link::Column::UpdatedAt)
+            .all(&self.connection)
+            .await?;
+        Ok(models
+            .into_iter()
+            .find(|model| {
+                model
+                    .error_code
+                    .as_deref()
+                    .is_none_or(|code| !code.starts_with(&error_prefix))
+                    || model
+                        .next_retry_at
+                        .as_deref()
+                        .and_then(|value| parse_timestamp(value).ok())
+                        .is_some_and(|retry_at| retry_at <= now)
+            })
+            .map(link_from_model))
+    }
+
+    pub async fn list_release_summaries(&self) -> Result<Vec<ReleaseSummary>> {
+        canonical_release::Entity::find()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| {
+                let id = Uuid::parse_str(&model.id)?;
+                let mut summary: ReleaseSummary = serde_json::from_value(model.metadata_json)?;
+                summary.id = Some(id);
+                Ok(summary)
+            })
+            .collect()
+    }
+
+    pub async fn set_automatic_release_match(
+        &self,
+        client: &str,
+        info_hash: &str,
+        release_id: Uuid,
+        tracker_hint: Option<&str>,
+    ) -> Result<()> {
+        let Some(model) = download_release_link::Entity::find_by_id((
+            client.to_owned(),
+            info_hash.to_ascii_lowercase(),
+        ))
+        .one(&self.connection)
+        .await?
+        else {
+            return Ok(());
+        };
+        let mut active = model.into_active_model();
+        if let Some(tracker) = tracker_hint {
+            active.tracker = Set(Some(tracker.to_owned()));
+        }
+        active.release_id = Set(Some(release_id.to_string()));
+        active.resolution_state = Set("linked".into());
+        active.attempts = Set(0);
+        active.next_retry_at = Set(None);
+        active.error_code = Set(None);
+        active.error_message = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
+    pub async fn set_automatic_match_review(
+        &self,
+        client: &str,
+        info_hash: &str,
+        matcher_version: i32,
+        outcome: &str,
+        message: &str,
+    ) -> Result<()> {
+        let Some(model) = download_release_link::Entity::find_by_id((
+            client.to_owned(),
+            info_hash.to_ascii_lowercase(),
+        ))
+        .one(&self.connection)
+        .await?
+        else {
+            return Ok(());
+        };
+        if model.release_id.is_some() {
+            return Ok(());
+        }
+        let mut active = model.into_active_model();
+        let retry_at = Utc::now() + chrono::Duration::days(7);
+        active.error_code = Set(Some(format!(
+            "automatic_match_v{matcher_version}_{outcome}"
+        )));
+        active.error_message = Set(Some(message.chars().take(500).collect()));
+        active.next_retry_at = Set(Some(retry_at.to_rfc3339()));
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
     pub async fn recover_resolving_links(&self) -> Result<()> {
         let models = download_release_link::Entity::find()
             .filter(download_release_link::Column::ResolutionState.eq("resolving"))
@@ -5047,8 +5161,7 @@ impl Database {
         let mut query = download_release_link::Entity::find()
             .filter(download_release_link::Column::Present.eq(true))
             .filter(download_release_link::Column::ResolutionState.eq("linked"))
-            .filter(download_release_link::Column::Tracker.is_not_null())
-            .filter(download_release_link::Column::TorrentId.is_not_null());
+            .filter(download_release_link::Column::ReleaseId.is_not_null());
         if let Some(client) = client {
             query = query.filter(download_release_link::Column::Client.eq(client));
         }
@@ -5061,40 +5174,41 @@ impl Database {
             .limit(limit)
             .all(&self.connection)
             .await?;
-        let identities = links
-            .iter()
-            .filter_map(|link| Some((link.tracker.clone()?, link.torrent_id?)))
-            .collect::<Vec<_>>();
-        let mut canonical_by_identity = HashMap::new();
-        for chunk in identities.chunks(300) {
-            let condition =
-                chunk
-                    .iter()
-                    .fold(Condition::any(), |condition, (tracker, torrent_id)| {
-                        condition.add(
-                            Condition::all()
-                                .add(canonical_torrent::Column::Tracker.eq(tracker.clone()))
-                                .add(canonical_torrent::Column::TorrentId.eq(*torrent_id)),
-                        )
-                    });
-            for model in canonical_torrent::Entity::find()
-                .filter(condition)
-                .all(&self.connection)
-                .await?
-            {
-                canonical_by_identity.insert((model.tracker.clone(), model.torrent_id), model);
-            }
-        }
+        let metadata = self.resolved_download_metadata(&links).await?;
         let mut indexed = Vec::with_capacity(links.len());
         for link in links {
-            let (Some(tracker), Some(torrent_id)) = (link.tracker.clone(), link.torrent_id) else {
-                continue;
-            };
-            let Some(canonical) = canonical_by_identity.remove(&(tracker, torrent_id)) else {
-                continue;
+            let exact = link
+                .tracker
+                .clone()
+                .zip(link.torrent_id)
+                .and_then(|identity| metadata.canonical_by_identity.get(&identity).cloned());
+            let (release, variant) = if let Some(canonical) = exact {
+                let canonical = canonical_from_model(canonical)?;
+                let Cached {
+                    value,
+                    fetched_at,
+                    expires_at,
+                } = canonical;
+                (
+                    Cached {
+                        value: value.release,
+                        fetched_at,
+                        expires_at,
+                    },
+                    Some(value.variant),
+                )
+            } else {
+                let Some(release_id) = link.release_id.as_deref() else {
+                    continue;
+                };
+                let Some(release) = metadata.release_by_id.get(release_id).cloned() else {
+                    continue;
+                };
+                (cached_release_from_model(release)?, None)
             };
             indexed.push(IndexedDownload {
-                canonical: canonical_from_model(canonical)?,
+                release,
+                variant,
                 client: link.client,
                 info_hash: link.info_hash,
                 live: link.observed_json.map(serde_json::from_value).transpose()?,
@@ -5140,50 +5254,45 @@ impl Database {
         &self,
         links: Vec<download_release_link::Model>,
     ) -> Result<Vec<LibraryRecord>> {
-        let identities = links
-            .iter()
-            .filter_map(|link| Some((link.tracker.clone()?, link.torrent_id?)))
-            .collect::<Vec<_>>();
-        let mut canonical_by_identity = HashMap::new();
-        for chunk in identities.chunks(300) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let condition = chunk
-                .iter()
-                .fold(Condition::any(), |condition, (tracker, id)| {
-                    condition.add(
-                        Condition::all()
-                            .add(canonical_torrent::Column::Tracker.eq(tracker.clone()))
-                            .add(canonical_torrent::Column::TorrentId.eq(*id)),
-                    )
-                });
-            for canonical in canonical_torrent::Entity::find()
-                .filter(condition)
-                .all(&self.connection)
-                .await?
-            {
-                canonical_by_identity
-                    .insert((canonical.tracker.clone(), canonical.torrent_id), canonical);
-            }
-        }
-
+        let metadata = self.resolved_download_metadata(&links).await?;
         let mut records = Vec::with_capacity(links.len());
         for link in links {
-            let (Some(tracker), Some(torrent_id), Some(library_added_at)) = (
-                link.tracker.as_deref(),
-                link.torrent_id,
-                link.library_added_at.as_deref(),
-            ) else {
+            let Some(library_added_at) = link.library_added_at.as_deref() else {
                 continue;
             };
-            let Some(canonical) = canonical_by_identity.remove(&(tracker.to_owned(), torrent_id))
-            else {
-                continue;
+            let exact = link
+                .tracker
+                .clone()
+                .zip(link.torrent_id)
+                .and_then(|identity| metadata.canonical_by_identity.get(&identity).cloned());
+            let (release, variant) = if let Some(canonical) = exact {
+                let canonical = canonical_from_model(canonical)?;
+                let Cached {
+                    value,
+                    fetched_at,
+                    expires_at,
+                } = canonical;
+                (
+                    Cached {
+                        value: value.release,
+                        fetched_at,
+                        expires_at,
+                    },
+                    Some(value.variant),
+                )
+            } else {
+                let Some(release_id) = link.release_id.as_deref() else {
+                    continue;
+                };
+                let Some(release) = metadata.release_by_id.get(release_id).cloned() else {
+                    continue;
+                };
+                (cached_release_from_model(release)?, None)
             };
             let library_added_at = parse_timestamp(library_added_at)?;
             records.push(LibraryRecord {
-                canonical: canonical_from_model(canonical)?,
+                release,
+                variant,
                 client: link.client,
                 info_hash: link.info_hash,
                 present: link.present,
@@ -5203,6 +5312,58 @@ impl Database {
             });
         }
         Ok(records)
+    }
+
+    async fn resolved_download_metadata(
+        &self,
+        links: &[download_release_link::Model],
+    ) -> Result<ResolvedDownloadMetadata> {
+        let identities = links
+            .iter()
+            .filter_map(|link| Some((link.tracker.clone()?, link.torrent_id?)))
+            .collect::<Vec<_>>();
+        let mut canonical_by_identity = HashMap::new();
+        for chunk in identities.chunks(300) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let condition =
+                chunk
+                    .iter()
+                    .fold(Condition::any(), |condition, (tracker, torrent_id)| {
+                        condition.add(
+                            Condition::all()
+                                .add(canonical_torrent::Column::Tracker.eq(tracker.clone()))
+                                .add(canonical_torrent::Column::TorrentId.eq(*torrent_id)),
+                        )
+                    });
+            for model in canonical_torrent::Entity::find()
+                .filter(condition)
+                .all(&self.connection)
+                .await?
+            {
+                canonical_by_identity.insert((model.tracker.clone(), model.torrent_id), model);
+            }
+        }
+        let release_ids = links
+            .iter()
+            .filter_map(|link| link.release_id.clone())
+            .collect::<Vec<_>>();
+        let release_by_id = if release_ids.is_empty() {
+            HashMap::new()
+        } else {
+            canonical_release::Entity::find()
+                .filter(canonical_release::Column::Id.is_in(release_ids))
+                .all(&self.connection)
+                .await?
+                .into_iter()
+                .map(|model| (model.id.clone(), model))
+                .collect()
+        };
+        Ok(ResolvedDownloadMetadata {
+            canonical_by_identity,
+            release_by_id,
+        })
     }
 
     pub async fn last_successful_download_scan(&self) -> Result<Option<DateTime<Utc>>> {
@@ -5623,6 +5784,18 @@ fn link_from_model(model: download_release_link::Model) -> DownloadReleaseLink {
     }
 }
 
+fn cached_release_from_model(model: canonical_release::Model) -> Result<Cached<ReleaseSummary>> {
+    let id = Uuid::parse_str(&model.id)?;
+    let fetched_at = parse_timestamp(&model.updated_at)?;
+    let mut value: ReleaseSummary = serde_json::from_value(model.metadata_json)?;
+    value.id = Some(id);
+    Ok(Cached {
+        value,
+        fetched_at,
+        expires_at: DateTime::<Utc>::MAX_UTC,
+    })
+}
+
 fn release_downloads_from_links(
     links: Vec<download_release_link::Model>,
 ) -> Result<Vec<ReleaseDownload>> {
@@ -5762,7 +5935,10 @@ mod tests {
         tracker::fallback_artist_credit,
     };
 
-    use super::{CreateReplacementImport, Database, EnqueueBackgroundJob, StoredProviderState};
+    use super::{
+        CreateReplacementImport, Database, DownloadObservation, EnqueueBackgroundJob,
+        StoredProviderState,
+    };
 
     #[tokio::test]
     async fn replacement_imports_persist_exact_supersessions_without_backfill_cleanup() {
@@ -6752,6 +6928,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_level_matches_leave_torrent_identity_unknown_but_complete_import_review() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("release-match.sqlite"))
+            .await
+            .expect("database");
+        let canonical = CanonicalTorrent {
+            release: ReleaseSummary {
+                id: None,
+                tracker: "ops".into(),
+                group_id: 10,
+                title: "Afterglow".into(),
+                artist: Some("Sleep Theory".into()),
+                artists: vec![fallback_artist_credit("ops", "Sleep Theory")],
+                year: Some(2025),
+                artwork: None,
+                release_type: Some("Album".into()),
+                sources: vec![crate::model::ReleaseSource {
+                    tracker: "ops".into(),
+                    group_id: 10,
+                    match_score: 1.0,
+                }],
+                album_coverage: None,
+            },
+            variant: TorrentVariant {
+                tracker: "ops".into(),
+                torrent_id: 20,
+                group_id: 10,
+                info_hash: None,
+                format: Some("FLAC".into()),
+                encoding: Some("Lossless".into()),
+                media: Some("WEB".into()),
+                size: Some(100),
+                seeders: None,
+                leechers: None,
+                snatched: None,
+                freeleech: false,
+                leech_status: crate::model::LeechStatus::Regular,
+                can_use_token: false,
+                token_eligibility_known: false,
+                eligibility: None,
+                remaster_title: None,
+                downloads: Vec::new(),
+                library: None,
+            },
+            tags: Vec::new(),
+            description: None,
+            record_label: None,
+        };
+        db.put_canonical(&canonical, Utc::now(), Utc::now() + Duration::hours(1))
+            .await
+            .expect("canonical");
+        let release_id = db.list_release_summaries().await.expect("releases")[0]
+            .id
+            .expect("release id");
+        db.observe_downloads(&[DownloadObservation {
+            torrent_name: Some("Sleep Theory — Afterglow (2025) [WEB-FLAC 24-48]".into()),
+            live: LiveDownloadStatus {
+                client: "music".into(),
+                info_hash: "redhash".into(),
+                state: ClientDownloadState::Seeding,
+                client_state: "stalledUP".into(),
+                diagnostic: None,
+                progress: 1.0,
+                size: 100,
+                downloaded: 100,
+                uploaded: 50,
+                download_speed: 0,
+                upload_speed: 0,
+                eta: None,
+                ratio: 0.5,
+                save_path: "/downloads/red".into(),
+                content_path: Some("/downloads/red/Afterglow".into()),
+                added_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+            },
+            announce_host: Some("flacsfor.me".into()),
+            tracker: None,
+            plex_target: None,
+        }])
+        .await
+        .expect("observation");
+        db.set_automatic_release_match("music", "redhash", release_id, Some("red"))
+            .await
+            .expect("automatic match");
+        db.sync_import_tasks().await.expect("sync imports");
+
+        let (downloads, total) = db
+            .list_indexed_downloads(Some("music"), 10, 0)
+            .await
+            .expect("downloads");
+        assert_eq!(total, 1);
+        assert_eq!(downloads[0].release.value.title, "Afterglow");
+        assert!(downloads[0].variant.is_none());
+        let library = db.list_library_records().await.expect("library");
+        assert_eq!(library.len(), 1);
+        assert!(library[0].variant.is_none());
+        assert_eq!(library[0].release.value.id, Some(release_id));
+        let imports = db.list_imports(10, 0).await.expect("imports");
+        assert_eq!(imports.counts.review, 0);
+        assert_eq!(imports.counts.complete, 1);
+    }
+
+    #[tokio::test]
     async fn persists_negative_results_and_recovers_in_progress_links() {
         let directory = tempdir().expect("temporary directory");
         let db = Database::open(&directory.path().join("wotbox.sqlite"))
@@ -6957,12 +7236,7 @@ mod tests {
         assert!(!records[0].present);
         assert!(records[0].missing_since.is_some());
         assert_eq!(records[0].completed_at, completed_at);
-        let release_id = records[0]
-            .canonical
-            .value
-            .release
-            .id
-            .expect("canonical release id");
+        let release_id = records[0].release.value.id.expect("canonical release id");
         assert_eq!(
             db.list_library_records_for_releases(&[release_id])
                 .await

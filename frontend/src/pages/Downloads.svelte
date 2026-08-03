@@ -55,7 +55,7 @@
   function releasePath(item: DownloadsPage["items"][number], showClientDetails = false): string {
     return releaseViewPath(
       item.release.id,
-      item.variant.torrentId,
+      item.variant?.torrentId,
       "downloads",
       { client: item.download.client, infoHash: item.download.infoHash },
       false,
@@ -186,7 +186,7 @@
                 {item.release.title}
               </a>
             </h2>
-            <p>{item.release.artist ?? "Various artists"} · {[item.release.year, item.release.releaseType, item.variant.format, item.variant.encoding].filter(Boolean).join(" · ")} · {formatBytes(download.size)}</p>
+            <p>{item.release.artist ?? "Various artists"} · {[item.release.year, item.release.releaseType, item.variant?.format, item.variant?.encoding].filter(Boolean).join(" · ")} · {formatBytes(download.size)}</p>
             <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
           </div>
           <StatusPill state={download.state} />

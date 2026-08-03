@@ -27,7 +27,10 @@ use crate::{
         ProviderFailure, ProviderFailureKind, ProviderRequestError, RequestClass,
         is_provider_unavailable, retry_after,
     },
-    release_matcher::{AUTO_MERGE_THRESHOLD, external_score, normalized},
+    release_matcher::{
+        AUTO_MERGE_THRESHOLD, external_score, is_download_metadata_token, normalized,
+        parse_download_release_name, strip_leading_catalog_code,
+    },
     tracker::{SearchRequest, TrackerClient},
 };
 
@@ -82,7 +85,8 @@ impl ReleaseDownloadIndex {
         self.downloads
             .iter()
             .filter_map(|download| {
-                let (artist, title, year) = parse_download_release_name(&download.torrent_name);
+                let identity = parse_download_release_name(&download.torrent_name);
+                let (artist, title, year) = (identity.artist, identity.title, identity.year);
                 let title_matches = trumped_identity_component(&title)
                     == trumped_identity_component(target_title)
                     || trumped_identity_component(&title)
@@ -1054,7 +1058,8 @@ async fn trumped_download_sources(state: &AppState) -> Result<Vec<Recommendation
         let Some(name) = link.torrent_name.as_deref() else {
             continue;
         };
-        let (artist, title, year) = parse_download_release_name(name);
+        let parsed = parse_download_release_name(name);
+        let (artist, title, year) = (parsed.artist, parsed.title, parsed.year);
         let identity = trumped_source_identity(tracker, &artist, &title, year);
         if title.is_empty() {
             continue;
@@ -1162,249 +1167,6 @@ fn trumped_source_identity(tracker: &str, artist: &str, title: &str, year: Optio
         trumped_identity_component(title),
         year.map(|value| value.to_string()).unwrap_or_default()
     )
-}
-
-fn parse_download_release_name(value: &str) -> (String, String, Option<i64>) {
-    let value = value.replace(['—', '–'], " - ");
-    let value = value.as_str();
-    if let Some(parsed) = parse_scene_release_name(value) {
-        return parsed;
-    }
-    let structured = value.contains(" - ");
-    let display = value
-        .chars()
-        .map(|character| match character {
-            '_' => ' ',
-            '.' if !structured => ' ',
-            character => character,
-        })
-        .collect::<String>();
-    let display = display.split_whitespace().collect::<Vec<_>>().join(" ");
-    let year = release_name_year(&display);
-    if let Some((title, artist)) = display.split_once(" ~ ") {
-        return (
-            strip_download_metadata(artist),
-            strip_download_metadata(strip_leading_catalog_code(title)),
-            year,
-        );
-    }
-    let Some((artist, remainder)) = display.split_once(" - ") else {
-        let parts = display.split(" · ").map(str::trim).collect::<Vec<_>>();
-        if parts.len() >= 3 && parts[1].parse::<i64>().ok() == year {
-            return (
-                parts[0].to_owned(),
-                strip_download_metadata(&parts[2..].join(" · ")),
-                year,
-            );
-        }
-        if let Some(year) = year
-            && let Some((artist, title)) = split_dated_release_name(&display, year)
-        {
-            return (
-                strip_download_metadata(strip_leading_catalog_code(&artist)),
-                strip_download_metadata(&title),
-                Some(year),
-            );
-        }
-        return (
-            String::new(),
-            strip_unstructured_download_metadata(&display, year),
-            year,
-        );
-    };
-    let artist = strip_leading_catalog_code(&strip_leading_year(artist.trim())).to_owned();
-    let remainder = remainder.trim();
-    let title = if remainder
-        .get(..4)
-        .and_then(|candidate| candidate.parse::<i64>().ok())
-        .is_some_and(|candidate| (1900..=2100).contains(&candidate))
-    {
-        remainder
-            .get(4..)
-            .and_then(|value| value.trim().strip_prefix('-'))
-            .map(str::trim)
-            .unwrap_or(remainder)
-    } else {
-        remainder
-    };
-    (artist, strip_download_metadata(title), year)
-}
-
-fn parse_scene_release_name(value: &str) -> Option<(String, String, Option<i64>)> {
-    let catalog = value.find("-(")?;
-    let catalog_end = value[catalog + 2..].find(')')? + catalog + 2;
-    let catalog_value = &value[catalog + 2..catalog_end];
-    if catalog_value.is_empty()
-        || !catalog_value
-            .chars()
-            .all(|character| character.is_ascii_digit())
-    {
-        return None;
-    }
-    let (artist, title) = value[..catalog].rsplit_once('-')?;
-    let clean = |part: &str| {
-        part.replace('_', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    Some((
-        clean(artist),
-        strip_download_metadata(&clean(title)),
-        release_name_year(value),
-    ))
-}
-
-fn split_dated_release_name(value: &str, year: i64) -> Option<(String, String)> {
-    let year = year.to_string();
-    let offset = value.find(&year)?;
-    let artist = value[..offset]
-        .trim()
-        .trim_end_matches(['-', '.', ' '])
-        .trim();
-    if artist.is_empty() {
-        return None;
-    }
-    let mut remainder = value[offset + year.len()..].trim_start();
-    let date_end = remainder
-        .char_indices()
-        .take_while(|(_, character)| character.is_ascii_digit() || matches!(character, '.' | ' '))
-        .map(|(offset, character)| offset + character.len_utf8())
-        .last()
-        .unwrap_or_default();
-    if date_end > 0 && remainder[date_end..].starts_with('-') {
-        remainder = remainder[date_end + 1..].trim_start();
-    }
-    while let Some(next) = remainder.strip_prefix('.') {
-        remainder = next.trim_start_matches(|character: char| character.is_ascii_digit());
-    }
-    remainder = remainder
-        .trim_start()
-        .strip_prefix('-')
-        .unwrap_or(remainder)
-        .trim();
-    if remainder.split_whitespace().all(is_download_metadata_token) {
-        return None;
-    }
-    let title = strip_download_metadata(remainder);
-    (!title.is_empty()).then(|| (artist.to_owned(), title))
-}
-
-fn strip_unstructured_download_metadata(value: &str, year: Option<i64>) -> String {
-    let mut value = strip_leading_year(value);
-    if let Some(year) = year {
-        let marker = year.to_string();
-        if let Some(offset) = value.find(&marker)
-            && value[offset + marker.len()..]
-                .split_whitespace()
-                .all(is_download_metadata_token)
-        {
-            value.truncate(offset);
-        }
-    }
-    strip_download_metadata(&value)
-}
-
-fn is_download_metadata_token(token: &str) -> bool {
-    let token = normalized(token);
-    token.is_empty()
-        || matches!(
-            token.as_str(),
-            "web" | "cd" | "cdm" | "flac" | "mp3" | "v0" | "v2" | "320" | "single"
-        )
-}
-
-fn release_name_year(value: &str) -> Option<i64> {
-    value
-        .split(|character: char| !character.is_ascii_digit())
-        .filter(|candidate| candidate.len() == 4)
-        .filter_map(|candidate| candidate.parse::<i64>().ok())
-        .find(|year| (1900..=2100).contains(year))
-}
-
-fn strip_download_metadata(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    let markers = [
-        " - 19",
-        " - 20",
-        " (19",
-        " (20",
-        " [19",
-        " [20",
-        " - single",
-        " [single",
-        " (single",
-        " [flac",
-        " [cd",
-        " [web",
-        " (flac",
-        " (web",
-        " (320",
-        " [320",
-        " (v0",
-        " (v2",
-        " [v0",
-        " [v2",
-        " [16",
-        " [24",
-        " [",
-        " v0",
-        " v2",
-        " 320",
-        " {",
-    ];
-    let end = markers
-        .iter()
-        .filter_map(|marker| lower.find(marker))
-        .min()
-        .unwrap_or(value.len());
-    let value = value[..end].trim().trim_end_matches('-').trim();
-    value
-        .strip_suffix(" Single")
-        .or_else(|| value.strip_suffix(" single"))
-        .unwrap_or(value)
-        .trim()
-        .to_owned()
-}
-
-fn strip_leading_year(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.starts_with('(')
-        && trimmed.get(5..6) == Some(")")
-        && trimmed
-            .get(1..5)
-            .and_then(|year| year.parse::<i64>().ok())
-            .is_some_and(|year| (1900..=2100).contains(&year))
-    {
-        return trimmed[6..].trim().to_owned();
-    }
-    if trimmed.len() > 5
-        && trimmed
-            .get(..4)
-            .and_then(|year| year.parse::<i64>().ok())
-            .is_some_and(|year| (1900..=2100).contains(&year))
-        && trimmed
-            .as_bytes()
-            .get(4)
-            .is_some_and(u8::is_ascii_whitespace)
-    {
-        return trimmed[5..].trim().to_owned();
-    }
-    trimmed.to_owned()
-}
-
-fn strip_leading_catalog_code(value: &str) -> &str {
-    let trimmed = value.trim();
-    if trimmed.starts_with('[')
-        && let Some(end) = trimmed.find("] ")
-        && !trimmed[1..end].is_empty()
-        && trimmed[1..end].chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-        })
-    {
-        return trimmed[end + 2..].trim();
-    }
-    trimmed
 }
 
 fn trumped_identity_component(value: &str) -> String {

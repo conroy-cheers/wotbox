@@ -1092,7 +1092,8 @@ pub struct CanonicalTorrent {
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalDownload {
     pub release: ReleaseSummary,
-    pub variant: TorrentVariant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<TorrentVariant>,
     pub download: LiveDownloadStatus,
     pub provenance: Provenance,
     pub live_observed_at: Option<DateTime<Utc>>,
@@ -1227,6 +1228,8 @@ pub struct LibraryVariantState {
 pub struct LibraryRelease {
     pub release: ReleaseSummary,
     pub variants: Vec<TorrentVariant>,
+    #[serde(default)]
+    pub release_copies: Vec<LibraryCopy>,
     pub availability: LibraryAvailability,
     pub added_at: DateTime<Utc>,
     pub provenance: Provenance,

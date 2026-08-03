@@ -25,6 +25,10 @@ use crate::{
     },
     plex::PlexScanTarget,
     provider::{ProviderFailureKind, ProviderRequestError, RequestClass},
+    release_matcher::{
+        DownloadMatchResult, MATCHER_VERSION, match_download_release, parse_download_release_name,
+    },
+    tracker::SearchRequest,
 };
 
 pub const RESOLVE_DOWNLOAD_HASH: &str = "resolve_download_hash";
@@ -37,6 +41,7 @@ pub const NOTIFY_PLEX: &str = "notify_plex";
 pub const SUBMIT_DOWNLOAD: &str = "submit_download";
 pub const PROCESS_IMPORT: &str = "process_import";
 pub const REFRESH_ARTIST_CATALOG: &str = "refresh_artist_catalog";
+pub const MATCH_DOWNLOAD_RELEASES: &str = "match_download_releases";
 
 const WORKER_LANES: [&str; 6] = [
     "event",
@@ -400,6 +405,22 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
         },
     )
     .await?;
+    enqueue(
+        state,
+        EnqueueBackgroundJob {
+            deduplication_key: &format!("match-download-releases:v{MATCHER_VERSION}"),
+            kind: MATCH_DOWNLOAD_RELEASES,
+            payload: json!({}),
+            provider_id: None,
+            lane: "maintenance",
+            priority: 15,
+            max_attempts: 20,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: Some(300),
+        },
+    )
+    .await?;
     let mut ops_offset = 0_i64;
     for link in state.db.due_links(100_000).await? {
         if let Some(tracker) = link.tracker {
@@ -604,7 +625,145 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
         SUBMIT_DOWNLOAD => submit_download(state, &job.payload).await,
         PROCESS_IMPORT => process_import(state, &job.payload).await,
         REFRESH_ARTIST_CATALOG => refresh_artist_catalog(state, &job.payload).await,
+        MATCH_DOWNLOAD_RELEASES => match_download_releases(state).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
+    }
+}
+
+fn announce_tracker_hint(host: Option<&str>) -> Option<&'static str> {
+    match host?
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "flacsfor.me" => Some("red"),
+        "home.opsfet.ch" => Some("ops"),
+        _ => None,
+    }
+}
+
+async fn match_download_releases(state: &Arc<AppState>) -> Result<JobOutcome> {
+    let Some(link) = state
+        .db
+        .next_download_for_automatic_match(MATCHER_VERSION)
+        .await?
+    else {
+        return Ok(JobOutcome::Complete);
+    };
+    let name = link.torrent_name.as_deref().unwrap_or_default();
+    let identity = parse_download_release_name(name);
+    if identity.title.trim().is_empty() {
+        state
+            .db
+            .set_automatic_match_review(
+                &link.client,
+                &link.info_hash,
+                MATCHER_VERSION,
+                "unparseable",
+                "Automatic matching could not identify a release title in the torrent name",
+            )
+            .await?;
+        state.db.sync_import_tasks().await?;
+        return Ok(more_download_matches());
+    }
+
+    let mut releases = state.db.list_release_summaries().await?;
+    let mut result = match_download_release(&identity, &releases);
+    if result == DownloadMatchResult::NotFound {
+        for (tracker_name, tracker) in &state.trackers {
+            let request = SearchRequest {
+                query: Some(identity.title.clone()),
+                artist: (!identity.artist.trim().is_empty()).then(|| identity.artist.clone()),
+                release_type: None,
+                year: None,
+                format: None,
+                encoding: None,
+                media: None,
+                page: Some(1),
+            };
+            let (page, _) = tracker
+                .search_with_class(&request, RequestClass::Background)
+                .await?;
+            crate::api::cache_search_canonical(&state.db, tracker_name, &page).await?;
+            releases = state.db.list_release_summaries().await?;
+            result = match_download_release(&identity, &releases);
+            if result != DownloadMatchResult::NotFound {
+                break;
+            }
+        }
+    }
+
+    match result {
+        DownloadMatchResult::Matched(candidate) => {
+            state
+                .db
+                .set_automatic_release_match(
+                    &link.client,
+                    &link.info_hash,
+                    candidate.release_id,
+                    announce_tracker_hint(link.announce_host.as_deref()),
+                )
+                .await?;
+            tracing::info!(
+                client = link.client,
+                info_hash = link.info_hash,
+                release_id = %candidate.release_id,
+                score = candidate.score,
+                "automatically linked download to canonical release"
+            );
+        }
+        DownloadMatchResult::Ambiguous { best, runner_up } => {
+            state
+                .db
+                .set_automatic_match_review(
+                    &link.client,
+                    &link.info_hash,
+                    MATCHER_VERSION,
+                    "ambiguous",
+                    &format!(
+                        "Automatic matching found multiple similar canonical releases ({:.1}% vs {:.1}% confidence)",
+                        best.score * 100.0,
+                        runner_up.score * 100.0
+                    ),
+                )
+                .await?;
+        }
+        DownloadMatchResult::NotFound => {
+            state
+                .db
+                .set_automatic_match_review(
+                    &link.client,
+                    &link.info_hash,
+                    MATCHER_VERSION,
+                    "not_found",
+                    &format!(
+                        "Automatic matching found no canonical release for {}{}{}",
+                        if identity.artist.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} — ", identity.artist)
+                        },
+                        identity.title,
+                        identity
+                            .year
+                            .map(|year| format!(" ({year})"))
+                            .unwrap_or_default()
+                    ),
+                )
+                .await?;
+        }
+    }
+    state.db.sync_import_tasks().await?;
+    Ok(more_download_matches())
+}
+
+fn more_download_matches() -> JobOutcome {
+    JobOutcome::Retry {
+        delay: Duration::from_millis(100),
+        increment_attempt: false,
+        code: "more_work",
+        message: "Continuing automatic download matching".into(),
     }
 }
 

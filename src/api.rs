@@ -2398,6 +2398,7 @@ fn default_library_limit() -> usize {
 struct LibraryReleaseBuild {
     release: ReleaseSummary,
     variants: HashMap<(String, i64), (TorrentVariant, Vec<LibraryCopy>)>,
+    release_copies: Vec<LibraryCopy>,
     added_at: chrono::DateTime<Utc>,
     fetched_at: chrono::DateTime<Utc>,
     stale: bool,
@@ -2456,16 +2457,14 @@ async fn load_library_releases_for_ids(
 fn build_library_releases(records: Vec<crate::db::LibraryRecord>) -> Vec<LibraryRelease> {
     let mut groups: HashMap<String, LibraryReleaseBuild> = HashMap::new();
     for record in records {
-        let tracker = record.canonical.value.release.tracker.clone();
-        let group_id = record.canonical.value.release.group_id;
+        let tracker = record.release.value.tracker.clone();
+        let group_id = record.release.value.group_id;
         let release_key = record
-            .canonical
-            .value
             .release
+            .value
             .id
             .map(|id| id.to_string())
             .unwrap_or_else(|| format!("{tracker}:{group_id}"));
-        let torrent_id = record.canonical.value.variant.torrent_id;
         let copy = LibraryCopy {
             client: record.client,
             info_hash: record.info_hash,
@@ -2477,28 +2476,34 @@ fn build_library_releases(records: Vec<crate::db::LibraryRecord>) -> Vec<Library
         let entry = groups
             .entry(release_key)
             .or_insert_with(|| LibraryReleaseBuild {
-                release: record.canonical.value.release.clone(),
+                release: record.release.value.clone(),
                 variants: HashMap::new(),
+                release_copies: Vec::new(),
                 added_at: record.library_added_at,
-                fetched_at: record.canonical.fetched_at,
-                stale: record.canonical.expires_at <= Utc::now(),
+                fetched_at: record.release.fetched_at,
+                stale: record.release.expires_at <= Utc::now(),
             });
-        if entry.release.artists.is_empty() && !record.canonical.value.release.artists.is_empty() {
-            entry.release = record.canonical.value.release.clone();
+        if entry.release.artists.is_empty() && !record.release.value.artists.is_empty() {
+            entry.release = record.release.value.clone();
         }
         entry.added_at = entry.added_at.min(record.library_added_at);
-        entry.fetched_at = entry.fetched_at.max(record.canonical.fetched_at);
-        entry.stale |= record.canonical.expires_at <= Utc::now();
-        let variant = entry
-            .variants
-            .entry((tracker, torrent_id))
-            .or_insert_with(|| {
-                let mut variant = record.canonical.value.variant.clone();
-                variant.downloads.clear();
-                variant.library = None;
-                (variant, Vec::new())
-            });
-        variant.1.push(copy);
+        entry.fetched_at = entry.fetched_at.max(record.release.fetched_at);
+        entry.stale |= record.release.expires_at <= Utc::now();
+        if let Some(record_variant) = record.variant {
+            let torrent_id = record_variant.torrent_id;
+            let variant = entry
+                .variants
+                .entry((tracker, torrent_id))
+                .or_insert_with(|| {
+                    let mut variant = record_variant;
+                    variant.downloads.clear();
+                    variant.library = None;
+                    (variant, Vec::new())
+                });
+            variant.1.push(copy);
+        } else {
+            entry.release_copies.push(copy);
+        }
     }
 
     groups
@@ -2545,7 +2550,9 @@ fn build_library_releases(records: Vec<crate::db::LibraryRecord>) -> Vec<Library
                         .is_some_and(|library| library.availability == LibraryAvailability::Present)
                 })
                 .count();
-            let availability = if present == variants.len() {
+            let release_copy_present = group.release_copies.iter().any(|copy| copy.present);
+            let availability = if release_copy_present || (present > 0 && present == variants.len())
+            {
                 LibraryAvailability::Present
             } else if present == 0 {
                 LibraryAvailability::Missing
@@ -2556,6 +2563,7 @@ fn build_library_releases(records: Vec<crate::db::LibraryRecord>) -> Vec<Library
                 provenance: provenance(&group.release.tracker, group.fetched_at, group.stale),
                 release: group.release,
                 variants,
+                release_copies: group.release_copies,
                 availability,
                 added_at: group.added_at,
             }
@@ -3043,7 +3051,7 @@ async fn downloads(
     }
     let release_ids = indexed
         .iter()
-        .filter_map(|download| download.canonical.value.release.id)
+        .filter_map(|download| download.release.value.id)
         .collect::<Vec<_>>();
     let release_details = state.db.get_release_details(&release_ids).await?;
     let mut items = Vec::new();
@@ -3056,30 +3064,32 @@ async fn downloads(
         let Some(live) = refreshed_live.or(indexed_download.live) else {
             continue;
         };
-        let canonical = indexed_download.canonical;
-        let stale = canonical.expires_at <= Utc::now();
-        if stale {
+        let cached_release = indexed_download.release;
+        let stale = cached_release.expires_at <= Utc::now();
+        if stale && indexed_download.variant.is_some() {
             background::enqueue_hash_resolution(
                 &state,
-                &canonical.value.release.tracker,
+                &cached_release.value.tracker,
                 &indexed_download.info_hash,
             )
             .await?;
         }
-        let mut variant = canonical.value.variant.clone();
-        variant.downloads = vec![live.clone()];
-        let release = match canonical.value.release.id {
+        let variant = indexed_download.variant.map(|mut variant| {
+            variant.downloads = vec![live.clone()];
+            variant
+        });
+        let release = match cached_release.value.id {
             Some(id) => release_details
                 .get(&id)
                 .map(|detail| detail.release.clone())
-                .unwrap_or(canonical.value.release),
-            None => canonical.value.release,
+                .unwrap_or(cached_release.value),
+            None => cached_release.value,
         };
         items.push(CanonicalDownload {
             release,
             variant,
             download: live,
-            provenance: provenance("canonical", canonical.fetched_at, stale),
+            provenance: provenance("canonical", cached_release.fetched_at, stale),
             live_observed_at: if live_stale {
                 indexed_download.observed_at
             } else {
@@ -3278,7 +3288,7 @@ async fn download_detail_compatibility(
     };
     Ok(Json(CanonicalDownload {
         release,
-        variant,
+        variant: Some(variant),
         download: live,
         provenance: provenance(
             "canonical",
@@ -4495,17 +4505,16 @@ pub(crate) async fn enrich_library_artist_credits(state: &Arc<AppState>) -> Resu
     let mut groups = HashSet::new();
     for record in state.db.list_library_records().await? {
         if record
-            .canonical
-            .value
             .release
+            .value
             .artists
             .iter()
             .any(|artist| artist.source == ArtistCreditSource::Structured)
         {
             continue;
         }
-        let tracker = record.canonical.value.release.tracker.clone();
-        let group_id = record.canonical.value.release.group_id;
+        let tracker = record.release.value.tracker.clone();
+        let group_id = record.release.value.group_id;
         groups.insert((tracker, group_id));
     }
     for (tracker, group_id) in groups.into_iter().take(5) {
@@ -5441,6 +5450,7 @@ mod tests {
                 album_coverage: None,
             },
             variants: Vec::new(),
+            release_copies: Vec::new(),
             availability: LibraryAvailability::Present,
             added_at: now,
             provenance: provenance("ops", now, false),
