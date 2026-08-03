@@ -4679,6 +4679,7 @@ impl Database {
             "unconfigured"
         };
         let should_resolve;
+        let reactivate_resolution;
         let newly_completed;
         if let Some(model) =
             download_release_link::Entity::find_by_id((live.client.clone(), hash.clone()))
@@ -4687,12 +4688,17 @@ impl Database {
         {
             let linked = model.resolution_state == "linked";
             let tracker_changed = model.tracker.as_deref() != tracker;
+            let release_level_match =
+                linked && (model.group_id.is_none() || model.torrent_id.is_none());
+            reactivate_resolution = release_level_match;
             let retry_due = model
                 .next_retry_at
                 .as_deref()
                 .is_none_or(|value| parse_timestamp(value).is_ok_and(|value| value <= now_value));
             should_resolve = tracker.is_some()
-                && (tracker_changed || (model.resolution_state == "pending" && retry_due));
+                && (tracker_changed
+                    || release_level_match
+                    || (model.resolution_state == "pending" && retry_due));
             let has_library_added_at = model.library_added_at.is_some();
             let has_completed_at = model.completed_at.is_some();
             newly_completed = !has_completed_at && completed_at.is_some();
@@ -4726,6 +4732,7 @@ impl Database {
             }
             active.update(transaction).await?;
         } else {
+            reactivate_resolution = false;
             newly_completed = completed_at.is_some();
             should_resolve = tracker.is_some();
             download_release_link::ActiveModel {
@@ -4757,13 +4764,15 @@ impl Database {
             .await?;
         }
         if should_resolve && let Some(tracker) = tracker {
+            let key = format!("resolve-hash:{}:{hash}:v3", tracker.to_ascii_lowercase());
+            if reactivate_resolution {
+                self.reactivate_completed_background_job_on(transaction, &key)
+                    .await?;
+            }
             self.enqueue_background_job_on(
                 transaction,
                 EnqueueBackgroundJob {
-                    deduplication_key: &format!(
-                        "resolve-hash:{}:{hash}:v3",
-                        tracker.to_ascii_lowercase()
-                    ),
+                    deduplication_key: &key,
                     kind: "resolve_download_hash",
                     payload: serde_json::json!({ "tracker": tracker, "infoHash": hash }),
                     provider_id: Some(format!("tracker:{tracker}")),
@@ -4876,11 +4885,23 @@ impl Database {
         Ok(download_release_link::Entity::find()
             .filter(download_release_link::Column::Tracker.eq(tracker))
             .filter(download_release_link::Column::InfoHash.eq(info_hash.to_ascii_lowercase()))
-            .filter(download_release_link::Column::ResolutionState.is_in([
-                "pending",
-                "resolving",
-                "failed",
-            ]))
+            .filter(
+                Condition::any()
+                    .add(download_release_link::Column::ResolutionState.is_in([
+                        "pending",
+                        "resolving",
+                        "failed",
+                    ]))
+                    .add(
+                        Condition::all()
+                            .add(download_release_link::Column::ResolutionState.eq("linked"))
+                            .add(
+                                Condition::any()
+                                    .add(download_release_link::Column::GroupId.is_null())
+                                    .add(download_release_link::Column::TorrentId.is_null()),
+                            ),
+                    ),
+            )
             .all(&self.connection)
             .await?
             .into_iter()
@@ -7110,27 +7131,28 @@ mod tests {
         let release_id = db.list_release_summaries().await.expect("releases")[0]
             .id
             .expect("release id");
+        let live = LiveDownloadStatus {
+            client: "music".into(),
+            info_hash: "redhash".into(),
+            state: ClientDownloadState::Seeding,
+            client_state: "stalledUP".into(),
+            diagnostic: None,
+            progress: 1.0,
+            size: 100,
+            downloaded: 100,
+            uploaded: 50,
+            download_speed: 0,
+            upload_speed: 0,
+            eta: None,
+            ratio: 0.5,
+            save_path: "/downloads/red".into(),
+            content_path: Some("/downloads/red/Afterglow".into()),
+            added_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        };
         db.observe_downloads(&[DownloadObservation {
             torrent_name: Some("Sleep Theory — Afterglow (2025) [WEB-FLAC 24-48]".into()),
-            live: LiveDownloadStatus {
-                client: "music".into(),
-                info_hash: "redhash".into(),
-                state: ClientDownloadState::Seeding,
-                client_state: "stalledUP".into(),
-                diagnostic: None,
-                progress: 1.0,
-                size: 100,
-                downloaded: 100,
-                uploaded: 50,
-                download_speed: 0,
-                upload_speed: 0,
-                eta: None,
-                ratio: 0.5,
-                save_path: "/downloads/red".into(),
-                content_path: Some("/downloads/red/Afterglow".into()),
-                added_at: Some(Utc::now()),
-                completed_at: Some(Utc::now()),
-            },
+            live: live.clone(),
             announce_host: Some("flacsfor.me".into()),
             tracker: None,
             plex_target: None,
@@ -7156,6 +7178,31 @@ mod tests {
         let imports = db.list_imports(10, 0).await.expect("imports");
         assert_eq!(imports.counts.review, 0);
         assert_eq!(imports.counts.complete, 1);
+
+        db.observe_downloads(&[DownloadObservation {
+            torrent_name: Some("Sleep Theory — Afterglow (2025) [WEB-FLAC 24-48]".into()),
+            live,
+            announce_host: Some("flacsfor.me".into()),
+            tracker: Some("red".into()),
+            plex_target: None,
+        }])
+        .await
+        .expect("configured tracker observation");
+        assert!(
+            db.background_job_by_key("resolve-hash:red:redhash:v3")
+                .await
+                .expect("resolution job")
+                .is_some(),
+            "release-level matches must be replaced by exact tracker hash resolution"
+        );
+        assert_eq!(
+            db.links_for_tracker_hash("red", "redhash")
+                .await
+                .expect("resolvable links")
+                .len(),
+            1,
+            "the resolver must include linked records without exact torrent identity"
+        );
     }
 
     #[tokio::test]
