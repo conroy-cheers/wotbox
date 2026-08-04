@@ -1546,14 +1546,10 @@ async fn index_tracklist(
 
 async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
     let payload: TrackerGroupPayload = serde_json::from_value(payload.clone())?;
-    let memberships = state.db.list_catalog_memberships().await?;
-    let indexes = state
+    let memberships = state
         .db
-        .list_track_indexes()
-        .await?
-        .into_iter()
-        .map(|index| ((index.tracker.clone(), index.group_id), index))
-        .collect::<HashMap<_, _>>();
+        .catalog_memberships_for_single(&payload.tracker, payload.group_id)
+        .await?;
     let single_artists = memberships
         .iter()
         .filter(|membership| {
@@ -1572,6 +1568,7 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
         // Complete this no-op; a later catalog refresh reactivates the durable job.
         return Ok(JobOutcome::Complete);
     }
+    let mut seen_albums = HashSet::new();
     let albums = memberships
         .iter()
         .filter(|membership| {
@@ -1590,10 +1587,24 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
                     .release_type
                     .as_deref()
                     .is_some_and(|kind| kind.eq_ignore_ascii_case("album"))
+                && seen_albums.insert(membership.group.release.group_id)
         })
         .collect::<Vec<_>>();
-    let single_key = (payload.tracker.clone(), payload.group_id);
-    let Some(single) = indexes.get(&single_key) else {
+    let mut group_ids = Vec::with_capacity(albums.len() + 1);
+    group_ids.push(payload.group_id);
+    group_ids.extend(
+        albums
+            .iter()
+            .map(|membership| membership.group.release.group_id),
+    );
+    let indexes = state
+        .db
+        .track_indexes_for_groups(&payload.tracker, &group_ids)
+        .await?
+        .into_iter()
+        .map(|index| (index.group_id, index))
+        .collect::<HashMap<_, _>>();
+    let Some(single) = indexes.get(&payload.group_id) else {
         return Ok(JobOutcome::Wait {
             code: "dependencies_pending",
             message: "Waiting for the Single tracklist".into(),
@@ -1613,11 +1624,7 @@ async fn compute_single_coverage(state: &Arc<AppState>, payload: &Value) -> Resu
     };
     let mut album_indexes = Vec::new();
     for membership in albums {
-        let key = (
-            membership.group.release.tracker.clone(),
-            membership.group.release.group_id,
-        );
-        let Some(index) = indexes.get(&key) else {
+        let Some(index) = indexes.get(&membership.group.release.group_id) else {
             return Ok(JobOutcome::Wait {
                 code: "dependencies_pending",
                 message: "Waiting for candidate Album tracklists".into(),

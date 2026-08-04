@@ -25,13 +25,14 @@ use crate::{
     },
     migration::Migrator,
     model::{
-        ArtistCatalogPage, ArtistCreditSource, ArtistRole, BackgroundJobCounts, BackgroundJobState,
-        BackgroundJobStatus, BackgroundJobsOverview, CanonicalTorrent, ChannelConfig, ChannelPack,
-        ChannelPackDecision, ChannelPackItem, ChannelPackSummary, ChannelRun, ChannelRunPhase,
-        ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts, DownloadJob, DownloadState,
-        ImportCleanupMode, ImportSupersession, ImportTask, ImportTaskCounts, ImportTaskState,
-        ImportsPage, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseDownload,
-        ReleaseSummary, RuntimePreferences, TorrentVariant, TrumpedDownloadRef,
+        ArtistCatalogPage, ArtistCatalogRole, ArtistCreditSource, ArtistRole, BackgroundJobCounts,
+        BackgroundJobState, BackgroundJobStatus, BackgroundJobsOverview, CanonicalTorrent,
+        ChannelConfig, ChannelPack, ChannelPackDecision, ChannelPackItem, ChannelPackSummary,
+        ChannelRun, ChannelRunPhase, ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts,
+        DownloadJob, DownloadState, ImportCleanupMode, ImportSupersession, ImportTask,
+        ImportTaskCounts, ImportTaskState, ImportsPage, LiveDownloadStatus, ProviderCircuitState,
+        ReleaseDetail, ReleaseDownload, ReleaseSummary, RuntimePreferences, TorrentVariant,
+        TrumpedDownloadRef,
     },
     plex::PlexScanTarget,
 };
@@ -127,7 +128,6 @@ pub struct TrackIndexJob {
 }
 
 pub struct StoredTrackIndex {
-    pub tracker: String,
     pub group_id: i64,
     pub state: String,
     pub index: Option<ReleaseTrackIndex>,
@@ -2774,8 +2774,31 @@ impl Database {
         Ok(())
     }
 
-    pub async fn list_catalog_memberships(&self) -> Result<Vec<CatalogMembership>> {
+    pub async fn catalog_memberships_for_single(
+        &self,
+        tracker: &str,
+        single_group_id: i64,
+    ) -> Result<Vec<CatalogMembership>> {
+        let tracker = tracker.to_ascii_lowercase();
+        let target_memberships = dedupe_catalog_membership::Entity::find()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq(&tracker))
+            .filter(dedupe_catalog_membership::Column::GroupId.eq(single_group_id))
+            .all(&self.connection)
+            .await?;
+        let mut primary_artist_ids = std::collections::HashSet::new();
+        for model in target_memberships {
+            let group: crate::model::ArtistCatalogRelease =
+                serde_json::from_value(model.group_json)?;
+            if group.roles.contains(&ArtistCatalogRole::Primary) {
+                primary_artist_ids.insert(model.artist_id);
+            }
+        }
+        if primary_artist_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         dedupe_catalog_membership::Entity::find()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq(tracker))
+            .filter(dedupe_catalog_membership::Column::ArtistId.is_in(primary_artist_ids))
             .all(&self.connection)
             .await?
             .into_iter()
@@ -2826,14 +2849,22 @@ impl Database {
         Ok(singles.into_iter().collect())
     }
 
-    pub async fn list_track_indexes(&self) -> Result<Vec<StoredTrackIndex>> {
+    pub async fn track_indexes_for_groups(
+        &self,
+        tracker: &str,
+        group_ids: &[i64],
+    ) -> Result<Vec<StoredTrackIndex>> {
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         release_track_index::Entity::find()
+            .filter(release_track_index::Column::Tracker.eq(tracker.to_ascii_lowercase()))
+            .filter(release_track_index::Column::GroupId.is_in(group_ids.iter().copied()))
             .all(&self.connection)
             .await?
             .into_iter()
             .map(|model| {
                 Ok(StoredTrackIndex {
-                    tracker: model.tracker,
                     group_id: model.group_id,
                     state: model.state,
                     index: model.index_json.map(serde_json::from_value).transpose()?,
@@ -6324,14 +6355,15 @@ mod tests {
 
     use crate::{
         entity::{
-            background_job, canonical_torrent, download_release_link, release_source,
-            release_track_index,
+            background_job, canonical_torrent, dedupe_catalog_membership, download_release_link,
+            release_source, release_track_index,
         },
         model::{
-            CanonicalTorrent, ChannelPackItem, ChannelRunStatus, ChannelRunTrigger,
-            ClientDownloadState, ImportCleanupMode, ImportTaskState, LiveDownloadStatus,
-            PackItemPlanState, ProviderCircuitState, RecommendationMatchState,
-            RecommendationSource, ReleaseSummary, TorrentVariant, TrumpedDownloadRef,
+            ArtistCatalogRelease, ArtistCatalogRole, CanonicalTorrent, ChannelPackItem,
+            ChannelRunStatus, ChannelRunTrigger, ClientDownloadState, ImportCleanupMode,
+            ImportTaskState, LiveDownloadStatus, PackItemPlanState, ProviderCircuitState,
+            RecommendationMatchState, RecommendationSource, ReleaseSummary, TorrentVariant,
+            TrumpedDownloadRef,
         },
         plex::PlexScanTarget,
         tracker::fallback_artist_credit,
@@ -6393,6 +6425,120 @@ mod tests {
             description: None,
             record_label: None,
         }
+    }
+
+    fn catalog_membership_group(
+        tracker: &str,
+        group_id: i64,
+        artist_id: i64,
+        release_type: &str,
+    ) -> ArtistCatalogRelease {
+        let mut release = tracker_release(
+            tracker,
+            group_id,
+            group_id * 10,
+            &format!("Release {group_id}"),
+            2026,
+            release_type,
+        );
+        release.release.artists = vec![crate::model::ArtistCredit {
+            canonical_id: None,
+            key: format!("id:{artist_id}"),
+            tracker: tracker.into(),
+            artist_id: Some(artist_id),
+            name: format!("Artist {artist_id}"),
+            role: crate::model::ArtistRole::Primary,
+            source: crate::model::ArtistCreditSource::Structured,
+        }];
+        ArtistCatalogRelease {
+            release: release.release,
+            tags: Vec::new(),
+            variants: vec![release.variant],
+            roles: vec![ArtistCatalogRole::Primary],
+            listed_on_tracker: true,
+            library_availability: None,
+            library_added_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn single_coverage_queries_only_relevant_catalog_rows_and_indexes() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("targeted-coverage.sqlite"))
+            .await
+            .expect("database");
+        let now = Utc::now().to_rfc3339();
+        for (tracker, artist_id, group_id, release_type) in [
+            ("ops", 10, 1, "Single"),
+            ("ops", 10, 2, "Album"),
+            ("ops", 99, 3, "Album"),
+            ("red", 10, 4, "Album"),
+        ] {
+            dedupe_catalog_membership::ActiveModel {
+                tracker: Set(tracker.into()),
+                artist_id: Set(artist_id),
+                group_id: Set(group_id),
+                group_json: Set(serde_json::to_value(catalog_membership_group(
+                    tracker,
+                    group_id,
+                    artist_id,
+                    release_type,
+                ))
+                .expect("catalog group JSON")),
+                updated_at: Set(now.clone()),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("catalog membership");
+        }
+        for (tracker, group_id) in [("ops", 1), ("ops", 2), ("ops", 3), ("red", 2)] {
+            release_track_index::ActiveModel {
+                tracker: Set(tracker.into()),
+                group_id: Set(group_id),
+                state: Set("indexed".into()),
+                index_json: Set(Some(
+                    serde_json::to_value(crate::dedupe::ReleaseTrackIndex {
+                        tracker: tracker.into(),
+                        group_id,
+                        title: format!("Release {group_id}"),
+                        release_type: Some(if group_id == 1 { "Single" } else { "Album" }.into()),
+                        artists: Vec::new(),
+                        variants: Vec::new(),
+                    })
+                    .expect("track index JSON"),
+                )),
+                attempts: Set(0),
+                next_retry_at: Set(None),
+                error_message: Set(None),
+                fetched_at: Set(Some(now.clone())),
+                expires_at: Set(None),
+                updated_at: Set(now.clone()),
+                priority: Set(0),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("track index");
+        }
+
+        let mut membership_ids = db
+            .catalog_memberships_for_single("OPS", 1)
+            .await
+            .expect("targeted memberships")
+            .into_iter()
+            .map(|membership| membership.group.release.group_id)
+            .collect::<Vec<_>>();
+        membership_ids.sort_unstable();
+        assert_eq!(membership_ids, vec![1, 2]);
+
+        let mut index_ids = db
+            .track_indexes_for_groups("OPS", &[1, 2])
+            .await
+            .expect("targeted indexes")
+            .into_iter()
+            .map(|index| index.group_id)
+            .collect::<Vec<_>>();
+        index_ids.sort();
+        assert_eq!(index_ids, vec![1, 2]);
     }
 
     #[tokio::test]
