@@ -3456,6 +3456,20 @@ async fn cleanup_orphaned_download_stages(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+async fn download_torrent_payload_for_job(
+    tracker: &dyn TrackerClient,
+    job: &DownloadJob,
+) -> Result<(Vec<u8>, String)> {
+    // Gazelle applies a freeleech token to the torrent-file request itself, so
+    // the first request must carry the final token decision. The returned file
+    // is also sufficient to calculate the missing info hash.
+    let bytes = tracker
+        .download_torrent(job.torrent_id, job.use_token)
+        .await?;
+    let info_hash = torrent_info_hash(&bytes)?;
+    Ok((bytes, info_hash))
+}
+
 pub(crate) async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> {
     let profile = state
         .profiles
@@ -3608,11 +3622,8 @@ pub(crate) async fn process_download(state: Arc<AppState>, job: DownloadJob) -> 
             .set_job_state(job.id, DownloadState::Submitting, None)
             .await?;
         submission_started = true;
-        let bytes = tracker.download_torrent(job.torrent_id, false).await?;
-        let info_hash = torrent_info_hash(&bytes)?;
-        if !job.use_token {
-            payload = Some(bytes);
-        }
+        let (bytes, info_hash) = download_torrent_payload_for_job(tracker.as_ref(), &job).await?;
+        payload = Some(bytes);
         info_hash
     };
     metadata.info_hash = Some(info_hash.clone());
@@ -5408,7 +5419,96 @@ struct ApiDoc;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+
     use super::*;
+
+    struct RecordingTracker {
+        token_requests: StdMutex<Vec<bool>>,
+    }
+
+    impl RecordingTracker {
+        fn unsupported<T>() -> Result<T> {
+            Err(anyhow!("unsupported test tracker operation"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrackerClient for RecordingTracker {
+        fn name(&self) -> &str {
+            "ops"
+        }
+
+        async fn account(&self) -> Result<(Account, Value)> {
+            Self::unsupported()
+        }
+
+        async fn search(&self, _request: &SearchRequest) -> Result<(SearchPage, Value)> {
+            Self::unsupported()
+        }
+
+        async fn artist_catalog(&self, _id: i64) -> Result<(ArtistCatalogPage, Value)> {
+            Self::unsupported()
+        }
+
+        async fn group(&self, _id: i64) -> Result<(ReleaseDetail, Value)> {
+            Self::unsupported()
+        }
+
+        async fn torrent(&self, _id: i64) -> Result<(TorrentMetadata, CanonicalTorrent, Value)> {
+            Self::unsupported()
+        }
+
+        async fn torrent_by_hash(&self, _info_hash: &str) -> Result<(CanonicalTorrent, Value)> {
+            Self::unsupported()
+        }
+
+        async fn download_torrent(&self, _id: i64, use_token: bool) -> Result<Vec<u8>> {
+            self.token_requests
+                .lock()
+                .expect("token request lock")
+                .push(use_token);
+            Ok(b"d4:infod4:name4:test6:lengthi1eee".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_hash_fetches_torrent_once_with_requested_token() {
+        let tracker = RecordingTracker {
+            token_requests: StdMutex::new(Vec::new()),
+        };
+        let now = Utc::now();
+        let job = DownloadJob {
+            id: Uuid::new_v4(),
+            tracker: "ops".into(),
+            torrent_id: 42,
+            group_id: None,
+            profile: "ops".into(),
+            use_token: true,
+            info_hash: None,
+            name: None,
+            state: DownloadState::FetchingMetadata,
+            progress: 0.0,
+            download_speed: 0,
+            upload_speed: 0,
+            eta: None,
+            error_code: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let (payload, hash) = download_torrent_payload_for_job(&tracker, &job)
+            .await
+            .expect("torrent payload");
+
+        assert_eq!(payload, b"d4:infod4:name4:test6:lengthi1eee");
+        assert_eq!(hash.len(), 40);
+        assert_eq!(
+            *tracker.token_requests.lock().expect("token requests"),
+            vec![true]
+        );
+    }
 
     #[test]
     fn staged_torrents_are_persisted_privately() {
