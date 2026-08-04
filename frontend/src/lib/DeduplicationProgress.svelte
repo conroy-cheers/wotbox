@@ -9,12 +9,11 @@
     detail: string;
   } = $props();
 
-  const progressValue = $derived(
-    status.tracklistsTotal > 0 ? status.tracklistsIndexed : status.checked
-  );
-  const progressTotal = $derived(
-    status.tracklistsTotal > 0 ? status.tracklistsTotal : status.total
-  );
+  // The overlap totals are scoped to the current page, while tracklist totals
+  // cover the whole durable queue. Mixing them made a nearly complete library
+  // look stuck behind unrelated catalogue indexing.
+  const progressValue = $derived(status.checked);
+  const progressTotal = $derived(status.total);
   const percentage = $derived(
     progressTotal > 0 ? Math.round((progressValue / progressTotal) * 100) : 0
   );
@@ -34,7 +33,7 @@
       <div
         class="deduplication-progress-track"
         role="progressbar"
-        aria-label="Tracklist indexing progress"
+        aria-label="Album overlap checking progress"
         aria-valuemin="0"
         aria-valuemax={progressTotal}
         aria-valuenow={progressValue}
