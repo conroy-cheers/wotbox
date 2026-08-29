@@ -554,7 +554,19 @@ fn fulfillment_revision(
     let mut digest = Sha256::new();
     digest.update(format!("{requirement:?}|{satisfaction:?}"));
     for holding in holdings {
-        digest.update(format!("{holding:?}"));
+        digest.update(format!(
+            "{:?}|{}|{}",
+            holding.variant, holding.in_library, holding.present
+        ));
+        for download in &holding.downloads {
+            digest.update(format!(
+                "{}|{}|{:?}|{}",
+                download.client,
+                download.info_hash.to_ascii_lowercase(),
+                download.state,
+                download.progress >= 1.0
+            ));
+        }
     }
     for activity in activities {
         digest.update(format!("{activity:?}"));
@@ -760,7 +772,7 @@ mod tests {
                 live: None,
             }],
         );
-        let fulfillment = item.fulfillment.expect("fulfillment");
+        let fulfillment = item.fulfillment.as_ref().expect("fulfillment");
         assert_eq!(fulfillment.requirement.release_id, Some(release_id));
         assert_eq!(fulfillment.satisfaction, FulfillmentSatisfaction::Satisfied);
         assert!(
@@ -770,5 +782,24 @@ mod tests {
         );
         assert_eq!(item.disposition, PackItemDisposition::Resolved);
         assert!(!item.selectable);
+        let revision = fulfillment.revision.clone();
+        item.variants[0].downloads[0].upload_speed = 42_000;
+        item.variants[0].downloads[0].ratio = 9.5;
+        project_channel_item(
+            &mut item,
+            &[],
+            &[ReleaseInventoryRecord {
+                tracker: Some("red".into()),
+                torrent_id: Some(20),
+                present: true,
+                in_library: true,
+                live: None,
+            }],
+        );
+        assert_eq!(
+            item.fulfillment.expect("updated fulfillment").revision,
+            revision,
+            "telemetry-only changes must not invalidate fulfillment actions"
+        );
     }
 }
