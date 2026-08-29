@@ -409,6 +409,7 @@ pub async fn refresh_channel(
                     job_id: None,
                     job: None,
                     acquisition: None,
+                    fulfillment: None,
                     disposition: Default::default(),
                     selectable: false,
                 }
@@ -2426,6 +2427,7 @@ async fn resolve_release_with_index(
         job_id: None,
         job: None,
         acquisition: None,
+        fulfillment: None,
         disposition: Default::default(),
         selectable: false,
     })
@@ -2799,6 +2801,7 @@ fn unresolved_item(
         job_id: None,
         job: None,
         acquisition: None,
+        fulfillment: None,
         disposition: Default::default(),
         selectable: false,
     }
@@ -2824,6 +2827,7 @@ fn ambiguous_item(
         job_id: None,
         job: None,
         acquisition: None,
+        fulfillment: None,
         disposition: Default::default(),
         selectable: false,
     }
@@ -3533,6 +3537,7 @@ mod tests {
                 job_id: None,
                 job: None,
                 acquisition: None,
+                fulfillment: None,
                 disposition: Default::default(),
                 selectable: false,
             }

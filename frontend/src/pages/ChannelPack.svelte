@@ -291,6 +291,7 @@
               title={item.release.title}
               source="channels"
               requestedTorrentId={item.replacement?.torrentId ?? item.plan?.torrentId}
+              fulfillment={item.fulfillment}
               onadd={item.replacement ? undefined : (variant) => choose(item, variant)}
             />
           {:else if item.candidates.length}

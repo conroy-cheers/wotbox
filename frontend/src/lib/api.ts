@@ -287,6 +287,50 @@ export type TorrentVariant = {
   library?: LibraryVariantState;
 };
 
+export type VariantKey = {
+  tracker: string;
+  torrentId: number;
+};
+
+export type ReleaseFulfillment = {
+  requirement: {
+    scope: "release" | "exact_variant";
+    releaseId?: string;
+    target?: VariantKey;
+  };
+  satisfaction: "satisfied" | "unsatisfied" | "not_required" | "unknown";
+  holdings: {
+    variant?: VariantKey;
+    inLibrary: boolean;
+    present: boolean;
+    downloads: LiveDownloadStatus[];
+  }[];
+  activities: {
+    kind:
+      | "queued"
+      | "downloading"
+      | "downloaded"
+      | "importing"
+      | "seeding"
+      | "paused"
+      | "checking"
+      | "stalled"
+      | "failed";
+    target?: VariantKey;
+    jobId?: string;
+    client?: string;
+    infoHash?: string;
+  }[];
+  actions: {
+    kind: "add" | "add_another" | "retry" | "cleanup" | "review_match" | "change_match";
+    target?: VariantKey;
+    primary: boolean;
+    enabled: boolean;
+    reason?: string;
+  }[];
+  revision: string;
+};
+
 export type ReleaseDetail = {
   release: ReleaseSummary;
   fieldProvenance: Record<string, {
@@ -746,6 +790,7 @@ export type ChannelPackItem = {
     reason?: string;
     updatedAt: string;
   };
+  fulfillment?: ReleaseFulfillment;
   disposition: "actionable" | "waiting" | "cleanup" | "review" | "resolved";
   selectable: boolean;
   planState:

@@ -4,7 +4,8 @@ import {
   defaultReleasePreferences,
   isMediaAllowed,
   isQualityAllowed,
-  rankVariants
+  rankVariants,
+  selectFeaturedVariant
 } from "./releasePreferences";
 
 const variant = (
@@ -66,5 +67,36 @@ describe("release preferences", () => {
       variant(2, "FLAC", "Lossless", "CD", 1, "Deluxe")
     ];
     expect(rankVariants(values, preferences)[0].torrentId).toBe(2);
+  });
+
+  it("shows a current attachment before a higher-ranked unowned alternative", () => {
+    const values = [
+      { ...variant(1, "FLAC", "24bit Lossless", "WEB", 100), tracker: "ops" },
+      {
+        ...variant(2, "FLAC", "24bit Lossless", "WEB", 20),
+        tracker: "red",
+        downloads: [{} as never]
+      }
+    ];
+    const ranked = rankVariants(values, defaultReleasePreferences);
+    expect(ranked[0].torrentId).toBe(1);
+    expect(selectFeaturedVariant(ranked, undefined, () => true)?.torrentId).toBe(2);
+  });
+
+  it("keeps an explicit exact target ahead of current release holdings", () => {
+    const values = [
+      {
+        ...variant(1, "FLAC", "24bit Lossless", "WEB", 100),
+        tracker: "ops",
+        downloads: [{} as never]
+      },
+      { ...variant(2, "FLAC", "Lossless", "WEB", 20), tracker: "red" }
+    ];
+    const ranked = rankVariants(values, defaultReleasePreferences);
+    expect(selectFeaturedVariant(
+      ranked,
+      { tracker: "red", torrentId: 2 },
+      () => true
+    )?.torrentId).toBe(2);
   });
 });

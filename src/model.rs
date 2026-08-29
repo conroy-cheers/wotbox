@@ -1684,6 +1684,108 @@ pub enum AcquisitionPhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct VariantKey {
+    pub tracker: String,
+    pub torrent_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseHolding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<VariantKey>,
+    pub in_library: bool,
+    pub present: bool,
+    #[serde(default)]
+    pub downloads: Vec<LiveDownloadStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentSatisfaction {
+    Satisfied,
+    Unsatisfied,
+    NotRequired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentActivityKind {
+    Queued,
+    Downloading,
+    Downloaded,
+    Importing,
+    Seeding,
+    Paused,
+    Checking,
+    Stalled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FulfillmentActivity {
+    pub kind: FulfillmentActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<VariantKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentActionKind {
+    Add,
+    AddAnother,
+    Retry,
+    Cleanup,
+    ReviewMatch,
+    ChangeMatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FulfillmentAction {
+    pub kind: FulfillmentActionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<VariantKey>,
+    pub primary: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FulfillmentRequirement {
+    pub scope: AcquisitionScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<VariantKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseFulfillment {
+    pub requirement: FulfillmentRequirement,
+    pub satisfaction: FulfillmentSatisfaction,
+    #[serde(default)]
+    pub holdings: Vec<ReleaseHolding>,
+    #[serde(default)]
+    pub activities: Vec<FulfillmentActivity>,
+    #[serde(default)]
+    pub actions: Vec<FulfillmentAction>,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionState {
@@ -1837,6 +1939,8 @@ pub struct ChannelPackItem {
     pub job: Option<DownloadJob>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquisition: Option<AcquisitionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfillment: Option<ReleaseFulfillment>,
     #[serde(default)]
     pub disposition: PackItemDisposition,
     #[serde(default)]

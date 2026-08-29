@@ -106,6 +106,25 @@ export function rankVariants<T extends DisplayVariant>(
   });
 }
 
+export function selectFeaturedVariant<T extends DisplayVariant>(
+  ranked: T[],
+  target: { tracker?: string; torrentId: number } | undefined,
+  isDownloadable: (variant: T) => boolean
+): T | undefined {
+  return ranked.find((variant) =>
+    variant.torrentId === target?.torrentId
+      && (!target.tracker
+        || !variant.tracker
+        || variant.tracker.toLowerCase() === target.tracker.toLowerCase())
+  )
+    ?? ranked.find((variant) => variant.downloads.length > 0)
+    ?? ranked.find((variant) =>
+      "library" in variant && variant.library?.availability === "present"
+    )
+    ?? ranked.find(isDownloadable)
+    ?? ranked[0];
+}
+
 function trackerRank(tracker: string | undefined, preferences: ReleasePreferences): number {
   if (!tracker) return preferences.trackerOrder.length;
   const rank = preferences.trackerOrder.findIndex((known) =>

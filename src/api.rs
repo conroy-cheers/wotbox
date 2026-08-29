@@ -716,7 +716,7 @@ async fn channel_pack(
         })?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
-    project_pack_acquisition(&state, &mut pack).await?;
+    project_pack_fulfillment(&state, &mut pack).await?;
     Ok(Json(pack))
 }
 
@@ -752,7 +752,7 @@ async fn replan_channel_pack(
         .context("channel pack disappeared")?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
-    project_pack_acquisition(&state, &mut pack).await?;
+    project_pack_fulfillment(&state, &mut pack).await?;
     Ok(Json(pack))
 }
 
@@ -791,7 +791,7 @@ async fn attach_channel_pack_item(
         .context("channel pack disappeared")?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
-    project_pack_acquisition(&state, &mut pack).await?;
+    project_pack_fulfillment(&state, &mut pack).await?;
     Ok(Json(pack))
 }
 
@@ -828,7 +828,7 @@ async fn accept_channel_pack(
     let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
-    project_pack_acquisition(&state, &mut pack).await?;
+    project_pack_fulfillment(&state, &mut pack).await?;
     let selected = request
         .ordinals
         .map(|ordinals| ordinals.into_iter().collect::<HashSet<_>>());
@@ -939,7 +939,7 @@ async fn hydrate_pack_jobs(state: &AppState, pack: &mut ChannelPack) -> Result<(
     Ok(())
 }
 
-async fn project_pack_acquisition(
+async fn project_pack_fulfillment(
     state: &AppState,
     pack: &mut ChannelPack,
 ) -> Result<(), AppError> {
@@ -949,8 +949,28 @@ async fn project_pack_acquisition(
         .filter_map(|item| item.release.as_ref().and_then(|release| release.id))
         .collect::<Vec<_>>();
     let import_states = state.db.import_states_for_releases(&release_ids).await?;
-    let release_flags = state.db.release_download_flags_for(&release_ids).await?;
-    let jobs = state.db.list_jobs().await?;
+    let release_inventory = state.db.release_inventory_for(&release_ids).await?;
+    let variant_keys = pack
+        .items
+        .iter()
+        .flat_map(|item| {
+            item.variants
+                .iter()
+                .map(|variant| (variant.tracker.to_ascii_lowercase(), variant.torrent_id))
+                .chain(
+                    item.plan
+                        .iter()
+                        .map(|plan| (plan.tracker.to_ascii_lowercase(), plan.torrent_id)),
+                )
+                .chain(item.replacement.iter().map(|replacement| {
+                    (
+                        replacement.tracker.to_ascii_lowercase(),
+                        replacement.torrent_id,
+                    )
+                }))
+        })
+        .collect();
+    let jobs = state.db.list_jobs_for_variants(&variant_keys).await?;
     pack.summary = Default::default();
     for item in &mut pack.items {
         if item.job.is_none()
@@ -976,10 +996,11 @@ async fn project_pack_acquisition(
             .and_then(|release_id| import_states.get(&release_id))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let flags = release_id
-            .and_then(|release_id| release_flags.get(&release_id).copied())
-            .unwrap_or((false, false));
-        crate::acquisition::project_channel_item(item, states, flags);
+        let inventory = release_id
+            .and_then(|release_id| release_inventory.get(&release_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        crate::acquisition::project_channel_item(item, states, inventory);
         if item.selectable {
             pack.summary.executable += 1;
             if let Some(plan) = &item.plan {

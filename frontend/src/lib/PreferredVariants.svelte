@@ -4,6 +4,7 @@
   import {
     api,
     formatBytes,
+    type ReleaseFulfillment,
     type RuntimePreferences
   } from "./api";
   import {
@@ -11,6 +12,7 @@
     isMediaAllowed,
     isQualityAllowed,
     rankVariants,
+    selectFeaturedVariant,
     type DisplayVariant
   } from "./releasePreferences";
   import { releaseViewPath, type ReleaseSource } from "./routing";
@@ -23,6 +25,7 @@
     groupId,
     title,
     requestedTorrentId,
+    fulfillment,
     source = "search",
     expanded: controlledExpanded,
     onexpandedchange,
@@ -34,6 +37,7 @@
     groupId: number;
     title: string;
     requestedTorrentId?: number;
+    fulfillment?: ReleaseFulfillment;
     source?: ReleaseSource;
     expanded?: boolean;
     onexpandedchange?: (expanded: boolean) => void;
@@ -49,11 +53,18 @@
   });
   const policy = $derived($preferences.data?.release ?? defaultReleasePreferences);
   const ranked = $derived(rankVariants(variants, policy));
-  const preferred = $derived(
-    ranked.find((variant) => variant.torrentId === requestedTorrentId)
-      ?? ranked.find((variant) => isDownloadable(variant))
-      ?? ranked[0]
+  const fulfillmentTarget = $derived(
+    fulfillment?.requirement.target
+      ?? fulfillment?.actions.find((action) => action.primary && action.target)?.target
   );
+  const focusTorrentId = $derived(requestedTorrentId ?? fulfillmentTarget?.torrentId);
+  const preferred = $derived(selectFeaturedVariant(
+    ranked,
+    focusTorrentId === undefined
+      ? undefined
+      : { tracker: fulfillmentTarget?.tracker, torrentId: focusTorrentId },
+    isDownloadable
+  ));
   const remaining = $derived(ranked.filter((variant) => variant.torrentId !== preferred?.torrentId));
 
   function libraryState(variant: DisplayVariant) {
@@ -75,6 +86,17 @@
     if (trackerPolicy.mode === "freeleech_only") return false;
     if (trackerPolicy.mode === "freeleech_or_token") return variant.canUseToken;
     return true;
+  }
+
+  function fulfillmentAction(variant: DisplayVariant) {
+    if (!fulfillment) return undefined;
+    const variantTracker = (variant.tracker ?? tracker).toLowerCase();
+    return fulfillment.actions.find((action) =>
+      action.target
+        && action.target.torrentId === variant.torrentId
+        && action.target.tracker.toLowerCase() === variantTracker
+        && ["add", "add_another", "retry"].includes(action.kind)
+    );
   }
 
   function policyFor(variantTracker: string) {
@@ -164,6 +186,8 @@
   {@const qualityAllowed = isQualityAllowed(variant, policy)}
   {@const mediaAllowed = isMediaAllowed(variant, policy)}
   {@const allowed = isDownloadable(variant)}
+  {@const action = fulfillmentAction(variant)}
+  {@const canAdd = Boolean(onadd) && allowed && (!fulfillment || action?.enabled === true)}
   {@const library = libraryState(variant)}
   {@const policyTooltipId = `policy-${variant.tracker ?? tracker}-${variant.torrentId}`}
   <div class="torrent-row preferred-torrent-row" class:matched={isPreferred}>
@@ -214,18 +238,18 @@
         <a class="download-status-link" href={variantPath(variant)}>
           <StatusPill state={variant.downloads[0].state} />
         </a>
-      {:else if library?.availability === "present" || !onadd}
+      {:else if library?.availability === "present" || !onadd || (fulfillment && !action)}
         <a class="secondary-button compact-button" href={variantPath(variant)}>View</a>
       {:else}
         <button
           class="download-button catalog-add-button"
-          disabled={!allowed}
-          title={allowed ? `Add ${title}` : "This variant is blocked by your release preferences"}
-          aria-label={allowed ? `Add ${title}` : `${title} is blocked by release preferences`}
-          onclick={() => allowed && onadd?.(variant)}
+          disabled={!canAdd}
+          title={canAdd ? `${action?.kind === "add_another" ? "Add another variant of" : action?.kind === "retry" ? "Retry" : "Add"} ${title}` : "This variant is blocked by your release preferences"}
+          aria-label={canAdd ? `${action?.kind === "add_another" ? "Add another variant of" : action?.kind === "retry" ? "Retry" : "Add"} ${title}` : `${title} is blocked by release preferences`}
+          onclick={() => canAdd && onadd?.(variant)}
         >
           <ArrowDownToLine size={15} />
-          <span>{library?.availability === "missing" ? "Re-add" : "Add"}</span>
+          <span>{action?.kind === "add_another" ? "Add another" : action?.kind === "retry" ? "Retry" : library?.availability === "missing" ? "Re-add" : "Add"}</span>
         </button>
       {/if}
     </div>

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    str::FromStr,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -77,6 +82,15 @@ pub struct LibraryRecord {
     pub completed_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub missing_since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseInventoryRecord {
+    pub tracker: Option<String>,
+    pub torrent_id: Option<i64>,
+    pub present: bool,
+    pub in_library: bool,
+    pub live: Option<LiveDownloadStatus>,
 }
 
 pub struct IndexedDownload {
@@ -1744,10 +1758,10 @@ impl Database {
         Ok((owned, downloading))
     }
 
-    pub async fn release_download_flags_for(
+    pub async fn release_inventory_for(
         &self,
         release_ids: &[Uuid],
-    ) -> Result<HashMap<Uuid, (bool, bool)>> {
+    ) -> Result<HashMap<Uuid, Vec<ReleaseInventoryRecord>>> {
         if release_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1758,18 +1772,25 @@ impl Database {
             )
             .all(&self.connection)
             .await?;
-        let mut flags = HashMap::new();
+        let mut inventory = HashMap::new();
         for link in links {
             let Some(release_id) = link.release_id.as_deref() else {
                 continue;
             };
-            let entry = flags
-                .entry(Uuid::parse_str(release_id)?)
-                .or_insert((false, false));
-            entry.0 |= link.library_added_at.is_some();
-            entry.1 |= link.present && link.library_added_at.is_none();
+            let release_id = Uuid::parse_str(release_id)?;
+            let live = link.observed_json.map(serde_json::from_value).transpose()?;
+            inventory
+                .entry(release_id)
+                .or_insert_with(Vec::new)
+                .push(ReleaseInventoryRecord {
+                    tracker: link.tracker,
+                    torrent_id: link.torrent_id,
+                    present: link.present,
+                    in_library: link.library_added_at.is_some(),
+                    live,
+                });
         }
-        Ok(flags)
+        Ok(inventory)
     }
 
     pub async fn import_states_for_releases(
@@ -3460,6 +3481,28 @@ impl Database {
             .all(&self.connection)
             .await?
             .into_iter()
+            .map(job_from_model)
+            .collect()
+    }
+
+    pub async fn list_jobs_for_variants(
+        &self,
+        variants: &HashSet<(String, i64)>,
+    ) -> Result<Vec<DownloadJob>> {
+        if variants.is_empty() {
+            return Ok(Vec::new());
+        }
+        let torrent_ids = variants
+            .iter()
+            .map(|(_, torrent_id)| *torrent_id)
+            .collect::<HashSet<_>>();
+        download_job::Entity::find()
+            .filter(download_job::Column::TorrentId.is_in(torrent_ids))
+            .order_by_desc(download_job::Column::CreatedAt)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .filter(|job| variants.contains(&(job.tracker.to_ascii_lowercase(), job.torrent_id)))
             .map(job_from_model)
             .collect()
     }
@@ -7692,6 +7735,7 @@ mod tests {
             job_id: None,
             job: None,
             acquisition: None,
+            fulfillment: None,
             disposition: Default::default(),
             selectable: false,
         };
