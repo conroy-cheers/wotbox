@@ -716,6 +716,7 @@ async fn channel_pack(
         })?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
+    project_pack_acquisition(&state, &mut pack).await?;
     Ok(Json(pack))
 }
 
@@ -751,6 +752,7 @@ async fn replan_channel_pack(
         .context("channel pack disappeared")?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
+    project_pack_acquisition(&state, &mut pack).await?;
     Ok(Json(pack))
 }
 
@@ -771,9 +773,12 @@ async fn attach_channel_pack_item(
             AppError::not_found("channel_pack_item_not_found", "Pack item was not found")
         })?;
     let source = pack.items[index].source.clone();
-    pack.items[index] = channel::resolve_release(&state, source, request.release_id, &preferences)
-        .await
-        .map_err(|error| AppError::bad_request("invalid_channel_match", error))?;
+    pack.items[index] =
+        channel::resolve_release(&state, source.clone(), request.release_id, &preferences)
+            .await
+            .map_err(|error| AppError::bad_request("invalid_channel_match", error))?;
+    channel::persist_external_source_link(&state, &source, request.release_id, "manual", None)
+        .await?;
     channel::coordinate_pack_plan(&state, &mut pack.items, &preferences).await;
     state
         .db
@@ -786,6 +791,7 @@ async fn attach_channel_pack_item(
         .context("channel pack disappeared")?;
     hydrate_pack_jobs(&state, &mut pack).await?;
     channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
+    project_pack_acquisition(&state, &mut pack).await?;
     Ok(Json(pack))
 }
 
@@ -820,6 +826,9 @@ async fn accept_channel_pack(
     let preferences = state.db.get_runtime_preferences().await?;
     let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
     let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
+    hydrate_pack_jobs(&state, &mut pack).await?;
+    channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
+    project_pack_acquisition(&state, &mut pack).await?;
     let selected = request
         .ordinals
         .map(|ordinals| ordinals.into_iter().collect::<HashSet<_>>());
@@ -833,19 +842,19 @@ async fn accept_channel_pack(
         let actionable = pack
             .items
             .iter()
-            .filter(|item| channel_item_is_actionable(item) && selected.contains(&item.ordinal))
+            .filter(|item| item.selectable && selected.contains(&item.ordinal))
             .count();
         if actionable != selected.len() {
-            return Err(AppError::bad_request(
-                "invalid_channel_selection",
-                "The selection contains an item that has no replacement action",
+            return Err(AppError::conflict(
+                "pack_state_changed",
+                "One or more selected items changed acquisition state; refresh the pack before accepting",
             ));
         }
     }
     let mut jobs = Vec::new();
     let mut submitted = 0;
     for item in &mut pack.items {
-        if !channel_item_is_actionable(item) {
+        if !item.selectable {
             continue;
         }
         if selected
@@ -921,20 +930,76 @@ async fn accept_channel_pack(
     ))
 }
 
-fn channel_item_is_actionable(item: &crate::model::ChannelPackItem) -> bool {
-    item.plan_state == crate::model::PackItemPlanState::Executable
-        || (item.replacement.is_some()
-            && matches!(
-                item.plan_state,
-                crate::model::PackItemPlanState::CleanupReady
-                    | crate::model::PackItemPlanState::AlreadyDownloading
-            ))
-}
-
 async fn hydrate_pack_jobs(state: &AppState, pack: &mut ChannelPack) -> Result<(), AppError> {
     for item in &mut pack.items {
         if let Some(id) = item.job_id {
             item.job = state.db.get_job(id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn project_pack_acquisition(
+    state: &AppState,
+    pack: &mut ChannelPack,
+) -> Result<(), AppError> {
+    let release_ids = pack
+        .items
+        .iter()
+        .filter_map(|item| item.release.as_ref().and_then(|release| release.id))
+        .collect::<Vec<_>>();
+    let import_states = state.db.import_states_for_releases(&release_ids).await?;
+    let jobs = state.db.list_jobs().await?;
+    pack.summary = Default::default();
+    for item in &mut pack.items {
+        if item.job.is_none()
+            && let Some(job) = jobs.iter().find(|job| {
+                if let Some(replacement) = &item.replacement {
+                    return job.tracker.eq_ignore_ascii_case(&replacement.tracker)
+                        && job.torrent_id == replacement.torrent_id;
+                }
+                item.variants.iter().any(|variant| {
+                    job.tracker.eq_ignore_ascii_case(&variant.tracker)
+                        && job.torrent_id == variant.torrent_id
+                }) || item.plan.as_ref().is_some_and(|plan| {
+                    job.tracker.eq_ignore_ascii_case(&plan.tracker)
+                        && job.torrent_id == plan.torrent_id
+                })
+            })
+        {
+            item.job_id = Some(job.id);
+            item.job = Some(job.clone());
+        }
+        let release_id = item.release.as_ref().and_then(|release| release.id);
+        let states = release_id
+            .and_then(|release_id| import_states.get(&release_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        crate::acquisition::project_channel_item(item, states);
+        if item.selectable {
+            pack.summary.executable += 1;
+            if let Some(plan) = &item.plan {
+                pack.summary.total_size += plan.size.unwrap_or_default();
+                pack.summary.token_uses += plan.token_cost as usize;
+                *pack
+                    .summary
+                    .by_tracker
+                    .entry(plan.tracker.clone())
+                    .or_default() += 1;
+            } else if let Some(replacement) = &item.replacement {
+                *pack
+                    .summary
+                    .by_tracker
+                    .entry(replacement.tracker.clone())
+                    .or_default() += 1;
+            }
+        } else {
+            pack.summary.skipped += 1;
+            let reason = item
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", item.disposition).to_ascii_lowercase());
+            *pack.summary.by_reason.entry(reason).or_default() += 1;
         }
     }
     Ok(())

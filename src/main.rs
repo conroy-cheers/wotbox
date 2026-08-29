@@ -1,3 +1,4 @@
+mod acquisition;
 mod api;
 mod background;
 mod channel;

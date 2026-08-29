@@ -28,8 +28,9 @@ use crate::{
         is_provider_unavailable, retry_after,
     },
     release_matcher::{
-        AUTO_MERGE_THRESHOLD, external_score, is_download_metadata_token, normalized,
-        parse_download_release_name, strip_leading_catalog_code,
+        AUTO_MERGE_MARGIN, AUTO_MERGE_THRESHOLD, REVIEW_THRESHOLD, external_match_score,
+        external_score, is_download_metadata_token, is_long_form_release, normalized,
+        parse_download_release_name, strip_leading_catalog_code, title_aliases,
     },
     tracker::{SearchRequest, TrackerClient},
 };
@@ -407,6 +408,9 @@ pub async fn refresh_channel(
                     reason: Some(format!("Tracker lookup failed: {error}")),
                     job_id: None,
                     job: None,
+                    acquisition: None,
+                    disposition: Default::default(),
+                    selectable: false,
                 }
             }
         };
@@ -626,10 +630,15 @@ pub fn preference_fingerprint(
     state: &AppState,
     preferences: &RuntimePreferences,
 ) -> Result<String> {
-    const PLAN_COST_MODEL: &str = "exact-replacement-import-v3";
+    const PLAN_COST_MODEL: &str = "acquisition-projection-v4";
     let mut profiles = state.profiles.values().cloned().collect::<Vec<_>>();
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
-    let value = serde_json::to_vec(&(PLAN_COST_MODEL, preferences, profiles))?;
+    let value = serde_json::to_vec(&(
+        PLAN_COST_MODEL,
+        crate::release_matcher::MATCHER_VERSION,
+        preferences,
+        profiles,
+    ))?;
     Ok(hex::encode(Sha256::digest(value)))
 }
 
@@ -1183,6 +1192,22 @@ async fn resolve_source(
     preferences: &RuntimePreferences,
     download_index: &ReleaseDownloadIndex,
 ) -> Result<ChannelPackItem> {
+    if let Some((provider, source_key, fingerprint)) = external_source_identity(&source)
+        && let Some(release_id) = state
+            .db
+            .external_release_link(provider, source_key, &fingerprint)
+            .await?
+        && let Ok(item) = resolve_release_with_index(
+            state,
+            source.clone(),
+            release_id,
+            preferences,
+            download_index,
+        )
+        .await
+    {
+        return Ok(item);
+    }
     if let Some(item) =
         resolve_tracker_source(state, source.clone(), preferences, download_index).await?
     {
@@ -1203,7 +1228,7 @@ async fn resolve_source(
     let reason = if source.id.starts_with("trumped:") {
         "No matching release is currently available on a configured tracker"
     } else {
-        "No matching Album or EP is currently available on a configured tracker"
+        "No matching long-form release is currently available on a configured tracker"
     };
     Ok(unresolved_item(
         source,
@@ -1222,25 +1247,76 @@ async fn resolve_tracker_source(
     if source.id.starts_with("trumped:") {
         return resolve_trumped_tracker_source(state, source, preferences, download_index).await;
     }
-    let mut groups = Vec::new();
-    let mut queries = vec![source.title.clone()];
-    if let Some(base) = base_edition_title(&source.title)
-        && !queries
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(&base))
+    let alias_titles = title_aliases(&source.title)
+        .into_iter()
+        .map(|alias| normalized(&alias.title))
+        .collect::<Vec<_>>();
+    let mut cached_matches = state
+        .db
+        .external_release_candidates(&alias_titles)
+        .await?
+        .into_iter()
+        .filter(|release| is_long_form_release(release.release_type.as_deref()))
+        .filter_map(|release| {
+            let score = external_match_score(
+                &source.title,
+                &source.artist,
+                source.year,
+                &release.title,
+                release.artist.as_deref(),
+                release.year,
+                release.release_type.as_deref(),
+            )
+            .score;
+            (score >= REVIEW_THRESHOLD).then_some((score, release))
+        })
+        .collect::<Vec<_>>();
+    cached_matches.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
+    if let Some((best_score, best)) = cached_matches.first()
+        && let Some(release_id) = best.id
     {
-        queries.push(base);
+        let close_runner_up = cached_matches.get(1).is_some_and(|(score, release)| {
+            release.id != best.id && best_score - score < AUTO_MERGE_MARGIN
+        });
+        if *best_score >= AUTO_MERGE_THRESHOLD && !close_runner_up {
+            let item = resolve_release_with_index(
+                state,
+                source.clone(),
+                release_id,
+                preferences,
+                download_index,
+            )
+            .await?;
+            persist_external_source_link(state, &source, release_id, "auto", Some(*best_score))
+                .await?;
+            return Ok(Some(item));
+        }
+        return Ok(Some(ambiguous_item(
+            source,
+            "A cached canonical release match needs confirmation",
+            cached_matches
+                .into_iter()
+                .take(6)
+                .map(|(_, release)| release)
+                .collect(),
+        )));
     }
+    let mut groups = Vec::new();
+    let queries = title_aliases(&source.title);
     let mut tracker_errors = Vec::new();
     let mut unavailable_error = None;
     let mut successful_lookups = 0usize;
     for (name, tracker) in &state.trackers {
         for query in &queries {
             let request = SearchRequest {
-                query: tracker_query_title(query),
+                query: tracker_query_title(&query.title),
                 artist: Some(source.artist.clone()),
                 release_type: None,
-                year: source.year,
+                year: if query.kind == crate::release_matcher::TitleAliasKind::Edition {
+                    None
+                } else {
+                    source.year
+                },
                 format: None,
                 encoding: None,
                 media: None,
@@ -1254,11 +1330,11 @@ async fn resolve_tracker_source(
                     successful_lookups += 1;
                     cache_search_canonical(&state.db, name, &page).await?;
                     assign_search_ids(&state.db, &mut page).await?;
-                    groups.extend(page.groups.into_iter().filter(|group| {
-                        group.release_type.as_deref().is_some_and(|value| {
-                            value.eq_ignore_ascii_case("album") || value.eq_ignore_ascii_case("ep")
-                        })
-                    }));
+                    groups.extend(
+                        page.groups
+                            .into_iter()
+                            .filter(|group| is_long_form_release(group.release_type.as_deref())),
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(tracker = name, %error, "channel tracker lookup failed");
@@ -1276,7 +1352,7 @@ async fn resolve_tracker_source(
     let mut matches = groups
         .into_iter()
         .filter_map(|group| {
-            let score = external_score(
+            let score = external_match_score(
                 &source.title,
                 &source.artist,
                 source.year,
@@ -1284,8 +1360,9 @@ async fn resolve_tracker_source(
                 group.artist.as_deref(),
                 group.year,
                 group.release_type.as_deref(),
-            );
-            (score >= AUTO_MERGE_THRESHOLD).then_some((score, group))
+            )
+            .score;
+            (score >= REVIEW_THRESHOLD).then_some((score, group))
         })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
@@ -1300,7 +1377,7 @@ async fn resolve_tracker_source(
     };
     if let Some((second_score, second)) = matches.get(1)
         && best.id != second.id
-        && best_score - second_score < 0.03
+        && best_score - second_score < AUTO_MERGE_MARGIN
     {
         return Ok(Some(ambiguous_item(
             source,
@@ -1308,12 +1385,73 @@ async fn resolve_tracker_source(
             nearby_candidates(&matches, best_score),
         )));
     }
+    if best_score < AUTO_MERGE_THRESHOLD {
+        return Ok(Some(ambiguous_item(
+            source,
+            "A possible tracker release needs confirmation",
+            nearby_candidates(&matches, best_score),
+        )));
+    }
     let release_id = best
         .id
         .context("matched tracker release has no canonical id")?;
-    resolve_release_with_index(state, source, release_id, preferences, download_index)
+    let item = resolve_release_with_index(
+        state,
+        source.clone(),
+        release_id,
+        preferences,
+        download_index,
+    )
+    .await?;
+    persist_external_source_link(state, &source, release_id, "auto", Some(best_score)).await?;
+    Ok(Some(item))
+}
+
+fn external_source_identity(source: &RecommendationSource) -> Option<(&str, &str, String)> {
+    let (provider, source_key) = source.id.split_once(':')?;
+    if !matches!(provider, "apple" | "lastfm") || source_key.is_empty() {
+        return None;
+    }
+    let value = serde_json::to_vec(&(
+        crate::release_matcher::MATCHER_VERSION,
+        normalized(&source.artist),
+        normalized(&source.title),
+        source.year,
+        source
+            .substituted_from
+            .as_ref()
+            .map(|value| (normalized(&value.title), normalized(&value.release_type))),
+    ))
+    .ok()?;
+    Some((provider, source_key, hex::encode(Sha256::digest(value))))
+}
+
+pub async fn persist_external_source_link(
+    state: &AppState,
+    source: &RecommendationSource,
+    release_id: uuid::Uuid,
+    decision: &str,
+    score: Option<f64>,
+) -> Result<()> {
+    let Some((provider, source_key, fingerprint)) = external_source_identity(source) else {
+        return Ok(());
+    };
+    state
+        .db
+        .put_external_release_link(
+            provider,
+            source_key,
+            release_id,
+            decision,
+            &fingerprint,
+            score,
+            serde_json::json!({
+                "artist": source.artist,
+                "title": source.title,
+                "year": source.year,
+            }),
+        )
         .await
-        .map(Some)
 }
 
 async fn resolve_trumped_tracker_source(
@@ -1889,39 +2027,12 @@ fn tracker_query_title(value: &str) -> Option<String> {
         .then(|| value.to_owned())
 }
 
+#[cfg(test)]
 fn base_edition_title(title: &str) -> Option<String> {
-    const SUFFIXES: [&str; 22] = [
-        " (super deluxe edition)",
-        " (super deluxe)",
-        " (deluxe edition)",
-        " (deluxe)",
-        " (expanded edition)",
-        " (expanded)",
-        " (extended edition)",
-        " (extended)",
-        " (anniversary edition)",
-        " (bonus track version)",
-        " [super deluxe]",
-        " [deluxe edition]",
-        " [deluxe]",
-        " [expanded edition]",
-        " [expanded]",
-        " - super deluxe edition",
-        " - deluxe edition",
-        " - expanded edition",
-        ": super deluxe edition",
-        ": deluxe edition",
-        ": expanded edition",
-        " deluxe",
-    ];
-    let trimmed = title.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    SUFFIXES.iter().find_map(|suffix| {
-        lower
-            .strip_suffix(suffix)
-            .map(|base| trimmed[..base.len()].trim().to_owned())
-            .filter(|base| !base.is_empty())
-    })
+    title_aliases(title)
+        .into_iter()
+        .find(|alias| alias.kind == crate::release_matcher::TitleAliasKind::Edition)
+        .map(|alias| alias.title)
 }
 
 #[derive(Debug, Clone)]
@@ -2178,11 +2289,9 @@ async fn resolve_release_with_index(
         .await?
         .context("canonical release detail is unavailable")?;
     if !source.id.starts_with("trumped:")
-        && !detail.release.release_type.as_deref().is_some_and(|value| {
-            value.eq_ignore_ascii_case("album") || value.eq_ignore_ascii_case("ep")
-        })
+        && !is_long_form_release(detail.release.release_type.as_deref())
     {
-        bail!("only Album and EP releases can be attached to a channel pack");
+        bail!("only long-form releases can be attached to a channel pack");
     }
     let mut variants = detail.variants;
     if let Some(tracker) = trumped_tracker {
@@ -2316,6 +2425,9 @@ async fn resolve_release_with_index(
         reason,
         job_id: None,
         job: None,
+        acquisition: None,
+        disposition: Default::default(),
+        selectable: false,
     })
 }
 
@@ -2686,6 +2798,9 @@ fn unresolved_item(
         reason: Some(reason.into()),
         job_id: None,
         job: None,
+        acquisition: None,
+        disposition: Default::default(),
+        selectable: false,
     }
 }
 
@@ -2708,6 +2823,9 @@ fn ambiguous_item(
         reason: Some(reason.into()),
         job_id: None,
         job: None,
+        acquisition: None,
+        disposition: Default::default(),
+        selectable: false,
     }
 }
 
@@ -3414,6 +3532,9 @@ mod tests {
                 reason: None,
                 job_id: None,
                 job: None,
+                acquisition: None,
+                disposition: Default::default(),
+                selectable: false,
             }
         }
 

@@ -16,6 +16,8 @@ function item(
     variants: [],
     candidates: [],
     downloads: [],
+    disposition: planState === "executable" ? "actionable" : "review",
+    selectable: planState === "executable",
     planState,
     plan: planState === "executable"
       ? {
@@ -41,15 +43,33 @@ describe("channel pack selection", () => {
 
   it("includes accepted replacement watchers and cleanup-only actions", () => {
     const waiting = item(2, "already_downloading");
+    waiting.disposition = "waiting";
+    waiting.selectable = true;
     waiting.replacement = {
       tracker: "ops", torrentId: 20, state: "downloading", downloads: []
     };
     const cleanup = item(3, "cleanup_ready");
+    cleanup.disposition = "cleanup";
+    cleanup.selectable = true;
     cleanup.replacement = {
       tracker: "ops", torrentId: 30, state: "complete", downloads: []
     };
     expect([...executableOrdinals([item(1, "already_downloading"), waiting, cleanup])])
       .toEqual([2, 3]);
+  });
+
+  it("does not select a planned item once acquisition is downloading", () => {
+    const downloading = item(1, "executable");
+    downloading.acquisition = {
+      scope: "release",
+      phase: "downloading",
+      jobIds: [],
+      downloads: [],
+      updatedAt: "2026-08-29T00:00:00Z"
+    };
+    downloading.disposition = "waiting";
+    downloading.selectable = false;
+    expect([...executableOrdinals([downloading])]).toEqual([]);
   });
 
   it("summarizes only the approved subset", () => {

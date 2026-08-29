@@ -727,6 +727,27 @@ export type ChannelPackItem = {
   variants: TorrentVariant[];
   candidates: ReleaseSummary[];
   downloads: ReleaseDownload[];
+  acquisition?: {
+    scope: "release" | "exact_variant";
+    phase:
+      | "missing"
+      | "queued"
+      | "downloading"
+      | "downloaded"
+      | "importing"
+      | "owned"
+      | "needs_review"
+      | "failed";
+    releaseId?: string;
+    tracker?: string;
+    torrentId?: number;
+    jobIds: string[];
+    downloads: ReleaseDownload[];
+    reason?: string;
+    updatedAt: string;
+  };
+  disposition: "actionable" | "waiting" | "cleanup" | "review" | "resolved";
+  selectable: boolean;
   planState:
     | "executable"
     | "cleanup_ready"

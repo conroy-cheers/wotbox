@@ -20,8 +20,9 @@ use crate::{
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
         channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
         download_client_scan, download_event, download_job, download_release_link,
-        import_supersession, import_task, match_candidate, provider_state, release_source,
-        release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
+        external_release_link, import_supersession, import_task, match_candidate, provider_state,
+        release_source, release_track_index, runtime_preference, single_album_coverage,
+        tracker_snapshot,
     },
     migration::Migrator,
     model::{
@@ -1644,6 +1645,93 @@ impl Database {
         Ok(())
     }
 
+    pub async fn external_release_link(
+        &self,
+        provider: &str,
+        source_key: &str,
+        identity_fingerprint: &str,
+    ) -> Result<Option<Uuid>> {
+        let Some(link) = external_release_link::Entity::find_by_id((
+            provider.to_ascii_lowercase(),
+            source_key.to_owned(),
+        ))
+        .one(&self.connection)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let reusable = link.decision == "manual"
+            || (link.decision == "auto"
+                && link.matcher_version == crate::release_matcher::MATCHER_VERSION
+                && link.identity_fingerprint == identity_fingerprint);
+        reusable
+            .then(|| Uuid::parse_str(&link.release_id))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn external_release_candidates(
+        &self,
+        normalized_titles: &[String],
+    ) -> Result<Vec<ReleaseSummary>> {
+        if normalized_titles.is_empty() {
+            return Ok(Vec::new());
+        }
+        canonical_release::Entity::find()
+            .filter(canonical_release::Column::NormalizedTitle.is_in(normalized_titles.to_vec()))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|model| cached_release_from_model(model).map(|cached| cached.value))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_external_release_link(
+        &self,
+        provider: &str,
+        source_key: &str,
+        release_id: Uuid,
+        decision: &str,
+        identity_fingerprint: &str,
+        score: Option<f64>,
+        evidence_json: Value,
+    ) -> Result<()> {
+        let provider = provider.to_ascii_lowercase();
+        let now = Utc::now().to_rfc3339();
+        if let Some(model) =
+            external_release_link::Entity::find_by_id((provider.clone(), source_key.to_owned()))
+                .one(&self.connection)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.release_id = Set(release_id.to_string());
+            active.decision = Set(decision.to_owned());
+            active.matcher_version = Set(crate::release_matcher::MATCHER_VERSION);
+            active.identity_fingerprint = Set(identity_fingerprint.to_owned());
+            active.score = Set(score);
+            active.evidence_json = Set(evidence_json);
+            active.updated_at = Set(now);
+            active.update(&self.connection).await?;
+        } else {
+            external_release_link::ActiveModel {
+                provider: Set(provider),
+                source_key: Set(source_key.to_owned()),
+                release_id: Set(release_id.to_string()),
+                decision: Set(decision.to_owned()),
+                matcher_version: Set(crate::release_matcher::MATCHER_VERSION),
+                identity_fingerprint: Set(identity_fingerprint.to_owned()),
+                score: Set(score),
+                evidence_json: Set(evidence_json),
+                created_at: Set(now.clone()),
+                updated_at: Set(now),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn release_download_flags(&self, release_id: Uuid) -> Result<(bool, bool)> {
         let links = download_release_link::Entity::find()
             .filter(download_release_link::Column::ReleaseId.eq(release_id.to_string()))
@@ -1654,6 +1742,33 @@ impl Database {
             .iter()
             .any(|link| link.present && link.library_added_at.is_none());
         Ok((owned, downloading))
+    }
+
+    pub async fn import_states_for_releases(
+        &self,
+        release_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ImportTaskState>>> {
+        if release_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let models = import_task::Entity::find()
+            .filter(
+                import_task::Column::ReleaseId
+                    .is_in(release_ids.iter().map(Uuid::to_string).collect::<Vec<_>>()),
+            )
+            .all(&self.connection)
+            .await?;
+        let mut states = HashMap::new();
+        for model in models {
+            let Some(release_id) = model.release_id else {
+                continue;
+            };
+            states
+                .entry(Uuid::parse_str(&release_id)?)
+                .or_insert_with(Vec::new)
+                .push(parse_import_task_state(&model.state)?);
+        }
+        Ok(states)
     }
 
     pub async fn list_unlinked_downloads(&self) -> Result<Vec<UnlinkedDownload>> {
@@ -6352,6 +6467,7 @@ mod tests {
         ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
     };
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use crate::{
         entity::{
@@ -7447,6 +7563,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_release_links_reuse_manual_decisions_and_invalidate_stale_auto_decisions() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        let release_id = Uuid::new_v4();
+        db.put_external_release_link(
+            "apple",
+            "42",
+            release_id,
+            "auto",
+            "current",
+            Some(0.93),
+            serde_json::json!({"alias": "edition"}),
+        )
+        .await
+        .expect("put auto link");
+        assert_eq!(
+            db.external_release_link("apple", "42", "current")
+                .await
+                .expect("current link"),
+            Some(release_id)
+        );
+        assert_eq!(
+            db.external_release_link("apple", "42", "changed")
+                .await
+                .expect("stale link"),
+            None
+        );
+
+        db.put_external_release_link(
+            "apple",
+            "42",
+            release_id,
+            "manual",
+            "old identity",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("put manual link");
+        assert_eq!(
+            db.external_release_link("apple", "42", "changed again")
+                .await
+                .expect("manual link"),
+            Some(release_id)
+        );
+    }
+
+    #[tokio::test]
     async fn persists_channel_configuration_and_immutable_pack_items() {
         let directory = tempdir().expect("temporary directory");
         let db = Database::open(&directory.path().join("wotbox.sqlite"))
@@ -7497,6 +7663,9 @@ mod tests {
             reason: Some("Unavailable".into()),
             job_id: None,
             job: None,
+            acquisition: None,
+            disposition: Default::default(),
+            selectable: false,
         };
         let id = db
             .create_channel_pack("country_chart", "AU Top 100", false, "fingerprint", &[item])

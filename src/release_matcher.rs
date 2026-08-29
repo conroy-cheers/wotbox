@@ -6,12 +6,160 @@ use crate::model::{
     ReleaseDetail, ReleaseSource, ReleaseSummary, SearchGroup, decode_tracker_text,
 };
 
-pub const MATCHER_VERSION: i32 = 3;
+pub const MATCHER_VERSION: i32 = 4;
 pub const AUTO_MERGE_THRESHOLD: f64 = 0.88;
 pub const AUTO_MERGE_MARGIN: f64 = 0.035;
 pub const REVIEW_THRESHOLD: f64 = 0.80;
 pub const DOWNLOAD_MATCH_THRESHOLD: f64 = 0.90;
 pub const DOWNLOAD_MATCH_MARGIN: f64 = 0.035;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseClass {
+    LongForm,
+    Single,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleAliasKind {
+    Exact,
+    Edition,
+    Subtitle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TitleAlias {
+    pub title: String,
+    pub kind: TitleAliasKind,
+    pub penalty: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExternalMatchScore {
+    pub score: f64,
+    pub alias_kind: TitleAliasKind,
+}
+
+pub fn release_class(value: Option<&str>) -> ReleaseClass {
+    match value.map(normalized).as_deref() {
+        Some(
+            "album" | "ep" | "soundtrack" | "anthology" | "compilation" | "sampler" | "live album"
+            | "split" | "remix" | "bootleg" | "mixtape" | "dj mix" | "concert recording",
+        ) => ReleaseClass::LongForm,
+        Some("single") => ReleaseClass::Single,
+        _ => ReleaseClass::Other,
+    }
+}
+
+pub fn is_long_form_release(value: Option<&str>) -> bool {
+    release_class(value) == ReleaseClass::LongForm
+}
+
+pub fn title_aliases(title: &str) -> Vec<TitleAlias> {
+    let title = title.trim();
+    let mut aliases = vec![TitleAlias {
+        title: title.to_owned(),
+        kind: TitleAliasKind::Exact,
+        penalty: 0.0,
+    }];
+    if let Some(base) = strip_packaging_qualifier(title) {
+        push_alias(&mut aliases, base, TitleAliasKind::Edition, 0.02);
+    }
+    for separator in [": ", " - ", " – ", " — "] {
+        if let Some((base, subtitle)) = title.split_once(separator)
+            && base.split_whitespace().count() >= 2
+            && subtitle.split_whitespace().count() >= 2
+            && !contains_protected_intent(subtitle)
+        {
+            push_alias(
+                &mut aliases,
+                base.trim().to_owned(),
+                TitleAliasKind::Subtitle,
+                0.06,
+            );
+        }
+    }
+    aliases
+}
+
+fn push_alias(aliases: &mut Vec<TitleAlias>, title: String, kind: TitleAliasKind, penalty: f64) {
+    if !title.is_empty()
+        && !aliases
+            .iter()
+            .any(|known| normalized(&known.title) == normalized(&title))
+    {
+        aliases.push(TitleAlias {
+            title,
+            kind,
+            penalty,
+        });
+    }
+}
+
+fn strip_packaging_qualifier(title: &str) -> Option<String> {
+    const SUFFIXES: [&str; 34] = [
+        " (super deluxe edition)",
+        " (super deluxe)",
+        " (deluxe edition)",
+        " (deluxe)",
+        " (expanded edition)",
+        " (expanded)",
+        " (extended edition)",
+        " (extended)",
+        " (anniversary edition)",
+        " (bonus track version)",
+        " (remastered)",
+        " (remaster)",
+        " (reissue)",
+        " (special edition)",
+        " (collector's edition)",
+        " [super deluxe]",
+        " [deluxe edition]",
+        " [deluxe]",
+        " [expanded edition]",
+        " [expanded]",
+        " - super deluxe edition",
+        " - deluxe edition",
+        " - expanded edition",
+        " - extended edition",
+        " - anniversary edition",
+        " - bonus track version",
+        " - remastered",
+        " - reissue",
+        ": super deluxe edition",
+        ": deluxe edition",
+        ": expanded edition",
+        ": special edition",
+        " deluxe",
+        " expanded",
+    ];
+    if contains_protected_intent(title) {
+        return None;
+    }
+    let lower = title.to_ascii_lowercase();
+    SUFFIXES.iter().find_map(|suffix| {
+        lower
+            .strip_suffix(suffix)
+            .map(|base| title[..base.len()].trim().to_owned())
+            .filter(|base| !base.is_empty())
+    })
+}
+
+fn contains_protected_intent(value: &str) -> bool {
+    let value = format!(" {} ", normalized(value));
+    [
+        " live ",
+        " remix ",
+        " acoustic ",
+        " instrumental ",
+        " karaoke ",
+        " rerecorded ",
+        " re recorded ",
+        " taylor s version ",
+    ]
+    .iter()
+    .any(|intent| value.contains(intent))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadReleaseIdentity {
@@ -195,16 +343,70 @@ pub fn external_score(
     tracker_year: Option<i64>,
     tracker_type: Option<&str>,
 ) -> f64 {
-    identity_score(
+    external_match_score(
         source_title,
-        Some(source_artist),
+        source_artist,
         source_year,
-        None,
         tracker_title,
         tracker_artist,
         tracker_year,
         tracker_type,
     )
+    .score
+}
+
+pub fn external_match_score(
+    source_title: &str,
+    source_artist: &str,
+    source_year: Option<i64>,
+    tracker_title: &str,
+    tracker_artist: Option<&str>,
+    tracker_year: Option<i64>,
+    tracker_type: Option<&str>,
+) -> ExternalMatchScore {
+    let compilation_artist = tracker_artist.is_some_and(|artist| {
+        normalized(artist) == "various artists"
+            && is_long_form_release(tracker_type)
+            && source_year == tracker_year
+            && normalized(source_title) == normalized(tracker_title)
+            && source_artist
+                .split(['&', ',', '/', ';'])
+                .filter(|part| !part.trim().is_empty())
+                .count()
+                > 1
+    });
+    title_aliases(source_title)
+        .into_iter()
+        .map(|alias| {
+            let mut score = identity_score_with_policy(
+                &alias.title,
+                Some(source_artist),
+                source_year,
+                None,
+                tracker_title,
+                tracker_artist,
+                tracker_year,
+                tracker_type,
+                alias.kind == TitleAliasKind::Edition,
+                compilation_artist,
+            ) - alias.penalty;
+            if alias.kind == TitleAliasKind::Subtitle && source_year != tracker_year {
+                score = 0.0;
+            }
+            ExternalMatchScore {
+                score: score.max(0.0),
+                alias_kind: alias.kind,
+            }
+        })
+        .max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(Ordering::Equal)
+        })
+        .unwrap_or(ExternalMatchScore {
+            score: 0.0,
+            alias_kind: TitleAliasKind::Exact,
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,10 +420,41 @@ fn identity_score(
     right_year: Option<i64>,
     right_type: Option<&str>,
 ) -> f64 {
+    identity_score_with_policy(
+        left_title,
+        left_artist,
+        left_year,
+        left_type,
+        right_title,
+        right_artist,
+        right_year,
+        right_type,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn identity_score_with_policy(
+    left_title: &str,
+    left_artist: Option<&str>,
+    left_year: Option<i64>,
+    left_type: Option<&str>,
+    right_title: &str,
+    right_artist: Option<&str>,
+    right_year: Option<i64>,
+    right_type: Option<&str>,
+    edition_year_flexible: bool,
+    compilation_artist: bool,
+) -> f64 {
     let title = title_similarity(left_title, right_title);
-    let artist = match (left_artist, right_artist) {
-        (Some(left), Some(right)) => artist_similarity(left, right),
-        _ => 0.5,
+    let artist = if compilation_artist {
+        0.94
+    } else {
+        match (left_artist, right_artist) {
+            (Some(left), Some(right)) => artist_similarity(left, right),
+            _ => 0.5,
+        }
     };
     let release_type = match (left_type, right_type) {
         (Some(left), Some(right)) if normalized(left) == normalized(right) => 1.0,
@@ -237,6 +470,7 @@ fn identity_score(
         (Some(left), Some(right)) if left == right => 1.0,
         (Some(left), Some(right)) if (left - right).abs() <= 1 => 0.7,
         (None, _) | (_, None) => 0.5,
+        (Some(_), Some(_)) if edition_year_flexible => 0.5,
         _ => 0.0,
     };
     let generic_artist = [left_artist, right_artist]
@@ -255,7 +489,9 @@ fn identity_score(
     if (generic_artist || generic_title) && left_year != right_year {
         return 0.0;
     }
-    if matches!((left_year, right_year), (Some(left), Some(right)) if (left - right).abs() > 2) {
+    if !edition_year_flexible
+        && matches!((left_year, right_year), (Some(left), Some(right)) if (left - right).abs() > 2)
+    {
         return 0.0;
     }
     title * 0.52 + artist * 0.30 + release_type * 0.10 + year * 0.08
@@ -669,8 +905,10 @@ mod tests {
     use crate::model::{ReleaseSummary, SearchGroup};
 
     use super::{
-        AUTO_MERGE_THRESHOLD, DownloadMatchResult, external_score, group_score,
-        match_download_release, normalized, parse_download_release_name,
+        AUTO_MERGE_THRESHOLD, DownloadMatchResult, ReleaseClass, TitleAliasKind,
+        external_match_score, external_score, group_score, is_long_form_release,
+        match_download_release, normalized, parse_download_release_name, release_class,
+        title_aliases,
     };
 
     #[derive(Clone, Deserialize)]
@@ -779,6 +1017,104 @@ mod tests {
                 Some("Album"),
             ) < AUTO_MERGE_THRESHOLD
         );
+        assert!(
+            external_score(
+                "Greatest Hits (Deluxe Edition)",
+                "Various Artists",
+                Some(2024),
+                "Greatest Hits",
+                Some("Various Artists"),
+                Some(2004),
+                Some("Compilation"),
+            ) < AUTO_MERGE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn recommendation_aliases_cover_editions_and_subtitles_but_preserve_intent() {
+        assert_eq!(
+            title_aliases("Short n' Sweet (Deluxe Edition)")
+                .into_iter()
+                .map(|alias| (alias.title, alias.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Short n' Sweet (Deluxe Edition)".into(),
+                    TitleAliasKind::Exact
+                ),
+                ("Short n' Sweet".into(), TitleAliasKind::Edition),
+            ]
+        );
+        assert!(
+            title_aliases("The Great Divide: The Last Of The Bugs")
+                .iter()
+                .any(|alias| alias.title == "The Great Divide"
+                    && alias.kind == TitleAliasKind::Subtitle)
+        );
+        for protected in [
+            "Folklore: The Long Pond Studio Sessions (Live)",
+            "Red (Taylor's Version)",
+            "Album (Acoustic)",
+            "Album - Instrumental",
+        ] {
+            assert_eq!(title_aliases(protected).len(), 1, "{protected}");
+        }
+    }
+
+    #[test]
+    fn external_matching_accepts_safe_variants_conservatively() {
+        let noah = external_match_score(
+            "The Great Divide: The Last Of The Bugs",
+            "Noah Kahan",
+            Some(2026),
+            "The Great Divide",
+            Some("Noah Kahan"),
+            Some(2026),
+            Some("Album"),
+        );
+        assert_eq!(noah.alias_kind, TitleAliasKind::Subtitle);
+        assert!(noah.score >= AUTO_MERGE_THRESHOLD, "{}", noah.score);
+
+        let deluxe = external_match_score(
+            "Jolene (Deluxe Edition)",
+            "Dolly Parton",
+            Some(2024),
+            "Jolene",
+            Some("Dolly Parton"),
+            Some(1974),
+            Some("Album"),
+        );
+        assert_eq!(deluxe.alias_kind, TitleAliasKind::Edition);
+        assert!(deluxe.score >= AUTO_MERGE_THRESHOLD, "{}", deluxe.score);
+
+        assert!(
+            external_score(
+                "Greatest Hits",
+                "Various Artists",
+                Some(2024),
+                "Greatest Hits",
+                Some("Various Artists"),
+                Some(2004),
+                Some("Compilation"),
+            ) < AUTO_MERGE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn release_classes_are_shared_and_explicit() {
+        for value in [
+            "Album",
+            "EP",
+            "Anthology",
+            "Compilation",
+            "Mixtape",
+            "DJ Mix",
+            "Soundtrack",
+        ] {
+            assert!(is_long_form_release(Some(value)), "{value}");
+        }
+        assert_eq!(release_class(Some("Single")), ReleaseClass::Single);
+        assert_eq!(release_class(Some("Interview")), ReleaseClass::Other);
     }
 
     #[test]

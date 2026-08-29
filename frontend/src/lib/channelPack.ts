@@ -3,10 +3,7 @@ import type { ChannelPackItem, ChannelPlanSummary } from "./api";
 export function executableOrdinals(items: ChannelPackItem[]): Set<number> {
   return new Set(
     items
-      .filter((item) =>
-        item.planState === "executable"
-        || (Boolean(item.replacement)
-          && ["cleanup_ready", "already_downloading"].includes(item.planState)))
+      .filter((item) => item.selectable)
       .map((item) => item.ordinal)
   );
 }
@@ -25,10 +22,7 @@ export function summarizeSelection(
   };
   for (const item of items) {
     if (!selected.has(item.ordinal)) continue;
-    const actionable = item.planState === "executable"
-      || (Boolean(item.replacement)
-        && ["cleanup_ready", "already_downloading"].includes(item.planState));
-    if (!actionable) continue;
+    if (!item.selectable) continue;
     summary.executable++;
     summary.skipped--;
     summary.totalSize += item.plan?.size ?? 0;

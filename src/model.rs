@@ -1664,6 +1664,57 @@ pub enum PackItemPlanState {
     Submitted,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionScope {
+    Release,
+    ExactVariant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionPhase {
+    Missing,
+    Queued,
+    Downloading,
+    Downloaded,
+    Importing,
+    Owned,
+    NeedsReview,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionState {
+    pub scope: AcquisitionScope,
+    pub phase: AcquisitionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent_id: Option<i64>,
+    #[serde(default)]
+    pub job_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub downloads: Vec<ReleaseDownload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PackItemDisposition {
+    Actionable,
+    Waiting,
+    Cleanup,
+    #[default]
+    Review,
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationSource {
@@ -1784,6 +1835,12 @@ pub struct ChannelPackItem {
     pub job_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<DownloadJob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquisition: Option<AcquisitionState>,
+    #[serde(default)]
+    pub disposition: PackItemDisposition,
+    #[serde(default)]
+    pub selectable: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]

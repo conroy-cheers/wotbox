@@ -8,9 +8,10 @@ use crate::entity::{
     artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
     canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
     channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
-    download_client_scan, download_event, download_job, download_release_link, import_supersession,
-    import_task, match_candidate, provider_state, release_source, release_track_index,
-    runtime_preference, single_album_coverage, tracker_snapshot,
+    download_client_scan, download_event, download_job, download_release_link,
+    external_release_link, import_supersession, import_task, match_candidate, provider_state,
+    release_source, release_track_index, runtime_preference, single_album_coverage,
+    tracker_snapshot,
 };
 
 pub struct Migrator;
@@ -32,7 +33,39 @@ impl MigratorTrait for Migrator {
             Box::new(ImportQueueSchema),
             Box::new(ChannelProviderWaitSchema),
             Box::new(CanonicalReleaseReconciliationSchema),
+            Box::new(ExternalReleaseLinksSchema),
         ]
+    }
+}
+
+struct ExternalReleaseLinksSchema;
+
+impl MigrationName for ExternalReleaseLinksSchema {
+    fn name(&self) -> &str {
+        "m20260829_000014_external_release_links"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ExternalReleaseLinksSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, external_release_link::Entity).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_external_release_links_release_id")
+                    .table(external_release_link::Entity)
+                    .col(external_release_link::Column::ReleaseId)
+                    .to_owned(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

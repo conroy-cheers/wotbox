@@ -4,6 +4,7 @@
   import { untrack } from "svelte";
   import {
     api,
+    ApiError,
     appPath,
     formatBytes,
     type ChannelBatchResult,
@@ -68,6 +69,12 @@
       queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] });
       queryClient.invalidateQueries({ queryKey: ["channels-overview"] });
       queryClient.invalidateQueries({ queryKey: ["downloads"] });
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === "pack_state_changed") {
+        selectedOrdinals = new Set();
+        queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] });
+      }
     }
   });
   const selectedSummary = $derived(
@@ -102,17 +109,11 @@
   }
 
   function itemView(item: ChannelPack["items"][number]): PackView {
-    if (item.planState === "cleanup_ready") return "cleanup";
-    if (item.planState === "already_downloading" || (item.job && item.job.state !== "complete" && item.job.state !== "failed")) return "waiting";
-    if (item.planState === "executable") return "actionable";
-    if (["already_owned", "excluded", "submitted"].includes(item.planState) || item.job?.state === "complete") return "resolved";
-    return "review";
+    return item.disposition;
   }
 
   function selectable(item: ChannelPack["items"][number]): boolean {
-    return item.planState === "executable"
-      || (Boolean(item.replacement)
-        && ["cleanup_ready", "already_downloading"].includes(item.planState));
+    return item.selectable;
   }
 
   function visibleItems(current: ChannelPack): ChannelPack["items"] {
@@ -322,6 +323,9 @@
               {#if !item.release}
                 <a href={`${searchPath(item.source.artist, item.source.title)}&pack=${current.id}&item=${item.ordinal}&version=${current.planVersion}`}>Search and attach</a>
               {/if}
+            {/if}
+            {#if current.decision === "open" && item.release}
+              <a href={`${searchPath(item.source.artist, item.source.title)}&pack=${current.id}&item=${item.ordinal}&version=${current.planVersion}`}>Change match</a>
             {/if}
           </div>
         </div>

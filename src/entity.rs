@@ -232,6 +232,33 @@ pub mod release_source {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod external_release_link {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "external_release_links")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub provider: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_key: String,
+        pub release_id: String,
+        pub decision: String,
+        pub matcher_version: i32,
+        pub identity_fingerprint: String,
+        pub score: Option<f64>,
+        #[sea_orm(column_type = "Json")]
+        pub evidence_json: Json,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod canonical_artist {
     use sea_orm::entity::prelude::*;
 
