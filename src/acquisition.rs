@@ -68,7 +68,11 @@ pub fn disposition(
     }
 }
 
-pub fn project_channel_item(item: &mut ChannelPackItem, import_states: &[ImportTaskState]) {
+pub fn project_channel_item(
+    item: &mut ChannelPackItem,
+    import_states: &[ImportTaskState],
+    release_flags: (bool, bool),
+) {
     let release_id = item.release.as_ref().and_then(|release| release.id);
     let scope = if item.replacement.is_some() {
         AcquisitionScope::ExactVariant
@@ -81,7 +85,8 @@ pub fn project_channel_item(item: &mut ChannelPackItem, import_states: &[ImportT
     );
     let signals = AcquisitionSignals {
         owned: scope == AcquisitionScope::Release
-            && (item.downloads.iter().any(|download| download.in_library)
+            && (release_flags.0
+                || item.downloads.iter().any(|download| download.in_library)
                 || item.variants.iter().any(|variant| {
                     variant
                         .library
@@ -102,9 +107,10 @@ pub fn project_channel_item(item: &mut ChannelPackItem, import_states: &[ImportT
                 .as_ref()
                 .is_some_and(|job| job.state == DownloadState::Complete)
             || import_states.contains(&ImportTaskState::Complete),
-        downloading: downloads
-            .iter()
-            .any(|download| !download.in_library && download.live.progress < 1.0)
+        downloading: (scope == AcquisitionScope::Release && release_flags.1)
+            || downloads
+                .iter()
+                .any(|download| !download.in_library && download.live.progress < 1.0)
             || item.variants.iter().any(|variant| {
                 variant
                     .downloads

@@ -949,6 +949,7 @@ async fn project_pack_acquisition(
         .filter_map(|item| item.release.as_ref().and_then(|release| release.id))
         .collect::<Vec<_>>();
     let import_states = state.db.import_states_for_releases(&release_ids).await?;
+    let release_flags = state.db.release_download_flags_for(&release_ids).await?;
     let jobs = state.db.list_jobs().await?;
     pack.summary = Default::default();
     for item in &mut pack.items {
@@ -975,7 +976,10 @@ async fn project_pack_acquisition(
             .and_then(|release_id| import_states.get(&release_id))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        crate::acquisition::project_channel_item(item, states);
+        let flags = release_id
+            .and_then(|release_id| release_flags.get(&release_id).copied())
+            .unwrap_or((false, false));
+        crate::acquisition::project_channel_item(item, states, flags);
         if item.selectable {
             pack.summary.executable += 1;
             if let Some(plan) = &item.plan {

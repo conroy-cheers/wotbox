@@ -1744,6 +1744,34 @@ impl Database {
         Ok((owned, downloading))
     }
 
+    pub async fn release_download_flags_for(
+        &self,
+        release_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, (bool, bool)>> {
+        if release_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let links = download_release_link::Entity::find()
+            .filter(
+                download_release_link::Column::ReleaseId
+                    .is_in(release_ids.iter().map(Uuid::to_string).collect::<Vec<_>>()),
+            )
+            .all(&self.connection)
+            .await?;
+        let mut flags = HashMap::new();
+        for link in links {
+            let Some(release_id) = link.release_id.as_deref() else {
+                continue;
+            };
+            let entry = flags
+                .entry(Uuid::parse_str(release_id)?)
+                .or_insert((false, false));
+            entry.0 |= link.library_added_at.is_some();
+            entry.1 |= link.present && link.library_added_at.is_none();
+        }
+        Ok(flags)
+    }
+
     pub async fn import_states_for_releases(
         &self,
         release_ids: &[Uuid],
