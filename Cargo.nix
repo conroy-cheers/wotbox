@@ -1823,6 +1823,25 @@ rec {
         };
         resolvedDefaultFeatures = [ "std" ];
       };
+      "bytemuck" = rec {
+        crateName = "bytemuck";
+        version = "1.25.2";
+        edition = "2018";
+        sha256 = "15rp2m7j7kq22s76cbjwmrkd5r8lvacnm0mnrj013cnzka22x0wm";
+        authors = [
+          "Lokathor <zefria@gmail.com>"
+        ];
+        features = {
+          "bytemuck_derive" = [ "dep:bytemuck_derive" ];
+          "derive" = [ "bytemuck_derive" ];
+          "extern_crate_std" = [ "extern_crate_alloc" ];
+          "latest_stable_rust" = [ "aarch64_simd" "avx512_simd" "align_offset" "alloc_uninit" "const_zeroed" "derive" "impl_core_error" "min_const_generics" "must_cast" "must_cast_extra" "pod_saturating" "track_caller" "transparentwrapper_extra" "wasm_simd" "zeroable_atomics" "zeroable_maybe_uninit" "zeroable_unwind_fn" ];
+          "must_cast_extra" = [ "must_cast" ];
+          "nightly_portable_simd" = [ "rustversion" ];
+          "rustversion" = [ "dep:rustversion" ];
+        };
+        resolvedDefaultFeatures = [ "extern_crate_alloc" ];
+      };
       "byteorder" = rec {
         crateName = "byteorder";
         version = "1.5.0";
@@ -1835,6 +1854,17 @@ rec {
           "default" = [ "std" ];
         };
         resolvedDefaultFeatures = [ "std" ];
+      };
+      "byteorder-lite" = rec {
+        crateName = "byteorder-lite";
+        version = "0.1.0";
+        edition = "2021";
+        sha256 = "15alafmz4b9az56z6x7glcbcb6a8bfgyd109qc3bvx07zx4fj7wg";
+        libName = "byteorder_lite";
+        features = {
+          "default" = [ "std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
       };
       "bytes" = rec {
         crateName = "bytes";
@@ -2193,6 +2223,16 @@ rec {
         sha256 = "0yh22sqdvcdrfbhvnja4kaq5dyklpb4s70w5r6rplfdw4jna17hc";
         authors = [
           "RustCrypto Developers"
+        ];
+
+      };
+      "color_quant" = rec {
+        crateName = "color_quant";
+        version = "1.1.0";
+        edition = "2015";
+        sha256 = "12q1n427h2bbmmm1mnglr57jaz2dj9apk0plcxw7nwqiai7qjyrx";
+        authors = [
+          "nwin <nwin@users.noreply.github.com>"
         ];
 
       };
@@ -3254,6 +3294,22 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "default" "std" ];
       };
+      "fdeflate" = rec {
+        crateName = "fdeflate";
+        version = "0.3.7";
+        edition = "2021";
+        sha256 = "130ga18vyxbb5idbgi07njymdaavvk6j08yh1dfarm294ssm6s0y";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "simd-adler32";
+            packageId = "simd-adler32";
+          }
+        ];
+
+      };
       "find-msvc-tools" = rec {
         crateName = "find-msvc-tools";
         version = "0.1.9";
@@ -3980,6 +4036,31 @@ rec {
           "wasm_js" = [ "dep:wasm-bindgen" "dep:js-sys" ];
         };
         resolvedDefaultFeatures = [ "std" "sys_rng" "wasm_js" ];
+      };
+      "gif" = rec {
+        crateName = "gif";
+        version = "0.14.2";
+        edition = "2021";
+        sha256 = "0n81js7vlb9bwrjb765sicza3k0vrihjddrgm2mvpbfr272gr37f";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "color_quant";
+            packageId = "color_quant";
+            optional = true;
+          }
+          {
+            name = "weezl";
+            packageId = "weezl";
+          }
+        ];
+        features = {
+          "color_quant" = [ "dep:color_quant" ];
+          "default" = [ "raii_no_panic" "std" "color_quant" ];
+        };
+        resolvedDefaultFeatures = [ "color_quant" "default" "raii_no_panic" "std" ];
       };
       "glob" = rec {
         crateName = "glob";
@@ -5206,6 +5287,103 @@ rec {
         };
         resolvedDefaultFeatures = [ "compiled_data" ];
       };
+      "image" = rec {
+        crateName = "image";
+        version = "0.25.10";
+        edition = "2021";
+        sha256 = "0131b9fsd5grxf3lchfs2ci0rg8ga2mh1ygai7k2zh1k8cwq1aw5";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "bytemuck";
+            packageId = "bytemuck";
+            features = [ "extern_crate_alloc" ];
+          }
+          {
+            name = "byteorder-lite";
+            packageId = "byteorder-lite";
+          }
+          {
+            name = "color_quant";
+            packageId = "color_quant";
+            optional = true;
+          }
+          {
+            name = "gif";
+            packageId = "gif";
+            optional = true;
+          }
+          {
+            name = "image-webp";
+            packageId = "image-webp";
+            optional = true;
+          }
+          {
+            name = "moxcms";
+            packageId = "moxcms";
+          }
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+          }
+          {
+            name = "png";
+            packageId = "png";
+            optional = true;
+          }
+          {
+            name = "zune-core";
+            packageId = "zune-core";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "zune-jpeg";
+            packageId = "zune-jpeg";
+            optional = true;
+          }
+        ];
+        features = {
+          "avif" = [ "dep:ravif" "dep:rgb" ];
+          "avif-native" = [ "dep:mp4parse" "dep:dav1d" ];
+          "color_quant" = [ "dep:color_quant" ];
+          "default" = [ "rayon" "default-formats" ];
+          "default-formats" = [ "avif" "bmp" "dds" "exr" "ff" "gif" "hdr" "ico" "jpeg" "png" "pnm" "qoi" "tga" "tiff" "webp" ];
+          "exr" = [ "dep:exr" ];
+          "gif" = [ "dep:gif" "dep:color_quant" ];
+          "ico" = [ "bmp" "png" ];
+          "jpeg" = [ "dep:zune-core" "dep:zune-jpeg" ];
+          "nasm" = [ "ravif?/asm" ];
+          "png" = [ "dep:png" ];
+          "qoi" = [ "dep:qoi" ];
+          "rayon" = [ "dep:rayon" "ravif?/threading" "exr?/rayon" ];
+          "serde" = [ "dep:serde" ];
+          "tiff" = [ "dep:tiff" ];
+          "webp" = [ "dep:image-webp" ];
+        };
+        resolvedDefaultFeatures = [ "gif" "jpeg" "png" "webp" ];
+      };
+      "image-webp" = rec {
+        crateName = "image-webp";
+        version = "0.2.4";
+        edition = "2021";
+        sha256 = "1hz814csyi9283vinzlkix6qpnd6hs3fkw7xl6z2zgm4w7rrypjj";
+        libName = "image_webp";
+        dependencies = [
+          {
+            name = "byteorder-lite";
+            packageId = "byteorder-lite";
+          }
+          {
+            name = "quick-error";
+            packageId = "quick-error";
+          }
+        ];
+        features = {
+        };
+      };
       "include_dir" = rec {
         crateName = "include_dir";
         version = "0.7.4";
@@ -6160,7 +6338,7 @@ rec {
           "simd" = [ "simd-adler32" ];
           "simd-adler32" = [ "dep:simd-adler32" ];
         };
-        resolvedDefaultFeatures = [ "simd" "simd-adler32" "with-alloc" ];
+        resolvedDefaultFeatures = [ "default" "simd" "simd-adler32" "with-alloc" ];
       };
       "mio" = rec {
         crateName = "mio";
@@ -6196,6 +6374,45 @@ rec {
           "os-ext" = [ "os-poll" "windows-sys/Win32_System_Pipes" "windows-sys/Win32_Security" ];
         };
         resolvedDefaultFeatures = [ "net" "os-ext" "os-poll" ];
+      };
+      "moxcms" = rec {
+        crateName = "moxcms";
+        version = "0.8.1";
+        edition = "2024";
+        sha256 = "0jz4fd5f7pdn1rngqc96lxriqjkym1lswdhdbjr037s8p9ac31dv";
+        authors = [
+          "Radzivon Bartoshyk"
+        ];
+        dependencies = [
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+          }
+          {
+            name = "pxfm";
+            packageId = "pxfm";
+          }
+        ];
+        features = {
+          "any_to_any" = [ "lut" ];
+          "avx512_shaper_fixed_point_paths" = [ "avx512" ];
+          "avx512_shaper_optimized_paths" = [ "avx512" ];
+          "avx_luts" = [ "lut" "avx" ];
+          "avx_shaper_fixed_point_paths" = [ "avx" ];
+          "avx_shaper_optimized_paths" = [ "avx" ];
+          "avx_shaper_paths" = [ "avx" ];
+          "default" = [ "avx_shaper_paths" "sse_shaper_paths" "neon_shaper_paths" "avx_shaper_fixed_point_paths" "avx_luts" "sse_shaper_fixed_point_paths" "sse_luts" "neon_shaper_fixed_point_paths" "neon_luts" "lut" ];
+          "neon_luts" = [ "lut" "neon" ];
+          "neon_shaper_fixed_point_paths" = [ "neon" ];
+          "neon_shaper_optimized_paths" = [ "neon" ];
+          "neon_shaper_paths" = [ "neon" ];
+          "options" = [ "lut" ];
+          "sse_luts" = [ "lut" "sse" ];
+          "sse_shaper_fixed_point_paths" = [ "sse" ];
+          "sse_shaper_optimized_paths" = [ "sse" ];
+          "sse_shaper_paths" = [ "sse" ];
+        };
+        resolvedDefaultFeatures = [ "avx" "avx_luts" "avx_shaper_fixed_point_paths" "avx_shaper_paths" "default" "lut" "neon" "neon_luts" "neon_shaper_fixed_point_paths" "neon_shaper_paths" "sse" "sse_luts" "sse_shaper_fixed_point_paths" "sse_shaper_paths" ];
       };
       "multer" = rec {
         crateName = "multer";
@@ -6462,7 +6679,7 @@ rec {
           "default" = [ "std" ];
           "libm" = [ "dep:libm" ];
         };
-        resolvedDefaultFeatures = [ "i128" "libm" "std" ];
+        resolvedDefaultFeatures = [ "default" "i128" "libm" "std" ];
       };
       "num_cpus" = rec {
         crateName = "num_cpus";
@@ -6829,6 +7046,42 @@ rec {
         ];
 
       };
+      "png" = rec {
+        crateName = "png";
+        version = "0.18.1";
+        edition = "2021";
+        sha256 = "0qca282xp8a6d7mikxrwji3f52mjn4vnqxz2v9iz5adj665rnxk0";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "bitflags";
+            packageId = "bitflags";
+          }
+          {
+            name = "crc32fast";
+            packageId = "crc32fast";
+          }
+          {
+            name = "fdeflate";
+            packageId = "fdeflate";
+          }
+          {
+            name = "flate2";
+            packageId = "flate2";
+          }
+          {
+            name = "miniz_oxide";
+            packageId = "miniz_oxide";
+            features = [ "simd" ];
+          }
+        ];
+        features = {
+          "unstable" = [ "crc32fast/nightly" ];
+          "zlib-rs" = [ "flate2/zlib-rs" ];
+        };
+      };
       "potential_utf" = rec {
         crateName = "potential_utf";
         version = "0.1.5";
@@ -7013,6 +7266,28 @@ rec {
             packageId = "syn 1.0.109";
             features = [ "full" ];
           }
+        ];
+
+      };
+      "pxfm" = rec {
+        crateName = "pxfm";
+        version = "0.1.30";
+        edition = "2024";
+        sha256 = "1slrnbxd0nc96sny6x50ss1sm9ci0gig0fp1w8mw0pkgm5prapfm";
+        authors = [
+          "Radzivon Bartoshyk"
+        ];
+
+      };
+      "quick-error" = rec {
+        crateName = "quick-error";
+        version = "2.0.1";
+        edition = "2018";
+        sha256 = "18z6r2rcjvvf8cn92xjhm2qc3jpd1ljvcbf12zv0k9p565gmb4x9";
+        libName = "quick_error";
+        authors = [
+          "Paul Colomiets <paul@colomiets.name>"
+          "Colin Kiegel <kiegel@gmx.de>"
         ];
 
       };
@@ -10189,6 +10464,7 @@ rec {
         features = {
           "default" = [ "std" "const-generics" ];
         };
+        resolvedDefaultFeatures = [ "const-generics" "default" "std" ];
       };
       "simd_cesu8" = rec {
         crateName = "simd_cesu8";
@@ -12117,6 +12393,11 @@ rec {
             packageId = "tokio";
             features = [ "sync" ];
           }
+          {
+            name = "tokio-util";
+            packageId = "tokio-util";
+            optional = true;
+          }
         ];
         devDependencies = [
           {
@@ -12137,7 +12418,7 @@ rec {
           "time" = [ "tokio/time" ];
           "tokio-util" = [ "dep:tokio-util" ];
         };
-        resolvedDefaultFeatures = [ "default" "fs" "time" ];
+        resolvedDefaultFeatures = [ "default" "fs" "sync" "time" "tokio-util" ];
       };
       "tokio-util" = rec {
         crateName = "tokio-util";
@@ -14177,6 +14458,23 @@ rec {
         ];
 
       };
+      "weezl" = rec {
+        crateName = "weezl";
+        version = "0.1.12";
+        edition = "2018";
+        crateBin = [];
+        sha256 = "122a1dhha6cib5az4ihcqlh60ns2bi6rskdv875p94lbvj6wk2m2";
+        authors = [
+          "The image-rs Developers"
+        ];
+        features = {
+          "async" = [ "futures" "std" ];
+          "default" = [ "std" ];
+          "futures" = [ "dep:futures" ];
+          "std" = [ "alloc" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "default" "std" ];
+      };
       "whoami" = rec {
         crateName = "whoami";
         version = "2.1.2";
@@ -15233,6 +15531,12 @@ rec {
             packageId = "html-escape";
           }
           {
+            name = "image";
+            packageId = "image";
+            usesDefaultFeatures = false;
+            features = [ "gif" "jpeg" "png" "webp" ];
+          }
+          {
             name = "include_dir";
             packageId = "include_dir";
           }
@@ -15287,6 +15591,11 @@ rec {
             name = "tokio";
             packageId = "tokio";
             features = [ "full" ];
+          }
+          {
+            name = "tokio-stream";
+            packageId = "tokio-stream";
+            features = [ "sync" ];
           }
           {
             name = "toml";
@@ -15721,6 +16030,40 @@ rec {
         features = {
           "no-panic" = [ "dep:no-panic" ];
         };
+      };
+      "zune-core" = rec {
+        crateName = "zune-core";
+        version = "0.5.3";
+        edition = "2021";
+        sha256 = "12v5zdwcmjwzlfz61ajchzdaab75cxasqnmwf2hq929n8vypfqym";
+        libName = "zune_core";
+        features = {
+          "log" = [ "dep:log" ];
+          "serde" = [ "dep:serde" ];
+        };
+        resolvedDefaultFeatures = [ "std" ];
+      };
+      "zune-jpeg" = rec {
+        crateName = "zune-jpeg";
+        version = "0.5.15";
+        edition = "2021";
+        sha256 = "15kjpn6pywxlwb8w5irfd68x31wi3mb4y1da8bqh7havh5drvg17";
+        libName = "zune_jpeg";
+        authors = [
+          "caleb <etemesicaleb@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "zune-core";
+            packageId = "zune-core";
+          }
+        ];
+        features = {
+          "default" = [ "x86" "neon" "std" ];
+          "log" = [ "zune-core/log" ];
+          "std" = [ "zune-core/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "neon" "std" "x86" ];
       };
     };
 

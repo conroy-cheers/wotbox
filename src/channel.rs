@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     api::{AppState, assign_search_ids, cache_search_canonical},
+    change::{ChangeScope, ChangeSet},
     db::UnlinkedDownload,
     model::{
         ChannelConfig, ChannelKind, ChannelPackItem, ChannelRunPhase, ChannelRunStatus,
@@ -50,6 +51,27 @@ struct TrumpedSourceGroup {
     title: String,
     year: Option<i64>,
     links: Vec<crate::db::DownloadReleaseLink>,
+}
+
+async fn update_run_progress(
+    state: &AppState,
+    run_id: uuid::Uuid,
+    phase: ChannelRunPhase,
+    completed: u32,
+    total: Option<u32>,
+    message: Option<&str>,
+) -> Result<()> {
+    state
+        .db
+        .update_channel_run_progress(run_id, phase, completed, total, message)
+        .await?;
+    state
+        .publish(
+            ChangeSet::new("channel_progress", [ChangeScope::Channels])
+                .with_resources(["channels"]),
+        )
+        .await;
+    Ok(())
 }
 
 impl ReleaseDownloadIndex {
@@ -351,27 +373,25 @@ pub async fn refresh_channel(
     let download_index = ReleaseDownloadIndex::load(&state).await?;
     let mut items = Vec::with_capacity(sources.len());
     let source_total = sources.len() as u32;
-    state
-        .db
-        .update_channel_run_progress(
+    update_run_progress(
+        &state,
+        run_id,
+        ChannelRunPhase::Matching,
+        0,
+        Some(source_total),
+        Some("Matching recommendations on configured trackers"),
+    )
+    .await?;
+    for (index, source) in sources.into_iter().enumerate() {
+        update_run_progress(
+            &state,
             run_id,
             ChannelRunPhase::Matching,
-            0,
+            index as u32,
             Some(source_total),
-            Some("Matching recommendations on configured trackers"),
+            Some(&format!("Matching {} — {}", source.artist, source.title)),
         )
         .await?;
-    for (index, source) in sources.into_iter().enumerate() {
-        state
-            .db
-            .update_channel_run_progress(
-                run_id,
-                ChannelRunPhase::Matching,
-                index as u32,
-                Some(source_total),
-                Some(&format!("Matching {} — {}", source.artist, source.title)),
-            )
-            .await?;
         let item = match resolve_source_with_provider_recovery(
             &state,
             run_id,
@@ -417,27 +437,25 @@ pub async fn refresh_channel(
         };
         items.push(item);
     }
-    state
-        .db
-        .update_channel_run_progress(
-            run_id,
-            ChannelRunPhase::Planning,
-            source_total,
-            Some(source_total),
-            Some("Applying download rules and pack constraints"),
-        )
-        .await?;
+    update_run_progress(
+        &state,
+        run_id,
+        ChannelRunPhase::Planning,
+        source_total,
+        Some(source_total),
+        Some("Applying download rules and pack constraints"),
+    )
+    .await?;
     coordinate_pack_plan(&state, &mut items, &preferences).await;
-    state
-        .db
-        .update_channel_run_progress(
-            run_id,
-            ChannelRunPhase::Saving,
-            source_total,
-            Some(source_total),
-            Some("Saving recommendation pack"),
-        )
-        .await?;
+    update_run_progress(
+        &state,
+        run_id,
+        ChannelRunPhase::Saving,
+        source_total,
+        Some(source_total),
+        Some("Saving recommendation pack"),
+    )
+    .await?;
     let pack_id = state
         .db
         .create_channel_pack(&channel.id, &title, partial, &fingerprint, &items)
@@ -477,20 +495,25 @@ async fn resolve_source_with_provider_recovery(
                     .db
                     .wait_channel_run_for_provider(run_id, completed, total, &message, retry_at)
                     .await?;
+                state
+                    .publish(
+                        ChangeSet::new("channel_waiting_provider", [ChangeScope::Channels])
+                            .with_resources(["channels"]),
+                    )
+                    .await;
                 let delay = (retry_at - Utc::now())
                     .to_std()
                     .unwrap_or_else(|_| std::time::Duration::from_millis(1));
                 tokio::time::sleep(delay).await;
-                state
-                    .db
-                    .update_channel_run_progress(
-                        run_id,
-                        ChannelRunPhase::Matching,
-                        completed,
-                        Some(total),
-                        Some(&format!("Retrying {} — {}", source.artist, source.title)),
-                    )
-                    .await?;
+                update_run_progress(
+                    state,
+                    run_id,
+                    ChannelRunPhase::Matching,
+                    completed,
+                    Some(total),
+                    Some(&format!("Retrying {} — {}", source.artist, source.title)),
+                )
+                .await?;
             }
         }
     }
@@ -816,16 +839,15 @@ async fn fetch_lastfm_recommendations(
         if recommendations.len() >= settings.pack_size as usize {
             break;
         }
-        state
-            .db
-            .update_channel_run_progress(
-                run_id,
-                ChannelRunPhase::Discovering,
-                recommendations.len() as u32,
-                Some(settings.pack_size as u32),
-                Some(&format!("Checking recommendations from {artist}")),
-            )
-            .await?;
+        update_run_progress(
+            state,
+            run_id,
+            ChannelRunPhase::Discovering,
+            recommendations.len() as u32,
+            Some(settings.pack_size as u32),
+            Some(&format!("Checking recommendations from {artist}")),
+        )
+        .await?;
         let response = match lastfm_call(
             state,
             api_key,

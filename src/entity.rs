@@ -25,6 +25,185 @@ pub mod tracker_snapshot {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod library_asset {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_assets")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_hash: String,
+        pub source_url: String,
+        pub state: String,
+        pub blob_hash: Option<String>,
+        pub original_extension: Option<String>,
+        pub mime_type: Option<String>,
+        pub width: Option<i64>,
+        pub height: Option<i64>,
+        pub byte_size: Option<i64>,
+        pub error_code: Option<String>,
+        pub error_message: Option<String>,
+        pub retry_after: Option<String>,
+        #[sea_orm(default_value = 1)]
+        pub materializer_version: i32,
+        pub fetched_at: Option<String>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_asset_reference {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_asset_references")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub owner_kind: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub owner_id: String,
+        pub source_url: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_admission {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_admissions")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub release_id: String,
+        pub state: String,
+        pub error_code: Option<String>,
+        pub error_message: Option<String>,
+        pub admitted_at: Option<String>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_release_projection {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_release_projections")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub release_id: String,
+        pub normalized_title: String,
+        pub search_text: String,
+        pub tracker_keys: String,
+        pub format_keys: String,
+        pub encoding_keys: String,
+        pub media_keys: String,
+        pub sort_year: Option<i64>,
+        pub release_type: Option<String>,
+        pub availability: String,
+        pub covered_single: bool,
+        pub unresolved_credits: bool,
+        #[sea_orm(column_type = "Json")]
+        pub document_json: Json,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_artist_projection {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_artist_projections")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub artist_key: String,
+        pub canonical_id: Option<String>,
+        pub normalized_name: String,
+        #[sea_orm(column_type = "Json")]
+        pub document_json: Json,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_artist_release_projection {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_artist_release_projections")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub artist_key: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub release_id: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_projection_dirty {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_projection_dirty")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub release_id: String,
+        pub version: i64,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod library_projection_state {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "library_projection_state")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i32,
+        pub revision: i64,
+        pub schema_version: i32,
+        pub ready: bool,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod download_job {
     use sea_orm::entity::prelude::*;
 
@@ -101,6 +280,29 @@ pub mod download_event {
             Relation::DownloadJob.def()
         }
     }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod change_event {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "change_events")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub scopes: String,
+        #[sea_orm(default_value = "")]
+        pub resources: String,
+        pub reason: String,
+        #[sea_orm(column_type = "Json", nullable)]
+        pub payload_json: Option<Json>,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -244,6 +446,7 @@ pub mod external_release_link {
         pub source_key: String,
         pub release_id: String,
         pub decision: String,
+        #[sea_orm(default_value = 0)]
         pub matcher_version: i32,
         pub identity_fingerprint: String,
         pub score: Option<f64>,
@@ -300,6 +503,7 @@ pub mod artist_source {
         pub canonical_artist_id: String,
         pub name: String,
         pub normalized_name: String,
+        pub matcher_version: i32,
         #[sea_orm(column_type = "Json")]
         pub source_json: Json,
         pub fetched_at: String,
@@ -391,6 +595,9 @@ pub mod canonical_backfill_state {
         pub processed: i64,
         pub total: i64,
         pub last_error: Option<String>,
+        pub fingerprint: Option<String>,
+        #[sea_orm(column_type = "Json", nullable)]
+        pub details_json: Option<Json>,
         pub updated_at: String,
     }
 

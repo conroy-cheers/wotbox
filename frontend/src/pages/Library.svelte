@@ -13,6 +13,7 @@
     type PublicConfig
   } from "../lib/api";
   import DeduplicationProgress from "../lib/DeduplicationProgress.svelte";
+  import CachedImage from "../lib/CachedImage.svelte";
   import ReleaseCover from "../lib/ReleaseCover.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
@@ -47,16 +48,14 @@
       return {
         queryKey: ["library", $search, $tracker, $format, $availability, $limit] as const,
         queryFn: () => api<LibraryArtistsPage>(`/api/v1/library/artists?${params}`),
-        staleTime: 30_000,
-        refetchInterval: 30_000
+        staleTime: 30_000
       };
     }
   );
   const library = createQuery(options);
   const canonicalIndex = createQuery({
     queryKey: ["canonical-index"],
-    queryFn: () => api<CanonicalBackfillProgress>("/api/v1/index/canonical"),
-    refetchInterval: 2_000
+    queryFn: () => api<CanonicalBackfillProgress>("/api/v1/index/canonical")
   });
 
   $effect(() => {
@@ -91,6 +90,11 @@
     if (value === "partial") return "Partially missing";
     if (value === "missing") return "Missing";
     return "Available";
+  }
+
+  function sourceLabel(artist: LibraryArtistSummary): string {
+    const trackers = [...new Set(artist.sources.map((source) => source.tracker.toUpperCase()))];
+    return `${trackers.join(" + ") || artist.tracker.toUpperCase()} ${trackers.length === 1 ? "source" : "sources"}`;
   }
 
   function visibleReleases(items: LibraryArtistsPage["releases"]) {
@@ -217,7 +221,7 @@
               <div class="artist-mosaic" class:single={artist.artworks.length < 2}>
                 {#if artist.artworks.length}
                   {#each artist.artworks as artwork}
-                    <img src={artwork} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
+                    <CachedImage src={artwork} />
                   {/each}
                 {:else}
                   <Disc3 size={38} />
@@ -226,7 +230,7 @@
               <div class="artist-card-copy">
                 <div>
                   <h3>{artist.name}</h3>
-                  <span>{artist.tracker.toUpperCase()} source</span>
+                  <span>{sourceLabel(artist)}</span>
                 </div>
                 <p>{artist.releaseCount} {artist.releaseCount === 1 ? "release" : "releases"}</p>
                 {#if artist.missingCount}

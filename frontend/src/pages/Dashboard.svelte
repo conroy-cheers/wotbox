@@ -14,13 +14,11 @@
   });
   const downloads = createQuery({
     queryKey: ["downloads"],
-    queryFn: () => api<DownloadsPage>("/api/v1/downloads?limit=6"),
-    refetchInterval: 15_000
+    queryFn: () => api<DownloadsPage>("/api/v1/downloads?limit=6")
   });
   const providers = createQuery({
     queryKey: ["providers"],
-    queryFn: () => api<ProviderStatus[]>("/api/v1/providers"),
-    refetchInterval: 10_000
+    queryFn: () => api<ProviderStatus[]>("/api/v1/providers")
   });
   const qbit = $derived(($providers.data ?? []).find((provider) => provider.kind === "download_client"));
 </script>

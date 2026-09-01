@@ -22,6 +22,7 @@ pub struct Config {
     pub port: u16,
     pub base_path: String,
     pub database_path: PathBuf,
+    pub library_store_path: Option<PathBuf>,
     pub trackers: BTreeMap<String, TrackerConfig>,
     pub download_clients: BTreeMap<String, DownloadClientConfig>,
     pub download_profiles: BTreeMap<String, DownloadProfileConfig>,
@@ -82,6 +83,7 @@ impl Default for Config {
             port: 8780,
             base_path: "/".into(),
             database_path: "wotbox.sqlite".into(),
+            library_store_path: None,
             trackers: BTreeMap::new(),
             download_clients: BTreeMap::new(),
             download_profiles: BTreeMap::new(),
@@ -158,6 +160,9 @@ impl Config {
         }
         if let Ok(value) = std::env::var("WOTBOX_DATABASE_PATH") {
             config.database_path = value.into();
+        }
+        if let Ok(value) = std::env::var("WOTBOX_LIBRARY_STORE_PATH") {
+            config.library_store_path = Some(value.into());
         }
         let ops_token = std::env::var("OPS_TOKEN").context(
             "WOTBOX_CONFIG is unset and OPS_TOKEN is unavailable; provide a config file",

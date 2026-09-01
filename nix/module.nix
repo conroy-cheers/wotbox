@@ -66,6 +66,7 @@ let
     inherit (cfg) port;
     base_path = cfg.basePath;
     database_path = "${cfg.stateDirectory}/wotbox.sqlite";
+    library_store_path = cfg.libraryStoreDirectory;
     trackers = lib.mapAttrs (_: tracker: {
       inherit (tracker) kind;
       base_url = tracker.baseUrl;
@@ -128,6 +129,12 @@ in
       type = lib.types.str;
       default = "/var/lib/wotbox";
       readOnly = true;
+    };
+    libraryStoreDirectory = mkOption {
+      type = lib.types.str;
+      default = "${cfg.stateDirectory}/library-store";
+      defaultText = lib.literalExpression ''"\${config.services.wotbox.stateDirectory}/library-store"'';
+      description = "Durable content-addressed Library artwork store.";
     };
     workerThreads = mkOption {
       type = lib.types.ints.positive;

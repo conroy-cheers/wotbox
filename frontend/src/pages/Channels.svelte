@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createMutation, createQuery, useQueryClient } from "@tanstack/svelte-query";
+  import { createMutation, createQuery } from "@tanstack/svelte-query";
   import { History, Radio, RefreshCw, Settings2 } from "@lucide/svelte";
   import {
     api,
@@ -12,30 +12,14 @@
   } from "../lib/api";
 
   let expandedHistory = $state<Set<string>>(new Set());
-  const queryClient = useQueryClient();
+  let fullHistories = $state<Record<string, ChannelPackSummary[]>>({});
   const data = createQuery({
     queryKey: ["channels-overview"],
-    queryFn: async () => {
-      const channels = await api<ChannelOverview[]>("/api/v1/channels");
-      const histories = Object.fromEntries(await Promise.all(channels.map(async ({ channel }) => [
-        channel.id,
-        await api<ChannelPackSummary[]>(`/api/v1/channels/${channel.id}/packs?limit=100`)
-      ])));
-      return { channels, histories } as {
-        channels: ChannelOverview[];
-        histories: Record<string, ChannelPackSummary[]>;
-      };
-    },
-    refetchInterval: (query) =>
-      query.state.data?.channels.some((overview) => Boolean(overview.activeRun)) ? 1_000 : 5_000
+    queryFn: () => api<ChannelOverview[]>("/api/v1/channels")
   });
   const refresh = createMutation({
     mutationFn: (id: string) =>
-      api<ChannelRun>(`/api/v1/channels/${id}/refresh`, { method: "POST" }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["channels-overview"] });
-      queryClient.invalidateQueries({ queryKey: ["channels"] });
-    }
+      api<ChannelRun>(`/api/v1/channels/${id}/refresh`, { method: "POST" })
   });
 
   function label(channel: ChannelOverview["channel"]): string {
@@ -58,10 +42,20 @@
     return undefined;
   }
 
-  function toggleHistory(channelId: string) {
+  async function toggleHistory(overview: ChannelOverview) {
+    const channelId = overview.channel.id;
     const next = new Set(expandedHistory);
-    if (next.has(channelId)) next.delete(channelId);
-    else next.add(channelId);
+    if (next.has(channelId)) {
+      next.delete(channelId);
+    } else {
+      if (!fullHistories[channelId]) {
+        fullHistories = {
+          ...fullHistories,
+          [channelId]: await api<ChannelPackSummary[]>(`/api/v1/channels/${channelId}/packs?limit=100`)
+        };
+      }
+      next.add(channelId);
+    }
     expandedHistory = next;
   }
 
@@ -107,7 +101,7 @@
   <div class="error-panel">{$data.error.message}</div>
 {:else}
   <div class="channel-grid">
-    {#each $data.data?.channels ?? [] as overview}
+    {#each $data.data ?? [] as overview}
       <section class="channel-card">
         <header>
           <div class="channel-icon"><Radio size={22} /></div>
@@ -183,21 +177,20 @@
               : "No packs yet. Refresh the channel to build the first one."}
           </div>
         {/if}
-        {#if ($data.data?.histories[overview.channel.id]?.length ?? 0) > 1}
+        {#if overview.packCount > 1}
           <div class="pack-history">
             <h3><History size={15} /> History</h3>
-            {#each $data.data?.histories[overview.channel.id]?.slice(
-              1,
-              expandedHistory.has(overview.channel.id) ? undefined : 8
-            ) ?? [] as pack}
+            {#each (expandedHistory.has(overview.channel.id)
+              ? fullHistories[overview.channel.id] ?? overview.recentPacks
+              : overview.recentPacks).slice(1) as pack}
               <a href={appPath(`/channels/${overview.channel.id}/packs/${pack.id}`)}>
                 <span>{new Date(pack.createdAt).toLocaleDateString()}</span>
                 <span>{pack.summary.executable} ready · {pack.decision}</span>
               </a>
             {/each}
-            {#if ($data.data?.histories[overview.channel.id]?.length ?? 0) > 8}
-              <button class="secondary-button compact-button" onclick={() => toggleHistory(overview.channel.id)}>
-                {expandedHistory.has(overview.channel.id) ? "Show recent" : `Show all ${$data.data?.histories[overview.channel.id]?.length ?? 0} packs`}
+            {#if overview.packCount > 8}
+              <button class="secondary-button compact-button" onclick={() => toggleHistory(overview)}>
+                {expandedHistory.has(overview.channel.id) ? "Show recent" : `Show all ${overview.packCount} packs`}
               </button>
             {/if}
           </div>

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createQuery, useQueryClient } from "@tanstack/svelte-query";
+  import { createQuery } from "@tanstack/svelte-query";
   import { CirclePause, RefreshCw, RotateCcw } from "@lucide/svelte";
   import {
     api,
@@ -8,11 +8,9 @@
     type BackgroundJobStatus
   } from "./api";
 
-  const queryClient = useQueryClient();
   const jobs = createQuery({
     queryKey: ["background-jobs"],
-    queryFn: () => api<BackgroundJobsOverview>("/api/v1/background-jobs?limit=50"),
-    refetchInterval: 3_000
+    queryFn: () => api<BackgroundJobsOverview>("/api/v1/background-jobs?limit=50")
   });
   let actionJob = $state("");
   let actionError = $state("");
@@ -25,6 +23,8 @@
     canonical_backfill: "Update library identities",
     reconcile_canonical_releases: "Merge tracker releases",
     enrich_library_artists: "Enrich library artists",
+    reconcile_library_store: "Reconcile offline Library",
+    materialize_library_asset: "Store Library artwork",
     notify_plex: "Notify Plex",
     submit_download: "Submit download",
     process_import: "Replace trumped download",
@@ -86,7 +86,6 @@
     actionError = "";
     try {
       await api<unknown>(`/api/v1/background-jobs/${job.id}/${action}`, { method: "POST" });
-      await queryClient.invalidateQueries({ queryKey: ["background-jobs"] });
     } catch (cause) {
       actionError = cause instanceof Error ? cause.message : "Unable to update background job";
     } finally {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createQuery } from "@tanstack/svelte-query";
-  import { Check, GitMerge, X } from "@lucide/svelte";
-  import { api } from "../lib/api";
+  import { Check, GitMerge, RefreshCw, ShieldCheck, X } from "@lucide/svelte";
+  import { api, type CanonicalBackfillProgress, type CanonicalIdentityRepairPlan } from "../lib/api";
 
   type MatchCandidate = {
     id: string;
@@ -21,9 +21,43 @@
   let failure = $state("");
   const matches = createQuery({
     queryKey: ["match-candidates", "pending"],
-    queryFn: () => api<MatchCandidate[]>("/api/v1/matches?status=pending"),
-    refetchInterval: 15_000
+    queryFn: () => api<MatchCandidate[]>("/api/v1/matches?status=pending&scope=library")
   });
+  const canonical = createQuery({
+    queryKey: ["canonical-index"],
+    queryFn: () => api<CanonicalBackfillProgress>("/api/v1/index/canonical")
+  });
+
+  async function auditIdentities() {
+    working = "audit";
+    failure = "";
+    try {
+      await api<CanonicalIdentityRepairPlan>("/api/v1/index/canonical/audit", { method: "POST" });
+      await $canonical.refetch();
+    } catch (error) {
+      failure = error instanceof Error ? error.message : "Could not audit canonical identities";
+    } finally {
+      working = null;
+    }
+  }
+
+  async function applyIdentityRepair() {
+    const fingerprint = $canonical.data?.identityRepair?.fingerprint;
+    if (!fingerprint) return;
+    working = "repair";
+    failure = "";
+    try {
+      await api<{ jobId: string }>("/api/v1/index/canonical/repair", {
+        method: "POST",
+        body: JSON.stringify({ fingerprint })
+      });
+      await $canonical.refetch();
+    } catch (error) {
+      failure = error instanceof Error ? error.message : "Could not start canonical identity repair";
+    } finally {
+      working = null;
+    }
+  }
 
   function evidenceLabel(candidate: MatchCandidate): string {
     const evidence = candidate.evidence;
@@ -61,11 +95,44 @@
   <div>
     <p class="eyebrow">Canonical metadata</p>
     <h1>Match review</h1>
-    <p>Borderline cross-tracker matches wait here instead of being merged silently.</p>
+    <p>Borderline matches affecting your Library wait here instead of being merged silently.</p>
   </div>
 </header>
 
 {#if failure}<div class="error-banner">{failure}</div>{/if}
+
+<section class="panel">
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Library identity repair</p>
+      <h2>Cross-tracker artist audit</h2>
+      <p>Only shared-release evidence and unambiguous tracker ID promotions are applied automatically.</p>
+    </div>
+    <div class="actions">
+      <button class="button secondary" disabled={working !== null} onclick={auditIdentities}>
+        <RefreshCw size={15} /> Run audit
+      </button>
+      {#if $canonical.data?.identityRepair?.state === "audit_ready"}
+        <button class="button primary" disabled={working !== null} onclick={applyIdentityRepair}>
+          <ShieldCheck size={15} /> Apply audited repair
+        </button>
+      {/if}
+    </div>
+  </div>
+  {#if $canonical.data?.identityRepair?.plan}
+    {@const repair = $canonical.data.identityRepair}
+    {@const plan = repair.plan!}
+    <p>
+      {plan.components.length.toLocaleString()} strong-evidence merge groups ·
+      {plan.ambiguousNames.toLocaleString()} ambiguous names retained for review ·
+      {plan.staleReleaseSnapshots.toLocaleString()} stale release snapshots.
+      {#if repair.state === "applying"} Applied {repair.processed} of {repair.total}.{/if}
+      {#if repair.state === "complete"} Repair complete.{/if}
+    </p>
+  {:else}
+    <p>No repair audit has been recorded yet.</p>
+  {/if}
+</section>
 
 {#if $matches.isPending}
   <div class="panel"><div class="skeleton-row"></div><div class="skeleton-row"></div></div>

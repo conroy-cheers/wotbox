@@ -1099,6 +1099,24 @@ pub struct CanonicalDownload {
     pub live_observed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub live_stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_publication: Option<LibraryPublication>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryPublicationState {
+    Preparing,
+    Published,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPublication {
+    pub state: LibraryPublicationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -1237,6 +1255,16 @@ pub struct LibraryRelease {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct LibraryArtistSourceSummary {
+    pub key: String,
+    pub tracker: String,
+    pub artist_id: Option<i64>,
+    pub credit_source: ArtistCreditSource,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct LibraryArtistSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
@@ -1244,6 +1272,8 @@ pub struct LibraryArtistSummary {
     pub tracker: String,
     pub artist_id: Option<i64>,
     pub credit_source: ArtistCreditSource,
+    #[serde(default)]
+    pub sources: Vec<LibraryArtistSourceSummary>,
     pub name: String,
     pub release_count: usize,
     pub missing_count: usize,
@@ -1274,6 +1304,7 @@ pub struct LibraryArtistsPage {
 pub struct LibraryArtistPage {
     pub artist: LibraryArtistSummary,
     pub items: Vec<LibraryRelease>,
+    pub catalog: ArtistCatalogPage,
     pub total: usize,
     pub index: LibraryIndexStatus,
 }
@@ -1997,6 +2028,10 @@ pub struct ChannelOverview {
     pub active_run: Option<ChannelRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_pack: Option<ChannelPackSummary>,
+    #[serde(default)]
+    pub recent_packs: Vec<ChannelPackSummary>,
+    #[serde(default)]
+    pub pack_count: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]

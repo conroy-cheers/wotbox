@@ -8,10 +8,13 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectOptions, ConnectionTrait,
-    Database as SeaDatabase, DatabaseConnection, DatabaseTransaction, EntityTrait, IntoActiveModel,
-    ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode,
-    TransactionOptions, TransactionTrait, sea_query::Expr,
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database as SeaDatabase,
+    DatabaseConnection, DatabaseTransaction, EntityTrait, IntoActiveModel, ModelTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode, Statement,
+    TransactionOptions, TransactionTrait,
+    sea_query::{Expr, OnConflict},
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -23,11 +26,13 @@ use crate::{
     entity::{
         artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
-        channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
-        download_client_scan, download_event, download_job, download_release_link,
-        external_release_link, import_supersession, import_task, match_candidate, provider_state,
-        release_source, release_track_index, runtime_preference, single_album_coverage,
-        tracker_snapshot,
+        change_event, channel_config, channel_pack, channel_pack_item, channel_run,
+        dedupe_catalog_membership, download_client_scan, download_event, download_job,
+        download_release_link, external_release_link, import_supersession, import_task,
+        library_admission, library_artist_projection, library_artist_release_projection,
+        library_asset, library_asset_reference, library_projection_dirty, library_projection_state,
+        library_release_projection, match_candidate, provider_state, release_source,
+        release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
     },
     migration::Migrator,
     model::{
@@ -36,9 +41,9 @@ use crate::{
         ChannelConfig, ChannelPack, ChannelPackDecision, ChannelPackItem, ChannelPackSummary,
         ChannelRun, ChannelRunPhase, ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts,
         DownloadJob, DownloadState, ImportCleanupMode, ImportSupersession, ImportTask,
-        ImportTaskCounts, ImportTaskState, ImportsPage, LiveDownloadStatus, ProviderCircuitState,
-        ReleaseDetail, ReleaseDownload, ReleaseSummary, RuntimePreferences, TorrentVariant,
-        TrumpedDownloadRef,
+        ImportTaskCounts, ImportTaskState, ImportsPage, LibraryArtistSummary, LibraryAvailability,
+        LibraryRelease, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseDownload,
+        ReleaseSummary, RuntimePreferences, TorrentVariant, TrumpedDownloadRef,
     },
     plex::PlexScanTarget,
 };
@@ -54,11 +59,132 @@ pub struct Cached<T> {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredChangeEvent {
+    pub id: i64,
+    pub scopes: String,
+    pub resources: String,
+    pub reason: String,
+    pub payload: Option<Value>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReleaseIdentityMatch {
     release_id: Uuid,
     score: f64,
     auto_merge: bool,
+}
+
+fn ordered_uuid_strings(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_owned(), right.to_owned())
+    } else {
+        (right.to_owned(), left.to_owned())
+    }
+}
+
+fn generic_artist_name(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "" | "various artists" | "various" | "va" | "unknown artist" | "unknown"
+    )
+}
+
+fn artist_sort_name_for_projection(name: &str) -> String {
+    let normalized = name.trim().to_lowercase();
+    normalized
+        .strip_prefix("the ")
+        .unwrap_or(&normalized)
+        .to_owned()
+}
+
+fn projection_facet<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let mut values = values
+        .into_iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    format!("|{}|", values.join("|"))
+}
+
+fn projection_search_text(release: &LibraryRelease) -> String {
+    std::iter::once(release.release.title.as_str())
+        .chain(release.release.artist.as_deref())
+        .chain(
+            release
+                .release
+                .artists
+                .iter()
+                .map(|artist| artist.name.as_str()),
+        )
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn library_projection_semantic_document(document: &Value) -> Value {
+    let mut document = document.clone();
+    let Some(root) = document.as_object_mut() else {
+        return document;
+    };
+
+    // Tracker cache freshness and qBittorrent observation timestamps are telemetry. They can be
+    // useful in a detailed response, but neither changes what the local library contains. Ignore
+    // them when deciding whether to publish a new projection revision.
+    root.remove("provenance");
+    if let Some(copies) = root.get_mut("releaseCopies").and_then(Value::as_array_mut) {
+        for copy in copies {
+            if let Some(copy) = copy.as_object_mut() {
+                copy.remove("lastSeenAt");
+            }
+        }
+    }
+    if let Some(variants) = root.get_mut("variants").and_then(Value::as_array_mut) {
+        for variant in variants {
+            let Some(copies) = variant
+                .get_mut("library")
+                .and_then(|library| library.get_mut("copies"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for copy in copies {
+                if let Some(copy) = copy.as_object_mut() {
+                    copy.remove("lastSeenAt");
+                }
+            }
+        }
+    }
+    document
+}
+
+fn find_string_root(parent: &mut HashMap<String, String>, id: &str) -> String {
+    let next = parent
+        .entry(id.to_owned())
+        .or_insert_with(|| id.to_owned())
+        .clone();
+    if next == id {
+        return next;
+    }
+    let root = find_string_root(parent, &next);
+    parent.insert(id.to_owned(), root.clone());
+    root
+}
+
+fn union_strings(parent: &mut HashMap<String, String>, left: &str, right: &str) {
+    let left_root = find_string_root(parent, left);
+    let right_root = find_string_root(parent, right);
+    if left_root != right_root {
+        let (target, source) = if left_root <= right_root {
+            (left_root, right_root)
+        } else {
+            (right_root, left_root)
+        };
+        parent.insert(source, target);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +211,24 @@ pub struct LibraryRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct LibraryProjectionDirtyRecord {
+    pub release_id: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct LibraryProjectionFilter {
+    pub search_terms: Vec<String>,
+    pub tracker: Option<String>,
+    pub format: Option<String>,
+    pub encoding: Option<String>,
+    pub media: Option<String>,
+    pub year: Option<i64>,
+    pub release_type: Option<String>,
+    pub availability: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReleaseInventoryRecord {
     pub tracker: Option<String>,
     pub torrent_id: Option<i64>,
@@ -96,7 +240,7 @@ pub struct ReleaseInventoryRecord {
 pub struct IndexedDownload {
     pub release: Cached<ReleaseSummary>,
     pub variant: Option<crate::model::TorrentVariant>,
-    pub client: String,
+    #[allow(dead_code)]
     pub info_hash: String,
     pub live: Option<LiveDownloadStatus>,
     pub observed_at: Option<DateTime<Utc>>,
@@ -114,6 +258,11 @@ pub struct DownloadObservation {
     pub tracker: Option<String>,
     pub plex_target: Option<PlexScanTarget>,
 }
+
+// SQLite only permits one writer at a time. qBittorrent snapshots can contain thousands of
+// downloads, so keep their transactions short enough for projection maintenance, heartbeats,
+// provider state, and foreground mutations to make progress between batches.
+const DOWNLOAD_WRITE_BATCH_SIZE: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct UnlinkedDownload {
@@ -212,6 +361,42 @@ pub struct CanonicalBackfillProgress {
     pub total: i64,
     pub remaining: i64,
     pub last_error: Option<String>,
+    pub identity_repair: Option<CanonicalIdentityRepairStatus>,
+}
+
+pub const ARTIST_MATCHER_VERSION: i32 = 1;
+const CANONICAL_IDENTITY_REPAIR_KEY: &str = "canonical_identity_repair:v1";
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistRepairComponent {
+    pub target_id: Uuid,
+    pub member_ids: Vec<Uuid>,
+    pub normalized_name: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalIdentityRepairPlan {
+    pub matcher_version: i32,
+    pub fingerprint: String,
+    pub components: Vec<ArtistRepairComponent>,
+    pub ambiguous_names: usize,
+    pub rejected_pairs: usize,
+    pub stale_release_snapshots: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalIdentityRepairStatus {
+    pub state: String,
+    pub processed: i64,
+    pub total: i64,
+    pub remaining: i64,
+    pub fingerprint: Option<String>,
+    pub last_error: Option<String>,
+    pub plan: Option<CanonicalIdentityRepairPlan>,
 }
 
 impl Database {
@@ -244,6 +429,116 @@ impl Database {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn append_change_event(&self, scopes: &str, reason: &str) -> Result<i64> {
+        self.append_resource_change_event(scopes, "", reason, None)
+            .await
+    }
+
+    pub async fn append_resource_change_event(
+        &self,
+        scopes: &str,
+        resources: &str,
+        reason: &str,
+        payload: Option<Value>,
+    ) -> Result<i64> {
+        let event = change_event::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            scopes: Set(scopes.to_owned()),
+            resources: Set(resources.to_owned()),
+            reason: Set(reason.chars().take(200).collect()),
+            payload_json: Set(payload),
+            created_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&self.connection)
+        .await?;
+        Ok(event.id)
+    }
+
+    pub async fn latest_change_cursor(&self) -> Result<i64> {
+        Ok(change_event::Entity::find()
+            .order_by_desc(change_event::Column::Id)
+            .one(&self.connection)
+            .await?
+            .map_or(0, |event| event.id))
+    }
+
+    pub async fn change_events_after(
+        &self,
+        cursor: i64,
+        limit: u64,
+    ) -> Result<Vec<StoredChangeEvent>> {
+        change_event::Entity::find()
+            .filter(change_event::Column::Id.gt(cursor))
+            .order_by_asc(change_event::Column::Id)
+            .limit(limit)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|event| {
+                Ok(StoredChangeEvent {
+                    id: event.id,
+                    scopes: event.scopes,
+                    resources: event.resources,
+                    reason: event.reason,
+                    payload: event.payload_json,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn oldest_change_cursor(&self) -> Result<Option<i64>> {
+        Ok(change_event::Entity::find()
+            .order_by_asc(change_event::Column::Id)
+            .one(&self.connection)
+            .await?
+            .map(|event| event.id))
+    }
+
+    pub async fn prune_change_events(&self, before: DateTime<Utc>) -> Result<u64> {
+        Ok(change_event::Entity::delete_many()
+            .filter(change_event::Column::CreatedAt.lt(before.to_rfc3339()))
+            .exec(&self.connection)
+            .await?
+            .rows_affected)
+    }
+
+    pub async fn mark_downloads_removed(&self, client: &str, hashes: &[String]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let models = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Client.eq(client))
+            .filter(
+                download_release_link::Column::InfoHash
+                    .is_in(hashes.iter().map(|h| h.to_ascii_lowercase())),
+            )
+            .all(&self.connection)
+            .await?;
+        let batch_count = models.len().div_ceil(DOWNLOAD_WRITE_BATCH_SIZE);
+        for (batch_index, batch) in models.chunks(DOWNLOAD_WRITE_BATCH_SIZE).enumerate() {
+            let transaction = self.begin_write().await?;
+            for model in batch.iter().cloned() {
+                if model.library_added_at.is_some() {
+                    let mut active = model.into_active_model();
+                    active.present = Set(false);
+                    if active.missing_since.as_ref().is_none() {
+                        active.missing_since = Set(Some(now.clone()));
+                    }
+                    active.update(&transaction).await?;
+                } else {
+                    model.delete(&transaction).await?;
+                }
+            }
+            transaction.commit().await?;
+            if batch_index + 1 < batch_count {
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(())
+    }
+
     async fn begin_write(&self) -> Result<DatabaseTransaction> {
         Ok(self
             .connection
@@ -267,6 +562,681 @@ impl Database {
             .one(&self.connection)
             .await?;
         model.map(snapshot_from_model).transpose()
+    }
+
+    pub async fn catalog_groups_for_sources(
+        &self,
+        sources: &[(String, i64)],
+    ) -> Result<Vec<crate::model::ArtistCatalogRelease>> {
+        let mut groups = Vec::new();
+        for chunk in sources.chunks(300) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let condition =
+                chunk
+                    .iter()
+                    .fold(Condition::any(), |condition, (tracker, artist_id)| {
+                        condition.add(
+                            Condition::all()
+                                .add(
+                                    dedupe_catalog_membership::Column::Tracker
+                                        .eq(tracker.to_ascii_lowercase()),
+                                )
+                                .add(dedupe_catalog_membership::Column::ArtistId.eq(*artist_id)),
+                        )
+                    });
+            for model in dedupe_catalog_membership::Entity::find()
+                .filter(condition)
+                .all(&self.connection)
+                .await?
+            {
+                groups.push(serde_json::from_value(model.group_json)?);
+            }
+        }
+        Ok(groups)
+    }
+
+    pub async fn library_artist_catalogs_due(&self, limit: usize) -> Result<Vec<(String, i64)>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                format!(
+                    r#"
+                    SELECT DISTINCT lower(source.tracker) AS tracker, source.artist_id AS artist_id
+                      FROM artist_sources source
+                      JOIN canonical_release_credits credit
+                        ON credit.artist_id = source.canonical_artist_id
+                       AND credit.role = 'primary'
+                      JOIN download_release_links link
+                        ON link.release_id = credit.release_id
+                       AND link.library_added_at IS NOT NULL
+                      LEFT JOIN tracker_snapshots snapshot
+                        ON snapshot.tracker = source.tracker
+                       AND snapshot.resource_kind = 'artist'
+                       AND snapshot.resource_key = CAST(source.artist_id AS TEXT)
+                     WHERE source.artist_id IS NOT NULL
+                       AND (snapshot.id IS NULL OR snapshot.expires_at <= '{}')
+                     ORDER BY tracker, artist_id
+                     LIMIT {}
+                    "#,
+                    Utc::now().to_rfc3339().replace('\'', "''"),
+                    limit
+                ),
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("", "tracker")?, row.try_get("", "artist_id")?)))
+            .collect()
+    }
+
+    pub async fn reconcile_library_asset_references(&self) -> Result<()> {
+        const WRITE_BATCH_SIZE: usize = 250;
+
+        // Discover the complete desired closure without holding a write lock. Publishing the
+        // diff in small, independently committed statements keeps reconciliation from starving
+        // foreground reads and heartbeat updates on SQLite.
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                r#"
+                SELECT 'release' AS owner_kind, release.id AS owner_id,
+                       release.artwork AS source_url
+                  FROM canonical_releases release
+                 WHERE release.artwork LIKE 'https://%'
+                   AND EXISTS (
+                       SELECT 1 FROM download_release_links link
+                        WHERE link.release_id = release.id
+                          AND link.library_added_at IS NOT NULL
+                   )
+                UNION ALL
+                SELECT 'artist', artist.id, artist.artwork
+                  FROM canonical_artists artist
+                 WHERE artist.artwork LIKE 'https://%'
+                   AND EXISTS (
+                       SELECT 1
+                         FROM canonical_release_credits credit
+                         JOIN download_release_links link ON link.release_id = credit.release_id
+                        WHERE credit.artist_id = artist.id
+                          AND credit.role = 'primary'
+                          AND link.library_added_at IS NOT NULL
+                   )
+                UNION ALL
+                SELECT 'catalog',
+                       lower(membership.tracker) || ':' || membership.artist_id || ':' || membership.group_id,
+                       json_extract(membership.group_json, '$.release.artwork')
+                  FROM dedupe_catalog_memberships membership
+                 WHERE json_extract(membership.group_json, '$.release.artwork') LIKE 'https://%'
+                   AND EXISTS (
+                       SELECT 1
+                         FROM artist_sources source
+                         JOIN canonical_release_credits credit
+                           ON credit.artist_id = source.canonical_artist_id
+                          AND credit.role = 'primary'
+                         JOIN download_release_links link
+                           ON link.release_id = credit.release_id
+                          AND link.library_added_at IS NOT NULL
+                        WHERE source.tracker = membership.tracker
+                          AND source.artist_id = membership.artist_id
+                   )
+                "#,
+            ))
+            .await?;
+        let desired = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    (row.try_get("", "owner_kind")?, row.try_get("", "owner_id")?),
+                    row.try_get("", "source_url")?,
+                ))
+            })
+            .collect::<Result<HashMap<(String, String), String>>>()?;
+        let existing = library_asset_reference::Entity::find()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|reference| {
+                (
+                    (reference.owner_kind, reference.owner_id),
+                    reference.source_url,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let updates = desired
+            .iter()
+            .filter(|(owner, url)| existing.get(*owner) != Some(*url))
+            .collect::<Vec<_>>();
+        for chunk in updates.chunks(WRITE_BATCH_SIZE) {
+            let now = Utc::now().to_rfc3339();
+            let models = chunk
+                .iter()
+                .map(
+                    |((owner_kind, owner_id), source_url)| library_asset_reference::ActiveModel {
+                        owner_kind: Set(owner_kind.clone()),
+                        owner_id: Set(owner_id.clone()),
+                        source_url: Set((*source_url).clone()),
+                        updated_at: Set(now.clone()),
+                    },
+                )
+                .collect::<Vec<_>>();
+            library_asset_reference::Entity::insert_many(models)
+                .on_conflict(
+                    OnConflict::columns([
+                        library_asset_reference::Column::OwnerKind,
+                        library_asset_reference::Column::OwnerId,
+                    ])
+                    .update_columns([
+                        library_asset_reference::Column::SourceUrl,
+                        library_asset_reference::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+                )
+                .exec(&self.connection)
+                .await?;
+        }
+
+        let obsolete = existing
+            .keys()
+            .filter(|owner| !desired.contains_key(*owner))
+            .collect::<Vec<_>>();
+        for chunk in obsolete.chunks(WRITE_BATCH_SIZE) {
+            let filter = chunk.iter().fold(Condition::any(), |condition, owner| {
+                condition.add(
+                    Condition::all()
+                        .add(library_asset_reference::Column::OwnerKind.eq(&owner.0))
+                        .add(library_asset_reference::Column::OwnerId.eq(&owner.1)),
+                )
+            });
+            library_asset_reference::Entity::delete_many()
+                .filter(filter)
+                .exec(&self.connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn library_artwork_sources(&self, limit: usize) -> Result<Vec<String>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                format!(
+                    r#"
+                    SELECT DISTINCT reference.source_url AS source_url
+                      FROM library_asset_references reference
+                      LEFT JOIN library_assets asset ON asset.source_url = reference.source_url
+                     WHERE asset.source_hash IS NULL
+                        OR asset.materializer_version < {}
+                        OR (
+                            asset.state = 'failed_terminal'
+                            AND (asset.retry_after IS NULL OR datetime(asset.retry_after) <= datetime('now'))
+                        )
+                     ORDER BY reference.source_url
+                     LIMIT {}
+                    "#,
+                    crate::asset::MATERIALIZER_VERSION,
+                    limit
+                ),
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("", "source_url").map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn ensure_library_asset(&self, source_url: &str) -> Result<String> {
+        let source_hash = crate::asset::AssetStore::source_hash(source_url);
+        let transaction = self.begin_write().await?;
+        let existing = library_asset::Entity::find_by_id(source_hash.clone())
+            .one(&transaction)
+            .await?;
+        if let Some(model) = existing {
+            if model.materializer_version < crate::asset::MATERIALIZER_VERSION
+                || model.state == "failed_terminal"
+            {
+                let mut active = model.into_active_model();
+                active.state = Set("pending".into());
+                active.error_code = Set(None);
+                active.error_message = Set(None);
+                active.retry_after = Set(None);
+                active.materializer_version = Set(crate::asset::MATERIALIZER_VERSION);
+                active.updated_at = Set(Utc::now().to_rfc3339());
+                active.update(&transaction).await?;
+            }
+        } else {
+            let now = Utc::now().to_rfc3339();
+            library_asset::ActiveModel {
+                source_hash: Set(source_hash.clone()),
+                source_url: Set(source_url.to_owned()),
+                state: Set("pending".into()),
+                blob_hash: Set(None),
+                original_extension: Set(None),
+                mime_type: Set(None),
+                width: Set(None),
+                height: Set(None),
+                byte_size: Set(None),
+                error_code: Set(None),
+                error_message: Set(None),
+                retry_after: Set(None),
+                materializer_version: Set(crate::asset::MATERIALIZER_VERSION),
+                fetched_at: Set(None),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        let key = format!(
+            "materialize-library-asset:{source_hash}:v{}",
+            crate::asset::MATERIALIZER_VERSION
+        );
+        self.enqueue_background_job_on(
+            &transaction,
+            EnqueueBackgroundJob {
+                deduplication_key: &key,
+                kind: "materialize_library_asset",
+                payload: serde_json::json!({ "sourceHash": source_hash, "sourceUrl": source_url }),
+                provider_id: None,
+                lane: "media",
+                priority: -5,
+                max_attempts: 12,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            },
+        )
+        .await?;
+        self.reactivate_terminal_background_job_on(&transaction, &key)
+            .await?;
+        transaction.commit().await?;
+        Ok(source_hash)
+    }
+
+    pub async fn complete_library_asset(
+        &self,
+        asset: &crate::asset::MaterializedAsset,
+    ) -> Result<()> {
+        let model = library_asset::Entity::find_by_id(asset.source_hash.clone())
+            .one(&self.connection)
+            .await?
+            .context("Library asset disappeared during materialization")?;
+        let now = Utc::now().to_rfc3339();
+        let mut active = model.into_active_model();
+        active.state = Set("ready".into());
+        active.blob_hash = Set(Some(asset.blob_hash.clone()));
+        active.original_extension = Set(Some(asset.original_extension.clone()));
+        active.mime_type = Set(Some(asset.mime_type.clone()));
+        active.width = Set(Some(i64::from(asset.width)));
+        active.height = Set(Some(i64::from(asset.height)));
+        active.byte_size = Set(Some(i64::try_from(asset.byte_size)?));
+        active.error_code = Set(None);
+        active.error_message = Set(None);
+        active.retry_after = Set(None);
+        active.materializer_version = Set(crate::asset::MATERIALIZER_VERSION);
+        active.fetched_at = Set(Some(now.clone()));
+        active.updated_at = Set(now);
+        active.update(&self.connection).await?;
+        Ok(())
+    }
+
+    pub async fn set_library_asset_failure(
+        &self,
+        source_hash: &str,
+        state: &str,
+        code: &str,
+        message: &str,
+        retry_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        if let Some(model) = library_asset::Entity::find_by_id(source_hash)
+            .one(&self.connection)
+            .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set(state.into());
+            active.error_code = Set(Some(code.into()));
+            active.error_message = Set(Some(message.chars().take(500).collect()));
+            active.retry_after = Set(retry_after.map(|value| value.to_rfc3339()));
+            active.materializer_version = Set(crate::asset::MATERIALIZER_VERSION);
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&self.connection).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn library_asset(&self, source_hash: &str) -> Result<Option<library_asset::Model>> {
+        Ok(library_asset::Entity::find_by_id(source_hash)
+            .filter(library_asset::Column::State.eq("ready"))
+            .one(&self.connection)
+            .await?)
+    }
+
+    pub async fn prune_unreferenced_library_assets(
+        &self,
+        before: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                format!(
+                    r#"
+                    SELECT asset.source_hash AS source_hash,
+                           asset.blob_hash AS blob_hash,
+                           asset.original_extension AS original_extension
+                      FROM library_assets asset
+                     WHERE asset.state IN ('ready', 'absent', 'unsupported', 'failed_terminal')
+                       AND asset.updated_at < '{}'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM library_asset_references reference
+                            WHERE reference.source_url = asset.source_url
+                       )
+                     ORDER BY asset.updated_at
+                     LIMIT {}
+                    "#,
+                    before.to_rfc3339().replace('\'', "''"),
+                    limit
+                ),
+            ))
+            .await?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String>("", "source_hash")?,
+                    row.try_get::<Option<String>>("", "blob_hash")?,
+                    row.try_get::<Option<String>>("", "original_extension")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let transaction = self.begin_write().await?;
+        let source_hashes = candidates
+            .iter()
+            .map(|candidate| candidate.0.clone())
+            .collect::<Vec<_>>();
+        library_asset::Entity::delete_many()
+            .filter(library_asset::Column::SourceHash.is_in(source_hashes))
+            .exec(&transaction)
+            .await?;
+        let mut removable = Vec::new();
+        for (_, blob_hash, extension) in candidates {
+            let (Some(blob_hash), Some(extension)) = (blob_hash, extension) else {
+                continue;
+            };
+            if library_asset::Entity::find()
+                .filter(library_asset::Column::BlobHash.eq(blob_hash.clone()))
+                .count(&transaction)
+                .await?
+                == 0
+            {
+                removable.push((blob_hash, extension));
+            }
+        }
+        transaction.commit().await?;
+        removable.sort_unstable();
+        removable.dedup();
+        Ok(removable)
+    }
+
+    pub async fn reconcile_library_admissions(&self, _limit: usize) -> Result<usize> {
+        let held = download_release_link::Entity::find()
+            .select_only()
+            .column(download_release_link::Column::ReleaseId)
+            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
+            .filter(download_release_link::Column::ReleaseId.is_not_null())
+            .into_tuple::<Option<String>>()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<HashSet<_>>();
+        let credits = canonical_release_credit::Entity::find()
+            .filter(canonical_release_credit::Column::Role.eq("primary"))
+            .filter(canonical_release_credit::Column::ReleaseId.is_in(held.iter().cloned()))
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .fold(HashMap::<String, Vec<String>>::new(), |mut map, credit| {
+                map.entry(credit.release_id)
+                    .or_default()
+                    .push(credit.artist_id);
+                map
+            });
+        let artist_ids = credits.values().flatten().cloned().collect::<HashSet<_>>();
+        let sources = artist_source::Entity::find()
+            .select_only()
+            .columns([
+                artist_source::Column::CanonicalArtistId,
+                artist_source::Column::Tracker,
+                artist_source::Column::ArtistId,
+            ])
+            .filter(artist_source::Column::CanonicalArtistId.is_in(artist_ids))
+            .filter(artist_source::Column::ArtistId.is_not_null())
+            .into_tuple::<(String, String, Option<i64>)>()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .fold(
+                HashMap::<String, Vec<(String, i64)>>::new(),
+                |mut map, (canonical_artist_id, tracker, artist_id)| {
+                    if let Some(artist_id) = artist_id {
+                        map.entry(canonical_artist_id)
+                            .or_default()
+                            .push((tracker.to_ascii_lowercase(), artist_id));
+                    }
+                    map
+                },
+            );
+        let snapshots = tracker_snapshot::Entity::find()
+            .select_only()
+            .columns([
+                tracker_snapshot::Column::Tracker,
+                tracker_snapshot::Column::ResourceKey,
+            ])
+            .filter(tracker_snapshot::Column::ResourceKind.eq("artist"))
+            .into_tuple::<(String, String)>()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|(tracker, resource_key)| (tracker.to_ascii_lowercase(), resource_key))
+            .collect::<HashSet<_>>();
+        let references = library_asset_reference::Entity::find()
+            .select_only()
+            .columns([
+                library_asset_reference::Column::OwnerKind,
+                library_asset_reference::Column::OwnerId,
+                library_asset_reference::Column::SourceUrl,
+            ])
+            .into_tuple::<(String, String, String)>()
+            .all(&self.connection)
+            .await?;
+        let mut release_artworks = HashMap::new();
+        let mut artist_artworks = HashMap::new();
+        let mut catalog_artworks = HashMap::<(String, i64), Vec<String>>::new();
+        for (owner_kind, owner_id, source_url) in references {
+            match owner_kind.as_str() {
+                "release" => {
+                    release_artworks.insert(owner_id, source_url);
+                }
+                "artist" => {
+                    artist_artworks.insert(owner_id, source_url);
+                }
+                "catalog" => {
+                    let mut parts = owner_id.splitn(3, ':');
+                    if let (Some(tracker), Some(artist_id)) = (parts.next(), parts.next())
+                        && let Ok(artist_id) = artist_id.parse()
+                    {
+                        catalog_artworks
+                            .entry((tracker.to_owned(), artist_id))
+                            .or_default()
+                            .push(source_url);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let assets = library_asset::Entity::find()
+            .select_only()
+            .columns([
+                library_asset::Column::SourceUrl,
+                library_asset::Column::State,
+            ])
+            .into_tuple::<(String, String)>()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let canonical_releases = canonical_release::Entity::find()
+            .select_only()
+            .column(canonical_release::Column::Id)
+            .filter(canonical_release::Column::Id.is_in(held.iter().cloned()))
+            .into_tuple::<String>()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let existing = library_admission::Entity::find()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|admission| (admission.release_id.clone(), admission))
+            .collect::<HashMap<_, _>>();
+        let mut changed = 0;
+        for release_id in &held {
+            let mut state = "published";
+            let mut error_code = None;
+            let mut error_message = None;
+            let primary_artists = credits
+                .get(release_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if !canonical_releases.contains(release_id) {
+                state = "preparing";
+                error_code = Some("canonical_release_missing".to_owned());
+                error_message = Some("Canonical release metadata is not available yet".to_owned());
+            } else if primary_artists.is_empty() {
+                state = "preparing";
+                error_code = Some("primary_credit_missing".to_owned());
+                error_message = Some("Primary artist identity is not available yet".to_owned());
+            }
+            let mut required_artworks = release_artworks
+                .get(release_id)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if state == "published" {
+                for artist_id in primary_artists {
+                    if let Some(artwork) = artist_artworks.get(artist_id) {
+                        required_artworks.push(artwork.clone());
+                    }
+                    let Some(artist_sources) = sources.get(artist_id) else {
+                        state = "preparing";
+                        error_code = Some("artist_source_missing".to_owned());
+                        error_message = Some(format!(
+                            "No stable tracker identity is available for artist {artist_id}"
+                        ));
+                        break;
+                    };
+                    for source in artist_sources {
+                        if !snapshots.contains(&(source.0.clone(), source.1.to_string())) {
+                            state = "preparing";
+                            error_code = Some("artist_catalog_missing".to_owned());
+                            error_message = Some(format!(
+                                "The {} artist catalog has not been stored locally yet",
+                                source.0.to_ascii_uppercase()
+                            ));
+                            break;
+                        }
+                        if let Some(artworks) = catalog_artworks.get(source) {
+                            required_artworks.extend(artworks.iter().cloned());
+                        }
+                    }
+                    if state != "published" {
+                        break;
+                    }
+                }
+            }
+            if state == "published" {
+                for artwork in required_artworks {
+                    match assets.get(&artwork).map(String::as_str) {
+                        Some("ready" | "absent" | "unsupported") => {}
+                        Some("failed_terminal") => {
+                            state = "blocked";
+                            error_code = Some("artwork_failed".to_owned());
+                            error_message = Some(
+                                "Artwork could not be stored locally after repeated attempts"
+                                    .to_owned(),
+                            );
+                            break;
+                        }
+                        _ => {
+                            state = "preparing";
+                            error_code = Some("artwork_pending".to_owned());
+                            error_message =
+                                Some("Artwork is still being stored locally".to_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+            let now = Utc::now().to_rfc3339();
+            let admitted_at = existing
+                .get(release_id)
+                .and_then(|admission| admission.admitted_at.clone())
+                .or_else(|| (state == "published").then(|| now.clone()));
+            let unchanged = existing.get(release_id).is_some_and(|admission| {
+                admission.state == state
+                    && admission.error_code == error_code
+                    && admission.error_message == error_message
+                    && admission.admitted_at == admitted_at
+            });
+            if unchanged {
+                continue;
+            }
+            let active = library_admission::ActiveModel {
+                release_id: Set(release_id.clone()),
+                state: Set(state.into()),
+                error_code: Set(error_code),
+                error_message: Set(error_message),
+                admitted_at: Set(admitted_at),
+                updated_at: Set(now),
+            };
+            if existing.contains_key(release_id) {
+                active.update(&self.connection).await?;
+            } else {
+                active.insert(&self.connection).await?;
+            }
+            changed += 1;
+        }
+        let mut removal = library_admission::Entity::delete_many();
+        if !held.is_empty() {
+            removal = removal.filter(library_admission::Column::ReleaseId.is_not_in(held));
+        }
+        let removed = removal.exec(&self.connection).await?.rows_affected;
+        Ok(changed + usize::try_from(removed).unwrap_or(usize::MAX))
+    }
+
+    pub async fn library_publication_states(
+        &self,
+        release_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, library_admission::Model>> {
+        let mut states = HashMap::new();
+        for admission in library_admission::Entity::find()
+            .filter(
+                library_admission::Column::ReleaseId
+                    .is_in(release_ids.iter().map(ToString::to_string)),
+            )
+            .all(&self.connection)
+            .await?
+        {
+            states.insert(Uuid::parse_str(&admission.release_id)?, admission);
+        }
+        Ok(states)
     }
 
     pub async fn get_runtime_preferences(&self) -> Result<RuntimePreferences> {
@@ -444,6 +1414,39 @@ impl Database {
         active.last_error_code = Set(None);
         active.last_error_message = Set(None);
         active.finished_at = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(connection).await?;
+        Ok(())
+    }
+
+    async fn reactivate_terminal_background_job_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        key: &str,
+    ) -> Result<()> {
+        let Some(model) = background_job::Entity::find()
+            .filter(background_job::Column::DeduplicationKey.eq(key))
+            .filter(background_job::Column::State.is_in(["completed", "failed", "cancelled"]))
+            .one(connection)
+            .await?
+        else {
+            return Ok(());
+        };
+        let mut active = model.into_active_model();
+        active.state = Set("pending".into());
+        active.attempts = Set(0);
+        active.deferrals = Set(0);
+        active.next_run_at = Set(None);
+        active.lease_owner = Set(None);
+        active.lease_until = Set(None);
+        active.progress_completed = Set(0);
+        active.progress_total = Set(None);
+        active.progress_message = Set(None);
+        active.last_error_code = Set(None);
+        active.last_error_message = Set(None);
+        active.started_at = Set(None);
+        active.finished_at = Set(None);
+        active.cancelled_at = Set(None);
         active.updated_at = Set(Utc::now().to_rfc3339());
         active.update(connection).await?;
         Ok(())
@@ -631,25 +1634,36 @@ impl Database {
         total: Option<u64>,
         message: Option<&str>,
     ) -> Result<bool> {
-        let Some(model) = background_job::Entity::find_by_id(id.to_string())
+        let now = Utc::now();
+        let result = background_job::Entity::update_many()
+            .col_expr(
+                background_job::Column::LeaseUntil,
+                Expr::value(Some(
+                    (now + chrono::Duration::from_std(lease_duration)?).to_rfc3339(),
+                )),
+            )
+            .col_expr(
+                background_job::Column::ProgressCompleted,
+                Expr::value(i64::try_from(completed).unwrap_or(i64::MAX)),
+            )
+            .col_expr(
+                background_job::Column::ProgressTotal,
+                Expr::value(total.map(|value| i64::try_from(value).unwrap_or(i64::MAX))),
+            )
+            .col_expr(
+                background_job::Column::ProgressMessage,
+                Expr::value(message.map(|value| value.chars().take(200).collect::<String>())),
+            )
+            .col_expr(
+                background_job::Column::UpdatedAt,
+                Expr::value(now.to_rfc3339()),
+            )
+            .filter(background_job::Column::Id.eq(id.to_string()))
             .filter(background_job::Column::State.eq("running"))
             .filter(background_job::Column::LeaseOwner.eq(owner))
-            .one(&self.connection)
-            .await?
-        else {
-            return Ok(false);
-        };
-        let now = Utc::now();
-        let mut active = model.into_active_model();
-        active.lease_until = Set(Some(
-            (now + chrono::Duration::from_std(lease_duration)?).to_rfc3339(),
-        ));
-        active.progress_completed = Set(i64::try_from(completed).unwrap_or(i64::MAX));
-        active.progress_total = Set(total.map(|value| i64::try_from(value).unwrap_or(i64::MAX)));
-        active.progress_message = Set(message.map(|value| value.chars().take(200).collect()));
-        active.updated_at = Set(now.to_rfc3339());
-        active.update(&self.connection).await?;
-        Ok(true)
+            .exec(&self.connection)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
     pub async fn set_background_job_provider(&self, id: Uuid, provider_id: &str) -> Result<()> {
@@ -1525,6 +2539,13 @@ impl Database {
             });
         }
         Ok(result)
+    }
+
+    pub async fn count_channel_packs(&self, channel_id: &str) -> Result<u64> {
+        Ok(channel_pack::Entity::find()
+            .filter(channel_pack::Column::ChannelId.eq(channel_id))
+            .count(&self.connection)
+            .await?)
     }
 
     pub async fn recent_channel_sources(
@@ -2570,6 +3591,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn ensure_artist_catalog_refreshes(&self, artists: &[(String, i64)]) -> Result<()> {
         if artists.is_empty() {
             return Ok(());
@@ -3962,6 +4984,35 @@ impl Database {
             let artist_id = if let Some(source) = &existing {
                 Uuid::parse_str(&source.canonical_artist_id)?
             } else {
+                let same_tracker_name = artist_source::Entity::find()
+                    .filter(artist_source::Column::NormalizedName.eq(&normalized_name))
+                    .filter(artist_source::Column::Tracker.eq(&tracker))
+                    .all(&self.connection)
+                    .await?;
+                let stable_ids = same_tracker_name
+                    .iter()
+                    .filter(|source| source.artist_id.is_some())
+                    .map(|source| source.canonical_artist_id.as_str())
+                    .collect::<HashSet<_>>();
+                let fallback_ids = same_tracker_name
+                    .iter()
+                    .filter(|source| {
+                        source.artist_id.is_none() || source.source_key.starts_with("name:")
+                    })
+                    .map(|source| source.canonical_artist_id.as_str())
+                    .collect::<HashSet<_>>();
+                let promoted = if stable_ids.len() == 1 {
+                    stable_ids.iter().next().copied()
+                } else if credit.artist_id.is_some()
+                    && stable_ids.is_empty()
+                    && fallback_ids.len() == 1
+                {
+                    fallback_ids.iter().next().copied()
+                } else {
+                    None
+                }
+                .map(Uuid::parse_str)
+                .transpose()?;
                 let same_name = artist_source::Entity::find()
                     .filter(artist_source::Column::NormalizedName.eq(&normalized_name))
                     .filter(artist_source::Column::Tracker.ne(&tracker))
@@ -3983,7 +5034,7 @@ impl Database {
                             .then(|| Uuid::parse_str(&source.canonical_artist_id))
                     })
                 };
-                match corroborated.transpose()? {
+                match promoted.or(corroborated.transpose()?) {
                     Some(id) => id,
                     None => {
                         let id = Uuid::new_v4();
@@ -4031,6 +5082,7 @@ impl Database {
                 active.canonical_artist_id = Set(artist_id.to_string());
                 active.name = Set(credit.name.clone());
                 active.normalized_name = Set(normalized_name);
+                active.matcher_version = Set(ARTIST_MATCHER_VERSION);
                 active.source_json = Set(source_json);
                 active.fetched_at = Set(fetched_at.to_rfc3339());
                 active.expires_at = Set(expires_at.to_rfc3339());
@@ -4044,6 +5096,7 @@ impl Database {
                     canonical_artist_id: Set(artist_id.to_string()),
                     name: Set(credit.name.clone()),
                     normalized_name: Set(normalized_name),
+                    matcher_version: Set(ARTIST_MATCHER_VERSION),
                     source_json: Set(source_json),
                     fetched_at: Set(fetched_at.to_rfc3339()),
                     expires_at: Set(expires_at.to_rfc3339()),
@@ -4391,7 +5444,7 @@ impl Database {
             provenance_json: Set(serde_json::json!({})),
             overrides_json: Set(serde_json::json!({})),
             created_at: Set(now.clone()),
-            updated_at: Set(now),
+            updated_at: Set(now.clone()),
         }
         .insert(&self.connection)
         .await?;
@@ -4672,6 +5725,8 @@ impl Database {
                 processed: Set(total - remaining),
                 total: Set(total),
                 last_error: Set(last_error),
+                fingerprint: Set(None),
+                details_json: Set(None),
                 updated_at: Set(Utc::now().to_rfc3339()),
             }
             .insert(&self.connection)
@@ -4775,6 +5830,551 @@ impl Database {
         Ok(processed)
     }
 
+    pub async fn audit_canonical_identity_repair(&self) -> Result<CanonicalIdentityRepairPlan> {
+        use sha2::{Digest, Sha256};
+
+        if let Some(active) =
+            canonical_backfill_state::Entity::find_by_id(CANONICAL_IDENTITY_REPAIR_KEY)
+                .one(&self.connection)
+                .await?
+            && active.state == "applying"
+            && active.processed < active.total
+            && background_job::Entity::find()
+                .filter(
+                    background_job::Column::Kind.eq(crate::background::REPAIR_CANONICAL_IDENTITIES),
+                )
+                .filter(
+                    background_job::Column::State
+                        .is_in(["pending", "running", "retrying", "waiting"]),
+                )
+                .one(&self.connection)
+                .await?
+                .is_some()
+        {
+            anyhow::bail!("canonical identity repair is currently applying");
+        }
+
+        let sources = artist_source::Entity::find().all(&self.connection).await?;
+        let artists = canonical_artist::Entity::find()
+            .all(&self.connection)
+            .await?;
+        let credits = canonical_release_credit::Entity::find()
+            .filter(canonical_release_credit::Column::Role.eq("primary"))
+            .all(&self.connection)
+            .await?;
+        let library_release_ids = download_release_link::Entity::find()
+            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
+            .filter(download_release_link::Column::ReleaseId.is_not_null())
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .filter_map(|link| link.release_id)
+            .collect::<HashSet<_>>();
+        let rejected = match_candidate::Entity::find()
+            .filter(match_candidate::Column::Kind.eq("artist"))
+            .filter(match_candidate::Column::Status.eq("rejected"))
+            .all(&self.connection)
+            .await?;
+
+        let rejected_pairs = rejected
+            .iter()
+            .map(|candidate| ordered_uuid_strings(&candidate.left_id, &candidate.right_id))
+            .collect::<HashSet<_>>();
+        let artist_by_id = artists
+            .iter()
+            .map(|artist| (artist.id.clone(), artist))
+            .collect::<HashMap<_, _>>();
+        let mut sources_by_artist: HashMap<String, Vec<&artist_source::Model>> = HashMap::new();
+        for source in &sources {
+            sources_by_artist
+                .entry(source.canonical_artist_id.clone())
+                .or_default()
+                .push(source);
+        }
+
+        let eligible = |left: &str, right: &str| {
+            if left == right || rejected_pairs.contains(&ordered_uuid_strings(left, right)) {
+                return false;
+            }
+            [left, right].iter().all(|id| {
+                artist_by_id.get(*id).is_some_and(|artist| {
+                    artist
+                        .overrides_json
+                        .as_object()
+                        .is_none_or(|v| v.is_empty())
+                })
+            })
+        };
+
+        let source_by_key = sources
+            .iter()
+            .map(|source| {
+                (
+                    (
+                        source.tracker.to_ascii_lowercase(),
+                        source.source_key.clone(),
+                    ),
+                    source.canonical_artist_id.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut current_credits: HashMap<(String, String), HashMap<String, HashSet<String>>> =
+            HashMap::new();
+        let mut library_name_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        let library_sources = if library_release_ids.is_empty() {
+            Vec::new()
+        } else {
+            release_source::Entity::find()
+                .filter(release_source::Column::ReleaseId.is_in(library_release_ids))
+                .all(&self.connection)
+                .await?
+        };
+        for source in library_sources {
+            let Ok(summary) = serde_json::from_value::<ReleaseSummary>(source.source_json) else {
+                continue;
+            };
+            let tracker = source.tracker.to_ascii_lowercase();
+            for credit in summary
+                .artists
+                .iter()
+                .filter(|credit| credit.role == ArtistRole::Primary)
+            {
+                let normalized_name = crate::release_matcher::normalized(&credit.name);
+                if generic_artist_name(&normalized_name) {
+                    continue;
+                }
+                let artist_id = source_by_key
+                    .get(&(credit.tracker.to_ascii_lowercase(), credit.key.clone()))
+                    .cloned()
+                    .or_else(|| credit.canonical_id.map(|id| id.to_string()));
+                if let Some(artist_id) = artist_id {
+                    library_name_ids
+                        .entry(normalized_name.clone())
+                        .or_default()
+                        .insert(artist_id.clone());
+                    current_credits
+                        .entry((source.release_id.clone(), normalized_name))
+                        .or_default()
+                        .entry(tracker.clone())
+                        .or_default()
+                        .insert(artist_id);
+                }
+            }
+        }
+        let relevant_artist_ids = current_credits
+            .values()
+            .flat_map(|tracker_ids| tracker_ids.values())
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut edges: Vec<(String, String, String)> = Vec::new();
+        for ((release_id, normalized_name), tracker_ids) in current_credits {
+            if tracker_ids.len() < 2 {
+                continue;
+            }
+            let mut ids = tracker_ids.into_values().flatten().collect::<Vec<_>>();
+            ids.sort();
+            ids.dedup();
+            for pair in ids.windows(2) {
+                let canonical_names_match = pair.iter().all(|id| {
+                    artist_by_id
+                        .get(id)
+                        .is_some_and(|artist| artist.normalized_name == normalized_name)
+                });
+                if canonical_names_match && eligible(&pair[0], &pair[1]) {
+                    edges.push((
+                        pair[0].clone(),
+                        pair[1].clone(),
+                        format!("shared release {release_id}"),
+                    ));
+                }
+            }
+        }
+
+        let mut source_groups: HashMap<(&str, &str), Vec<&artist_source::Model>> = HashMap::new();
+        for source in &sources {
+            source_groups
+                .entry((&source.tracker, &source.normalized_name))
+                .or_default()
+                .push(source);
+        }
+        for ((tracker, normalized_name), group) in source_groups {
+            if generic_artist_name(normalized_name) {
+                continue;
+            }
+            if !group
+                .iter()
+                .any(|source| relevant_artist_ids.contains(&source.canonical_artist_id))
+            {
+                continue;
+            }
+            let stable_ids = group
+                .iter()
+                .filter(|source| source.artist_id.is_some())
+                .map(|source| source.canonical_artist_id.as_str())
+                .collect::<HashSet<_>>();
+            if stable_ids.len() != 1 {
+                continue;
+            }
+            let stable_id = *stable_ids.iter().next().expect("one stable id");
+            for fallback in group.iter().filter(|source| {
+                source.artist_id.is_none() || source.source_key.starts_with("name:")
+            }) {
+                let canonical_names_match = [stable_id, fallback.canonical_artist_id.as_str()]
+                    .iter()
+                    .all(|id| {
+                        artist_by_id
+                            .get(*id)
+                            .is_some_and(|artist| artist.normalized_name == normalized_name)
+                    });
+                if canonical_names_match && eligible(stable_id, &fallback.canonical_artist_id) {
+                    edges.push((
+                        stable_id.to_owned(),
+                        fallback.canonical_artist_id.clone(),
+                        format!("{tracker} stable source id promotion"),
+                    ));
+                }
+            }
+        }
+
+        let mut parent = HashMap::<String, String>::new();
+        let mut evidence = HashMap::<String, Vec<String>>::new();
+        for (left, right, reason) in edges {
+            union_strings(&mut parent, &left, &right);
+            evidence.entry(left).or_default().push(reason.clone());
+            evidence.entry(right).or_default().push(reason);
+        }
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for id in parent.clone().keys() {
+            let root = find_string_root(&mut parent, id);
+            groups.entry(root).or_default().push(id.clone());
+        }
+        let credit_counts = credits
+            .iter()
+            .fold(HashMap::<&str, usize>::new(), |mut map, row| {
+                *map.entry(&row.artist_id).or_default() += 1;
+                map
+            });
+        let mut components = Vec::new();
+        for mut member_ids in groups.into_values() {
+            member_ids.sort();
+            member_ids.dedup();
+            if member_ids.len() < 2 {
+                continue;
+            }
+            let blocked_by_rejection = member_ids.iter().enumerate().any(|(index, left)| {
+                member_ids[index + 1..]
+                    .iter()
+                    .any(|right| rejected_pairs.contains(&ordered_uuid_strings(left, right)))
+            });
+            if blocked_by_rejection {
+                continue;
+            }
+            let canonical_names = member_ids
+                .iter()
+                .filter_map(|id| artist_by_id.get(id).map(|artist| &artist.normalized_name))
+                .collect::<HashSet<_>>();
+            if canonical_names.len() != 1
+                || canonical_names
+                    .iter()
+                    .next()
+                    .is_none_or(|name| generic_artist_name(name))
+            {
+                continue;
+            }
+            member_ids.sort_by_key(|id| {
+                let stable = sources_by_artist.get(id).map_or(0, |rows| {
+                    rows.iter().filter(|row| row.artist_id.is_some()).count()
+                });
+                (
+                    std::cmp::Reverse(stable),
+                    std::cmp::Reverse(*credit_counts.get(id.as_str()).unwrap_or(&0)),
+                    id.clone(),
+                )
+            });
+            let target_id = Uuid::parse_str(&member_ids[0])?;
+            let normalized_name =
+                (*canonical_names.iter().next().expect("one canonical name")).clone();
+            let mut reasons = member_ids
+                .iter()
+                .flat_map(|id| evidence.get(id).into_iter().flatten().cloned())
+                .collect::<Vec<_>>();
+            reasons.sort();
+            reasons.dedup();
+            components.push(ArtistRepairComponent {
+                target_id,
+                member_ids: member_ids
+                    .into_iter()
+                    .map(|id| Uuid::parse_str(&id))
+                    .collect::<std::result::Result<_, _>>()?,
+                normalized_name,
+                evidence: reasons,
+            });
+        }
+        components.sort_by_key(|component| component.target_id);
+
+        let component_ids = components
+            .iter()
+            .flat_map(|component| component.member_ids.iter().map(Uuid::to_string))
+            .collect::<HashSet<_>>();
+        let ambiguous_groups = library_name_ids
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1 && !ids.iter().all(|id| component_ids.contains(id)))
+            .map(|(name, ids)| {
+                let mut ids = ids.iter().cloned().collect::<Vec<_>>();
+                ids.sort();
+                (name.clone(), ids)
+            })
+            .collect::<Vec<_>>();
+        let ambiguous_names = ambiguous_groups.len();
+        for (normalized_name, ids) in &ambiguous_groups {
+            for (index, left) in ids.iter().enumerate() {
+                for right in &ids[index + 1..] {
+                    let left = Uuid::parse_str(left)?;
+                    let right = Uuid::parse_str(right)?;
+                    if !self.match_pair_was_rejected("artist", left, right).await? {
+                        self.put_match_candidate(
+                            "artist",
+                            left,
+                            right,
+                            0.80,
+                            "pending",
+                            &serde_json::json!({
+                                "name": normalized_name,
+                                "reason": "exact Library name without strong merge evidence"
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        let stale_release_snapshots = self.count_stale_release_snapshots().await?;
+        let fingerprint_input = serde_json::to_vec(&(ARTIST_MATCHER_VERSION, &components))?;
+        let fingerprint = hex::encode(Sha256::digest(fingerprint_input));
+        let plan = CanonicalIdentityRepairPlan {
+            matcher_version: ARTIST_MATCHER_VERSION,
+            fingerprint,
+            components,
+            ambiguous_names,
+            rejected_pairs: rejected_pairs.len(),
+            stale_release_snapshots,
+        };
+        let now = Utc::now().to_rfc3339();
+        let total = plan.components.len() as i64;
+        if let Some(model) =
+            canonical_backfill_state::Entity::find_by_id(CANONICAL_IDENTITY_REPAIR_KEY)
+                .one(&self.connection)
+                .await?
+        {
+            let mut active = model.into_active_model();
+            active.state = Set("audit_ready".into());
+            active.processed = Set(0);
+            active.total = Set(total);
+            active.last_error = Set(None);
+            active.fingerprint = Set(Some(plan.fingerprint.clone()));
+            active.details_json = Set(Some(serde_json::to_value(&plan)?));
+            active.updated_at = Set(now);
+            active.update(&self.connection).await?;
+        } else {
+            canonical_backfill_state::ActiveModel {
+                key: Set(CANONICAL_IDENTITY_REPAIR_KEY.into()),
+                state: Set("audit_ready".into()),
+                processed: Set(0),
+                total: Set(total),
+                last_error: Set(None),
+                fingerprint: Set(Some(plan.fingerprint.clone())),
+                details_json: Set(Some(serde_json::to_value(&plan)?)),
+                updated_at: Set(now),
+            }
+            .insert(&self.connection)
+            .await?;
+        }
+        Ok(plan)
+    }
+
+    pub async fn apply_canonical_identity_repair(
+        &self,
+        fingerprint: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let model = canonical_backfill_state::Entity::find_by_id(CANONICAL_IDENTITY_REPAIR_KEY)
+            .one(&self.connection)
+            .await?
+            .context("canonical identity audit has not been run")?;
+        anyhow::ensure!(
+            model.fingerprint.as_deref() == Some(fingerprint),
+            "audit fingerprint does not match"
+        );
+        let plan: CanonicalIdentityRepairPlan = serde_json::from_value(
+            model
+                .details_json
+                .clone()
+                .context("canonical identity audit has no plan")?,
+        )?;
+        anyhow::ensure!(
+            plan.matcher_version == ARTIST_MATCHER_VERSION,
+            "artist matcher version changed; run a new audit"
+        );
+        let start = usize::try_from(model.processed.max(0)).unwrap_or(0);
+        let end = (start + limit.max(1)).min(plan.components.len());
+        for component in &plan.components[start..end] {
+            self.apply_artist_repair_component(component).await?;
+        }
+        if end == plan.components.len() {
+            self.normalize_release_snapshots().await?;
+        }
+        let mut active = model.into_active_model();
+        active.state = Set(if end == plan.components.len() {
+            "complete"
+        } else {
+            "applying"
+        }
+        .into());
+        active.processed = Set(end as i64);
+        active.last_error = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&self.connection).await?;
+        Ok(end - start)
+    }
+
+    pub async fn canonical_identity_repair_status(
+        &self,
+    ) -> Result<Option<CanonicalIdentityRepairStatus>> {
+        let Some(model) =
+            canonical_backfill_state::Entity::find_by_id(CANONICAL_IDENTITY_REPAIR_KEY)
+                .one(&self.connection)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let plan = model
+            .details_json
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()?;
+        Ok(Some(CanonicalIdentityRepairStatus {
+            state: model.state,
+            processed: model.processed,
+            total: model.total,
+            remaining: (model.total - model.processed).max(0),
+            fingerprint: model.fingerprint,
+            last_error: model.last_error,
+            plan,
+        }))
+    }
+
+    async fn apply_artist_repair_component(&self, component: &ArtistRepairComponent) -> Result<()> {
+        for (index, left) in component.member_ids.iter().enumerate() {
+            for right in &component.member_ids[index + 1..] {
+                let left = self.resolve_alias("artist", *left).await?;
+                let right = self.resolve_alias("artist", *right).await?;
+                if left != right {
+                    anyhow::ensure!(
+                        !self.match_pair_was_rejected("artist", left, right).await?,
+                        "rejected artist match blocks automatic repair"
+                    );
+                }
+            }
+        }
+        let target = self.resolve_alias("artist", component.target_id).await?;
+        for member in &component.member_ids {
+            let source = self.resolve_alias("artist", *member).await?;
+            if source == target {
+                continue;
+            }
+            let Some(source_artist) = canonical_artist::Entity::find_by_id(source.to_string())
+                .one(&self.connection)
+                .await?
+            else {
+                continue;
+            };
+            let Some(target_artist) = canonical_artist::Entity::find_by_id(target.to_string())
+                .one(&self.connection)
+                .await?
+            else {
+                anyhow::bail!("repair target {target} no longer exists")
+            };
+            anyhow::ensure!(
+                source_artist.normalized_name == target_artist.normalized_name
+                    && source_artist.normalized_name == component.normalized_name,
+                "artist identity changed after audit"
+            );
+            anyhow::ensure!(
+                source_artist
+                    .overrides_json
+                    .as_object()
+                    .is_none_or(|v| v.is_empty())
+                    && target_artist
+                        .overrides_json
+                        .as_object()
+                        .is_none_or(|v| v.is_empty()),
+                "manual artist override blocks automatic repair"
+            );
+            anyhow::ensure!(
+                !self
+                    .match_pair_was_rejected("artist", target, source)
+                    .await?,
+                "rejected artist match blocks automatic repair"
+            );
+            self.merge_artists(target, source).await?;
+        }
+        Ok(())
+    }
+
+    async fn count_stale_release_snapshots(&self) -> Result<usize> {
+        let mut count = 0;
+        for row in canonical_torrent::Entity::find()
+            .all(&self.connection)
+            .await?
+        {
+            let Some(release_id) = row.release_id.as_deref() else {
+                continue;
+            };
+            let Ok(canonical) = serde_json::from_value::<CanonicalTorrent>(row.canonical_json)
+            else {
+                continue;
+            };
+            if canonical.release.id.map(|id| id.to_string()).as_deref() != Some(release_id) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn normalize_release_snapshots(&self) -> Result<()> {
+        for row in canonical_torrent::Entity::find()
+            .all(&self.connection)
+            .await?
+        {
+            let Some(release_id) = row.release_id.as_deref() else {
+                continue;
+            };
+            let release_id = Uuid::parse_str(release_id)?;
+            let Ok(mut canonical) =
+                serde_json::from_value::<CanonicalTorrent>(row.canonical_json.clone())
+            else {
+                continue;
+            };
+            if canonical.release.id == Some(release_id) {
+                continue;
+            }
+            canonical.release.id = Some(release_id);
+            let mut active = row.into_active_model();
+            active.canonical_json = Set(serde_json::to_value(canonical)?);
+            active.update(&self.connection).await?;
+        }
+        artist_source::Entity::update_many()
+            .col_expr(
+                artist_source::Column::MatcherVersion,
+                Expr::value(ARTIST_MATCHER_VERSION),
+            )
+            .filter(artist_source::Column::MatcherVersion.lt(ARTIST_MATCHER_VERSION))
+            .exec(&self.connection)
+            .await?;
+        Ok(())
+    }
+
     pub async fn canonical_backfill_progress(&self) -> Result<CanonicalBackfillProgress> {
         if let Some(model) = canonical_backfill_state::Entity::find_by_id("canonical_identity")
             .one(&self.connection)
@@ -4786,6 +6386,7 @@ impl Database {
                 total: model.total,
                 remaining: (model.total - model.processed).max(0),
                 last_error: model.last_error,
+                identity_repair: self.canonical_identity_repair_status().await?,
             });
         }
         let total = canonical_torrent::Entity::find()
@@ -4806,6 +6407,7 @@ impl Database {
             total,
             remaining,
             last_error: None,
+            identity_repair: self.canonical_identity_repair_status().await?,
         })
     }
 
@@ -4968,7 +6570,129 @@ impl Database {
         canonical_release::Entity::delete_by_id(source.to_string())
             .exec(&self.connection)
             .await?;
-        self.rebuild_release_metadata(target).await
+        self.rebuild_release_metadata(target).await?;
+        self.reconcile_release_artist_identities(target).await
+    }
+
+    async fn reconcile_release_artist_identities(&self, release_id: Uuid) -> Result<()> {
+        let release_sources = release_source::Entity::find()
+            .filter(release_source::Column::ReleaseId.eq(release_id.to_string()))
+            .all(&self.connection)
+            .await?;
+        let all_sources = artist_source::Entity::find().all(&self.connection).await?;
+        let source_by_key = all_sources
+            .iter()
+            .map(|source| {
+                (
+                    (
+                        source.tracker.to_ascii_lowercase(),
+                        source.source_key.clone(),
+                    ),
+                    source.canonical_artist_id.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut groups: HashMap<String, HashMap<String, HashSet<Uuid>>> = HashMap::new();
+        for source in release_sources {
+            let tracker = source.tracker.to_ascii_lowercase();
+            let Ok(summary) = serde_json::from_value::<ReleaseSummary>(source.source_json) else {
+                continue;
+            };
+            for credit in summary
+                .artists
+                .iter()
+                .filter(|credit| credit.role == ArtistRole::Primary)
+            {
+                let normalized_name = crate::release_matcher::normalized(&credit.name);
+                if generic_artist_name(&normalized_name) {
+                    continue;
+                }
+                let artist_id = source_by_key
+                    .get(&(credit.tracker.to_ascii_lowercase(), credit.key.clone()))
+                    .map(String::as_str)
+                    .map(Uuid::parse_str)
+                    .transpose()?
+                    .or(credit.canonical_id);
+                if let Some(artist_id) = artist_id {
+                    groups
+                        .entry(normalized_name)
+                        .or_default()
+                        .entry(tracker.clone())
+                        .or_default()
+                        .insert(artist_id);
+                }
+            }
+        }
+        for (normalized_name, tracker_ids) in groups {
+            if tracker_ids.len() < 2 {
+                continue;
+            }
+            let mut ids = tracker_ids.into_values().flatten().collect::<Vec<_>>();
+            ids.sort();
+            ids.dedup();
+            if ids.len() < 2 {
+                continue;
+            }
+            let mut ranked = Vec::new();
+            for id in ids.iter().copied() {
+                let sources = all_sources
+                    .iter()
+                    .filter(|source| source.canonical_artist_id == id.to_string())
+                    .collect::<Vec<_>>();
+                ranked.push((
+                    std::cmp::Reverse(
+                        sources
+                            .iter()
+                            .filter(|source| source.artist_id.is_some())
+                            .count(),
+                    ),
+                    id,
+                ));
+            }
+            ranked.sort();
+            let target = ranked[0].1;
+            for (_, source) in ranked.iter().copied().skip(1) {
+                let Some(source_artist) = canonical_artist::Entity::find_by_id(source.to_string())
+                    .one(&self.connection)
+                    .await?
+                else {
+                    continue;
+                };
+                let Some(target_artist) = canonical_artist::Entity::find_by_id(target.to_string())
+                    .one(&self.connection)
+                    .await?
+                else {
+                    break;
+                };
+                if source_artist.normalized_name != normalized_name
+                    || target_artist.normalized_name != normalized_name
+                    || !source_artist
+                        .overrides_json
+                        .as_object()
+                        .is_none_or(|v| v.is_empty())
+                    || !target_artist
+                        .overrides_json
+                        .as_object()
+                        .is_none_or(|v| v.is_empty())
+                    || self
+                        .match_pair_was_rejected("artist", target, source)
+                        .await?
+                {
+                    continue;
+                }
+                self.put_match_candidate(
+                    "artist",
+                    target,
+                    source,
+                    1.0,
+                    "accepted_auto",
+                    &serde_json::json!({ "releaseId": release_id, "reason": "shared canonical release" }),
+                )
+                .await?;
+                self.merge_artists(target, source).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn merge_artists(&self, target: Uuid, source: Uuid) -> Result<()> {
@@ -4977,43 +6701,64 @@ impl Database {
         if target == source {
             return Ok(());
         }
+        let transaction = self.begin_write().await?;
         let source_rows = artist_source::Entity::find()
             .filter(artist_source::Column::CanonicalArtistId.eq(source.to_string()))
-            .all(&self.connection)
+            .all(&transaction)
             .await?;
         for model in source_rows {
             let mut active = model.into_active_model();
             active.canonical_artist_id = Set(target.to_string());
-            active.update(&self.connection).await?;
+            active.matcher_version = Set(ARTIST_MATCHER_VERSION);
+            active.update(&transaction).await?;
         }
         let credits = canonical_release_credit::Entity::find()
             .filter(canonical_release_credit::Column::ArtistId.eq(source.to_string()))
-            .all(&self.connection)
+            .all(&transaction)
             .await?;
+        let affected_releases = credits
+            .iter()
+            .filter_map(|credit| Uuid::parse_str(&credit.release_id).ok())
+            .collect::<HashSet<_>>();
         for credit in credits {
             let target_key = (
                 credit.release_id.clone(),
                 target.to_string(),
                 credit.role.clone(),
             );
-            if canonical_release_credit::Entity::find_by_id(target_key.clone())
-                .one(&self.connection)
+            if let Some(existing) = canonical_release_credit::Entity::find_by_id(target_key.clone())
+                .one(&transaction)
                 .await?
-                .is_none()
             {
+                let mut active = existing.into_active_model();
+                active.source_count =
+                    Set(active.source_count.take().unwrap_or_default() + credit.source_count);
+                active.update(&transaction).await?;
+            } else {
                 canonical_release_credit::ActiveModel {
                     release_id: Set(target_key.0),
                     artist_id: Set(target_key.1),
                     role: Set(target_key.2),
                     source_count: Set(credit.source_count),
                 }
-                .insert(&self.connection)
+                .insert(&transaction)
                 .await?;
             }
-            credit.delete(&self.connection).await?;
+            credit.delete(&transaction).await?;
         }
-        let mut affected_releases = std::collections::HashSet::new();
-        for model in release_source::Entity::find().all(&self.connection).await? {
+        let release_ids = affected_releases
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>();
+        let source_models = if release_ids.is_empty() {
+            Vec::new()
+        } else {
+            release_source::Entity::find()
+                .filter(release_source::Column::ReleaseId.is_in(release_ids))
+                .all(&transaction)
+                .await?
+        };
+        for model in source_models {
             let Ok(mut summary) =
                 serde_json::from_value::<ReleaseSummary>(model.source_json.clone())
             else {
@@ -5027,16 +6772,55 @@ impl Database {
                 }
             }
             if changed {
-                affected_releases.insert(Uuid::parse_str(&model.release_id)?);
                 let mut active = model.into_active_model();
                 active.source_json = Set(serde_json::to_value(summary)?);
-                active.update(&self.connection).await?;
+                active.update(&transaction).await?;
             }
         }
-        self.put_alias("artist", source, target).await?;
-        canonical_artist::Entity::delete_by_id(source.to_string())
-            .exec(&self.connection)
+        if canonical_alias::Entity::find_by_id(("artist".to_owned(), source.to_string()))
+            .one(&transaction)
+            .await?
+            .is_none()
+        {
+            canonical_alias::ActiveModel {
+                kind: Set("artist".into()),
+                alias_id: Set(source.to_string()),
+                target_id: Set(target.to_string()),
+                created_at: Set(Utc::now().to_rfc3339()),
+            }
+            .insert(&transaction)
             .await?;
+        }
+        let candidates = match_candidate::Entity::find()
+            .filter(match_candidate::Column::Kind.eq("artist"))
+            .filter(
+                Condition::any()
+                    .add(match_candidate::Column::LeftId.eq(source.to_string()))
+                    .add(match_candidate::Column::RightId.eq(source.to_string())),
+            )
+            .all(&transaction)
+            .await?;
+        for candidate in candidates {
+            if candidate.status == "rejected" {
+                continue;
+            }
+            let other_id = if candidate.left_id == source.to_string() {
+                &candidate.right_id
+            } else {
+                &candidate.left_id
+            };
+            if other_id != &target.to_string() {
+                continue;
+            }
+            let mut active = candidate.into_active_model();
+            active.status = Set("accepted_auto".into());
+            active.updated_at = Set(Utc::now().to_rfc3339());
+            active.update(&transaction).await?;
+        }
+        canonical_artist::Entity::delete_by_id(source.to_string())
+            .exec(&transaction)
+            .await?;
+        transaction.commit().await?;
         for release_id in affected_releases {
             self.rebuild_release_metadata(release_id).await?;
         }
@@ -5134,6 +6918,7 @@ impl Database {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub async fn observe_download(
         &self,
         live: &LiveDownloadStatus,
@@ -5152,12 +6937,47 @@ impl Database {
     }
 
     pub async fn observe_downloads(&self, observations: &[DownloadObservation]) -> Result<()> {
-        let transaction = self.begin_write().await?;
-        for observation in observations {
-            self.observe_download_on(&transaction, observation).await?;
+        let batch_count = observations.len().div_ceil(DOWNLOAD_WRITE_BATCH_SIZE);
+        for (batch_index, batch) in observations.chunks(DOWNLOAD_WRITE_BATCH_SIZE).enumerate() {
+            let transaction = self.begin_write().await?;
+            for observation in batch {
+                self.observe_download_on(&transaction, observation).await?;
+            }
+            transaction.commit().await?;
+            if batch_index + 1 < batch_count {
+                tokio::task::yield_now().await;
+            }
         }
-        transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn live_downloads_by_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<HashMap<String, Vec<LiveDownloadStatus>>> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let models = download_release_link::Entity::find()
+            .filter(download_release_link::Column::Present.eq(true))
+            .filter(
+                download_release_link::Column::InfoHash
+                    .is_in(hashes.iter().map(|hash| hash.to_ascii_lowercase())),
+            )
+            .all(&self.connection)
+            .await?;
+        let mut result = HashMap::new();
+        for model in models {
+            let Some(value) = model.observed_json else {
+                continue;
+            };
+            let live: LiveDownloadStatus = serde_json::from_value(value)?;
+            result
+                .entry(model.info_hash.to_ascii_lowercase())
+                .or_insert_with(Vec::new)
+                .push(live);
+        }
+        Ok(result)
     }
 
     async fn observe_download_on<C: ConnectionTrait>(
@@ -5415,6 +7235,56 @@ impl Database {
             .collect())
     }
 
+    pub async fn list_match_candidates_for_library(
+        &self,
+        kind: Option<&str>,
+        status: Option<&str>,
+        limit: u64,
+        release_ids: &[String],
+        artist_ids: &[String],
+    ) -> Result<Vec<match_candidate::Model>> {
+        if release_ids.is_empty() && artist_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = match_candidate::Entity::find();
+        if let Some(kind) = kind {
+            query = query.filter(match_candidate::Column::Kind.eq(kind));
+        }
+        if let Some(status) = status {
+            query = query.filter(match_candidate::Column::Status.eq(status));
+        }
+        let mut scope = Condition::any();
+        if !release_ids.is_empty() {
+            scope = scope.add(
+                Condition::all()
+                    .add(match_candidate::Column::Kind.eq("release"))
+                    .add(
+                        Condition::any()
+                            .add(match_candidate::Column::LeftId.is_in(release_ids.to_vec()))
+                            .add(match_candidate::Column::RightId.is_in(release_ids.to_vec())),
+                    ),
+            );
+        }
+        if !artist_ids.is_empty() {
+            scope = scope.add(
+                Condition::all()
+                    .add(match_candidate::Column::Kind.eq("artist"))
+                    .add(
+                        Condition::any()
+                            .add(match_candidate::Column::LeftId.is_in(artist_ids.to_vec()))
+                            .add(match_candidate::Column::RightId.is_in(artist_ids.to_vec())),
+                    ),
+            );
+        }
+        Ok(query
+            .filter(scope)
+            .order_by_desc(match_candidate::Column::Score)
+            .order_by_asc(match_candidate::Column::CreatedAt)
+            .limit(limit.clamp(1, 500))
+            .all(&self.connection)
+            .await?)
+    }
+
     pub async fn unregistered_downloads(&self) -> Result<Vec<DownloadReleaseLink>> {
         Ok(download_release_link::Entity::find()
             .filter(download_release_link::Column::Present.eq(true))
@@ -5559,25 +7429,36 @@ impl Database {
         scan_started_at: DateTime<Utc>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let transaction = self.begin_write().await?;
         let stale = download_release_link::Entity::find()
             .filter(download_release_link::Column::Client.eq(client))
             .filter(download_release_link::Column::LastSeenAt.lt(scan_started_at.to_rfc3339()))
-            .all(&transaction)
+            .all(&self.connection)
             .await?;
-        for model in stale {
-            if model.library_added_at.is_some() {
-                let has_missing_since = model.missing_since.is_some();
-                let mut active = model.into_active_model();
-                active.present = Set(false);
-                if !has_missing_since {
-                    active.missing_since = Set(Some(now.clone()));
+        let batch_count = stale.len().div_ceil(DOWNLOAD_WRITE_BATCH_SIZE);
+        for (batch_index, batch) in stale.chunks(DOWNLOAD_WRITE_BATCH_SIZE).enumerate() {
+            let transaction = self.begin_write().await?;
+            for model in batch.iter().cloned() {
+                if model.library_added_at.is_some() {
+                    let has_missing_since = model.missing_since.is_some();
+                    let mut active = model.into_active_model();
+                    active.present = Set(false);
+                    if !has_missing_since {
+                        active.missing_since = Set(Some(now.clone()));
+                    }
+                    active.update(&transaction).await?;
+                } else {
+                    model.delete(&transaction).await?;
                 }
-                active.update(&transaction).await?;
-            } else {
-                model.delete(&transaction).await?;
+            }
+            transaction.commit().await?;
+            if batch_index + 1 < batch_count {
+                tokio::task::yield_now().await;
             }
         }
+
+        // Publish scan completion only after every stale link has been reconciled. If a batch
+        // fails, the next full snapshot can safely repeat the idempotent link updates.
+        let transaction = self.begin_write().await?;
         if let Some(model) = download_client_scan::Entity::find_by_id(client)
             .one(&transaction)
             .await?
@@ -5793,39 +7674,12 @@ impl Database {
         let metadata = self.resolved_download_metadata(&links).await?;
         let mut indexed = Vec::with_capacity(links.len());
         for link in links {
-            let exact = link
-                .tracker
-                .clone()
-                .zip(link.torrent_id)
-                .and_then(|identity| metadata.canonical_by_identity.get(&identity).cloned());
-            let (release, variant) = if let Some(canonical) = exact {
-                let canonical = canonical_from_model(canonical)?;
-                let Cached {
-                    value,
-                    fetched_at,
-                    expires_at,
-                } = canonical;
-                (
-                    Cached {
-                        value: value.release,
-                        fetched_at,
-                        expires_at,
-                    },
-                    Some(value.variant),
-                )
-            } else {
-                let Some(release_id) = link.release_id.as_deref() else {
-                    continue;
-                };
-                let Some(release) = metadata.release_by_id.get(release_id).cloned() else {
-                    continue;
-                };
-                (cached_release_from_model(release)?, None)
+            let Some((release, variant)) = resolved_link_release(&link, &metadata)? else {
+                continue;
             };
             indexed.push(IndexedDownload {
                 release,
                 variant,
-                client: link.client,
                 info_hash: link.info_hash,
                 live: link.observed_json.map(serde_json::from_value).transpose()?,
                 observed_at: link
@@ -5839,31 +7693,625 @@ impl Database {
     }
 
     pub async fn list_library_records(&self) -> Result<Vec<LibraryRecord>> {
-        let links = download_release_link::Entity::find()
-            .filter(download_release_link::Column::ResolutionState.eq("linked"))
-            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
-            .all(&self.connection)
-            .await?;
-        self.library_records_from_links(links).await
+        self.list_library_records_filtered(None, false).await
     }
 
+    pub async fn library_projection_state(&self) -> Result<(i64, bool)> {
+        Ok(library_projection_state::Entity::find_by_id(1)
+            .one(&self.connection)
+            .await?
+            .map_or((0, false), |state| (state.revision, state.ready)))
+    }
+
+    pub async fn library_projection_dirty(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<LibraryProjectionDirtyRecord>> {
+        Ok(library_projection_dirty::Entity::find()
+            .order_by_asc(library_projection_dirty::Column::UpdatedAt)
+            .limit(limit)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|row| LibraryProjectionDirtyRecord {
+                release_id: row.release_id,
+                version: row.version,
+            })
+            .collect())
+    }
+
+    pub async fn projected_library_releases(&self) -> Result<Vec<LibraryRelease>> {
+        library_release_projection::Entity::find()
+            .order_by_desc(library_release_projection::Column::SortYear)
+            .order_by_asc(library_release_projection::Column::NormalizedTitle)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|row| Ok(serde_json::from_value(row.document_json)?))
+            .collect()
+    }
+
+    pub async fn projected_library_releases_filtered(
+        &self,
+        filter: &LibraryProjectionFilter,
+    ) -> Result<Vec<LibraryRelease>> {
+        let mut query = library_release_projection::Entity::find();
+        for term in &filter.search_terms {
+            let term = term.trim().to_lowercase();
+            if !term.is_empty() {
+                query = query.filter(library_release_projection::Column::SearchText.contains(term));
+            }
+        }
+        if let Some(tracker) = filter.tracker.as_deref().filter(|value| *value != "all") {
+            query = query.filter(
+                library_release_projection::Column::TrackerKeys
+                    .contains(format!("|{}|", tracker.trim().to_lowercase())),
+            );
+        }
+        if let Some(format) = filter.format.as_deref() {
+            query = query.filter(
+                library_release_projection::Column::FormatKeys
+                    .contains(format!("|{}|", format.trim().to_lowercase())),
+            );
+        }
+        if let Some(encoding) = filter.encoding.as_deref() {
+            query = query.filter(
+                library_release_projection::Column::EncodingKeys
+                    .contains(format!("|{}|", encoding.trim().to_lowercase())),
+            );
+        }
+        if let Some(media) = filter.media.as_deref() {
+            query = query.filter(
+                library_release_projection::Column::MediaKeys
+                    .contains(format!("|{}|", media.trim().to_lowercase())),
+            );
+        }
+        if let Some(year) = filter.year {
+            query = query.filter(library_release_projection::Column::SortYear.eq(year));
+        }
+        if let Some(kind) = filter.release_type.as_deref() {
+            query = query.filter(
+                library_release_projection::Column::ReleaseType.eq(kind.trim().to_lowercase()),
+            );
+        }
+        if let Some(availability) = filter
+            .availability
+            .as_deref()
+            .filter(|value| *value != "all")
+        {
+            query = query.filter(
+                library_release_projection::Column::Availability
+                    .eq(availability.trim().to_lowercase()),
+            );
+        }
+        query
+            .order_by_desc(library_release_projection::Column::SortYear)
+            .order_by_asc(library_release_projection::Column::NormalizedTitle)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|row| Ok(serde_json::from_value(row.document_json)?))
+            .collect()
+    }
+
+    pub async fn projected_library_singles(&self) -> Result<Vec<LibraryRelease>> {
+        library_release_projection::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(library_release_projection::Column::ReleaseType.eq("single"))
+                    .add(library_release_projection::Column::ReleaseType.eq("Single")),
+            )
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|row| Ok(serde_json::from_value(row.document_json)?))
+            .collect()
+    }
+
+    pub async fn projected_unresolved_credit_count(&self) -> Result<u64> {
+        Ok(library_release_projection::Entity::find()
+            .filter(library_release_projection::Column::UnresolvedCredits.eq(true))
+            .count(&self.connection)
+            .await?)
+    }
+
+    pub async fn projected_library_releases_for_ids(
+        &self,
+        release_ids: &[Uuid],
+    ) -> Result<Vec<LibraryRelease>> {
+        if release_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested = release_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut releases = Vec::new();
+        for chunk in requested.chunks(300) {
+            for row in library_release_projection::Entity::find()
+                .filter(library_release_projection::Column::ReleaseId.is_in(chunk.iter().cloned()))
+                .all(&self.connection)
+                .await?
+            {
+                releases.push(serde_json::from_value(row.document_json)?);
+            }
+        }
+        Ok(releases)
+    }
+
+    pub async fn projected_library_artists(&self) -> Result<Vec<LibraryArtistSummary>> {
+        library_artist_projection::Entity::find()
+            .order_by_asc(library_artist_projection::Column::NormalizedName)
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|row| Ok(serde_json::from_value(row.document_json)?))
+            .collect()
+    }
+
+    pub async fn projected_library_artist(
+        &self,
+        artist_key: &str,
+    ) -> Result<Option<LibraryArtistSummary>> {
+        library_artist_projection::Entity::find_by_id(artist_key)
+            .one(&self.connection)
+            .await?
+            .map(|row| serde_json::from_value(row.document_json).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn projected_library_release_ids_for_artist(
+        &self,
+        artist_key: &str,
+    ) -> Result<Vec<Uuid>> {
+        library_artist_release_projection::Entity::find()
+            .select_only()
+            .column(library_artist_release_projection::Column::ReleaseId)
+            .filter(library_artist_release_projection::Column::ArtistKey.eq(artist_key))
+            .into_tuple::<String>()
+            .all(&self.connection)
+            .await?
+            .into_iter()
+            .map(|id| Uuid::parse_str(&id).map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn projected_artist_keys_for_releases(
+        &self,
+        release_ids: &[Uuid],
+    ) -> Result<HashSet<String>> {
+        if release_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let requested = release_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut keys = HashSet::new();
+        for chunk in requested.chunks(300) {
+            keys.extend(
+                library_artist_release_projection::Entity::find()
+                    .select_only()
+                    .column(library_artist_release_projection::Column::ArtistKey)
+                    .filter(
+                        library_artist_release_projection::Column::ReleaseId
+                            .is_in(chunk.iter().cloned()),
+                    )
+                    .into_tuple::<String>()
+                    .all(&self.connection)
+                    .await?,
+            );
+        }
+        Ok(keys)
+    }
+
+    pub async fn projected_release_ids_for_artist_keys(
+        &self,
+        artist_keys: &HashSet<String>,
+    ) -> Result<HashSet<Uuid>> {
+        if artist_keys.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let requested = artist_keys.iter().cloned().collect::<Vec<_>>();
+        let mut ids = HashSet::new();
+        for chunk in requested.chunks(300) {
+            for id in library_artist_release_projection::Entity::find()
+                .select_only()
+                .column(library_artist_release_projection::Column::ReleaseId)
+                .filter(
+                    library_artist_release_projection::Column::ArtistKey
+                        .is_in(chunk.iter().cloned()),
+                )
+                .into_tuple::<String>()
+                .all(&self.connection)
+                .await?
+            {
+                ids.insert(Uuid::parse_str(&id)?);
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn incremental_library_projection_changed(
+        &self,
+        requested_ids: &[String],
+        releases: &[LibraryRelease],
+        artists: &[LibraryArtistSummary],
+        relations: &[(String, Uuid)],
+        affected_artist_keys: &HashSet<String>,
+    ) -> Result<bool> {
+        let mut stored_releases = HashMap::new();
+        for chunk in requested_ids.chunks(300) {
+            for row in library_release_projection::Entity::find()
+                .filter(library_release_projection::Column::ReleaseId.is_in(chunk.iter().cloned()))
+                .all(&self.connection)
+                .await?
+            {
+                stored_releases.insert(
+                    row.release_id,
+                    library_projection_semantic_document(&row.document_json),
+                );
+            }
+        }
+        let projected_releases = releases
+            .iter()
+            .filter_map(|release| {
+                release.release.id.map(|release_id| {
+                    Ok((
+                        release_id.to_string(),
+                        library_projection_semantic_document(&serde_json::to_value(release)?),
+                    ))
+                })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        if stored_releases != projected_releases {
+            return Ok(true);
+        }
+
+        let affected = affected_artist_keys.iter().cloned().collect::<Vec<_>>();
+        let mut stored_artists = HashMap::new();
+        for chunk in affected.chunks(300) {
+            for row in library_artist_projection::Entity::find()
+                .filter(library_artist_projection::Column::ArtistKey.is_in(chunk.iter().cloned()))
+                .all(&self.connection)
+                .await?
+            {
+                stored_artists.insert(row.artist_key, row.document_json);
+            }
+        }
+        let projected_artists = artists
+            .iter()
+            .map(|artist| {
+                let artist_key = artist.id.map(|id| id.to_string()).unwrap_or_else(|| {
+                    format!("{}:{}", artist.tracker.to_ascii_lowercase(), artist.key)
+                });
+                Ok((artist_key, serde_json::to_value(artist)?))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        if stored_artists != projected_artists {
+            return Ok(true);
+        }
+
+        let mut stored_relations = HashSet::new();
+        for chunk in requested_ids.chunks(300) {
+            stored_relations.extend(
+                library_artist_release_projection::Entity::find()
+                    .filter(
+                        library_artist_release_projection::Column::ReleaseId
+                            .is_in(chunk.iter().cloned()),
+                    )
+                    .all(&self.connection)
+                    .await?
+                    .into_iter()
+                    .map(|row| (row.artist_key, row.release_id)),
+            );
+        }
+        let projected_relations = relations
+            .iter()
+            .map(|(artist_key, release_id)| (artist_key.clone(), release_id.to_string()))
+            .collect::<HashSet<_>>();
+        Ok(stored_relations != projected_relations)
+    }
+
+    pub async fn store_library_projection(
+        &self,
+        full: bool,
+        dirty: &[LibraryProjectionDirtyRecord],
+        releases: &[LibraryRelease],
+        artists: &[LibraryArtistSummary],
+        relations: &[(String, Uuid)],
+        affected_artist_keys: &HashSet<String>,
+    ) -> Result<bool> {
+        let requested_ids = dirty
+            .iter()
+            .filter(|row| row.release_id != "*")
+            .map(|row| row.release_id.clone())
+            .collect::<Vec<_>>();
+        let projection_changed = full
+            || self
+                .incremental_library_projection_changed(
+                    &requested_ids,
+                    releases,
+                    artists,
+                    relations,
+                    affected_artist_keys,
+                )
+                .await?;
+        let transaction = self.begin_write().await?;
+        if !projection_changed {
+            for row in dirty {
+                library_projection_dirty::Entity::delete_many()
+                    .filter(library_projection_dirty::Column::ReleaseId.eq(row.release_id.clone()))
+                    .filter(library_projection_dirty::Column::Version.eq(row.version))
+                    .exec(&transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        if full {
+            library_artist_release_projection::Entity::delete_many()
+                .exec(&transaction)
+                .await?;
+            library_artist_projection::Entity::delete_many()
+                .exec(&transaction)
+                .await?;
+            library_release_projection::Entity::delete_many()
+                .exec(&transaction)
+                .await?;
+        } else {
+            for chunk in requested_ids.chunks(300) {
+                library_artist_release_projection::Entity::delete_many()
+                    .filter(
+                        library_artist_release_projection::Column::ReleaseId
+                            .is_in(chunk.iter().cloned()),
+                    )
+                    .exec(&transaction)
+                    .await?;
+                library_release_projection::Entity::delete_many()
+                    .filter(
+                        library_release_projection::Column::ReleaseId.is_in(chunk.iter().cloned()),
+                    )
+                    .exec(&transaction)
+                    .await?;
+            }
+            let affected = affected_artist_keys.iter().cloned().collect::<Vec<_>>();
+            for chunk in affected.chunks(300) {
+                library_artist_projection::Entity::delete_many()
+                    .filter(
+                        library_artist_projection::Column::ArtistKey.is_in(chunk.iter().cloned()),
+                    )
+                    .exec(&transaction)
+                    .await?;
+            }
+        }
+
+        let now = Utc::now().to_rfc3339();
+        for chunk in releases.chunks(200) {
+            let mut rows = Vec::new();
+            for release in chunk {
+                if let Some(release_id) = release.release.id {
+                    rows.push(library_release_projection::ActiveModel {
+                        release_id: Set(release_id.to_string()),
+                        normalized_title: Set(release.release.title.trim().to_lowercase()),
+                        search_text: Set(projection_search_text(release)),
+                        tracker_keys: Set(projection_facet(
+                            std::iter::once(release.release.tracker.as_str())
+                                .chain(
+                                    release
+                                        .release
+                                        .sources
+                                        .iter()
+                                        .map(|source| source.tracker.as_str()),
+                                )
+                                .chain(
+                                    release
+                                        .variants
+                                        .iter()
+                                        .map(|variant| variant.tracker.as_str()),
+                                ),
+                        )),
+                        format_keys: Set(projection_facet(
+                            release
+                                .variants
+                                .iter()
+                                .filter_map(|variant| variant.format.as_deref()),
+                        )),
+                        encoding_keys: Set(projection_facet(
+                            release
+                                .variants
+                                .iter()
+                                .filter_map(|variant| variant.encoding.as_deref()),
+                        )),
+                        media_keys: Set(projection_facet(
+                            release
+                                .variants
+                                .iter()
+                                .filter_map(|variant| variant.media.as_deref()),
+                        )),
+                        sort_year: Set(release.release.year),
+                        release_type: Set(release
+                            .release
+                            .release_type
+                            .as_deref()
+                            .map(str::to_lowercase)),
+                        availability: Set(match release.availability {
+                            LibraryAvailability::Present => "present",
+                            LibraryAvailability::Partial => "partial",
+                            LibraryAvailability::Missing => "missing",
+                        }
+                        .to_owned()),
+                        covered_single: Set(release.release.album_coverage.is_some()),
+                        unresolved_credits: Set(release
+                            .release
+                            .artists
+                            .iter()
+                            .all(|artist| artist.source == ArtistCreditSource::DisplayFallback)),
+                        document_json: Set(serde_json::to_value(release)?),
+                        updated_at: Set(now.clone()),
+                    });
+                }
+            }
+            if !rows.is_empty() {
+                library_release_projection::Entity::insert_many(rows)
+                    .on_conflict(
+                        OnConflict::column(library_release_projection::Column::ReleaseId)
+                            .update_columns([
+                                library_release_projection::Column::NormalizedTitle,
+                                library_release_projection::Column::SearchText,
+                                library_release_projection::Column::TrackerKeys,
+                                library_release_projection::Column::FormatKeys,
+                                library_release_projection::Column::EncodingKeys,
+                                library_release_projection::Column::MediaKeys,
+                                library_release_projection::Column::SortYear,
+                                library_release_projection::Column::ReleaseType,
+                                library_release_projection::Column::Availability,
+                                library_release_projection::Column::CoveredSingle,
+                                library_release_projection::Column::UnresolvedCredits,
+                                library_release_projection::Column::DocumentJson,
+                                library_release_projection::Column::UpdatedAt,
+                            ])
+                            .to_owned(),
+                    )
+                    .exec(&transaction)
+                    .await?;
+            }
+        }
+        for chunk in artists.chunks(200) {
+            let rows = chunk
+                .iter()
+                .map(|artist| {
+                    let artist_key = artist.id.map(|id| id.to_string()).unwrap_or_else(|| {
+                        format!("{}:{}", artist.tracker.to_ascii_lowercase(), artist.key)
+                    });
+                    Ok(library_artist_projection::ActiveModel {
+                        artist_key: Set(artist_key),
+                        canonical_id: Set(artist.id.map(|id| id.to_string())),
+                        normalized_name: Set(artist_sort_name_for_projection(&artist.name)),
+                        document_json: Set(serde_json::to_value(artist)?),
+                        updated_at: Set(now.clone()),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !rows.is_empty() {
+                library_artist_projection::Entity::insert_many(rows)
+                    .on_conflict(
+                        OnConflict::column(library_artist_projection::Column::ArtistKey)
+                            .update_columns([
+                                library_artist_projection::Column::CanonicalId,
+                                library_artist_projection::Column::NormalizedName,
+                                library_artist_projection::Column::DocumentJson,
+                                library_artist_projection::Column::UpdatedAt,
+                            ])
+                            .to_owned(),
+                    )
+                    .exec(&transaction)
+                    .await?;
+            }
+        }
+        for chunk in relations.chunks(300) {
+            let rows = chunk
+                .iter()
+                .map(
+                    |(artist_key, release_id)| library_artist_release_projection::ActiveModel {
+                        artist_key: Set(artist_key.clone()),
+                        release_id: Set(release_id.to_string()),
+                    },
+                )
+                .collect::<Vec<_>>();
+            if !rows.is_empty() {
+                library_artist_release_projection::Entity::insert_many(rows)
+                    .on_conflict(
+                        OnConflict::columns([
+                            library_artist_release_projection::Column::ArtistKey,
+                            library_artist_release_projection::Column::ReleaseId,
+                        ])
+                        .do_nothing()
+                        .to_owned(),
+                    )
+                    .exec(&transaction)
+                    .await?;
+            }
+        }
+
+        for row in dirty {
+            library_projection_dirty::Entity::delete_many()
+                .filter(library_projection_dirty::Column::ReleaseId.eq(row.release_id.clone()))
+                .filter(library_projection_dirty::Column::Version.eq(row.version))
+                .exec(&transaction)
+                .await?;
+        }
+        let state = library_projection_state::Entity::find_by_id(1)
+            .one(&transaction)
+            .await?;
+        let revision = state.as_ref().map_or(1, |state| state.revision + 1);
+        library_projection_state::ActiveModel {
+            id: Set(1),
+            revision: Set(revision),
+            schema_version: Set(1),
+            ready: Set(true),
+            updated_at: Set(now),
+        }
+        .save(&transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn list_published_library_records(&self) -> Result<Vec<LibraryRecord>> {
+        self.list_library_records_filtered(None, true).await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn list_library_records_for_releases(
         &self,
         release_ids: &[Uuid],
     ) -> Result<Vec<LibraryRecord>> {
-        if release_ids.is_empty() {
+        self.list_library_records_filtered(Some(release_ids), false)
+            .await
+    }
+
+    pub async fn list_published_library_records_for_releases(
+        &self,
+        release_ids: &[Uuid],
+    ) -> Result<Vec<LibraryRecord>> {
+        self.list_library_records_filtered(Some(release_ids), true)
+            .await
+    }
+
+    async fn list_library_records_filtered(
+        &self,
+        release_ids: Option<&[Uuid]>,
+        admitted_only: bool,
+    ) -> Result<Vec<LibraryRecord>> {
+        if release_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
         }
-        let links = download_release_link::Entity::find()
+        let requested =
+            release_ids.map(|ids| ids.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let mut query = download_release_link::Entity::find()
             .filter(download_release_link::Column::ResolutionState.eq("linked"))
-            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
-            .filter(
-                download_release_link::Column::ReleaseId
-                    .is_in(release_ids.iter().map(ToString::to_string)),
-            )
-            .all(&self.connection)
-            .await?;
-        self.library_records_from_links(links).await
+            .filter(download_release_link::Column::LibraryAddedAt.is_not_null());
+        if let Some(requested) = requested.as_ref() {
+            query = query.filter(download_release_link::Column::ReleaseId.is_in(requested.clone()));
+        }
+        if admitted_only {
+            let mut admissions = library_admission::Entity::find()
+                .select_only()
+                .column(library_admission::Column::ReleaseId)
+                .filter(library_admission::Column::AdmittedAt.is_not_null());
+            if let Some(requested) = requested {
+                admissions =
+                    admissions.filter(library_admission::Column::ReleaseId.is_in(requested));
+            }
+            let admitted = admissions
+                .into_tuple::<String>()
+                .all(&self.connection)
+                .await?;
+            query = query.filter(download_release_link::Column::ReleaseId.is_in(admitted));
+        }
+        self.library_records_from_links(query.all(&self.connection).await?)
+            .await
     }
 
     async fn library_records_from_links(
@@ -5876,34 +8324,8 @@ impl Database {
             let Some(library_added_at) = link.library_added_at.as_deref() else {
                 continue;
             };
-            let exact = link
-                .tracker
-                .clone()
-                .zip(link.torrent_id)
-                .and_then(|identity| metadata.canonical_by_identity.get(&identity).cloned());
-            let (release, variant) = if let Some(canonical) = exact {
-                let canonical = canonical_from_model(canonical)?;
-                let Cached {
-                    value,
-                    fetched_at,
-                    expires_at,
-                } = canonical;
-                (
-                    Cached {
-                        value: value.release,
-                        fetched_at,
-                        expires_at,
-                    },
-                    Some(value.variant),
-                )
-            } else {
-                let Some(release_id) = link.release_id.as_deref() else {
-                    continue;
-                };
-                let Some(release) = metadata.release_by_id.get(release_id).cloned() else {
-                    continue;
-                };
-                (cached_release_from_model(release)?, None)
+            let Some((release, variant)) = resolved_link_release(&link, &metadata)? else {
+                continue;
             };
             let library_added_at = parse_timestamp(library_added_at)?;
             records.push(LibraryRecord {
@@ -5964,6 +8386,11 @@ impl Database {
         let release_ids = links
             .iter()
             .filter_map(|link| link.release_id.clone())
+            .chain(
+                canonical_by_identity
+                    .values()
+                    .filter_map(|canonical| canonical.release_id.clone()),
+            )
             .collect::<Vec<_>>();
         let release_by_id = if release_ids.is_empty() {
             HashMap::new()
@@ -6013,6 +8440,39 @@ impl Database {
         .await?;
         Ok(())
     }
+}
+
+fn resolved_link_release(
+    link: &download_release_link::Model,
+    metadata: &ResolvedDownloadMetadata,
+) -> Result<Option<(Cached<ReleaseSummary>, Option<crate::model::TorrentVariant>)>> {
+    let exact = link
+        .tracker
+        .clone()
+        .zip(link.torrent_id)
+        .and_then(|identity| metadata.canonical_by_identity.get(&identity));
+    if let Some(model) = exact {
+        let canonical = canonical_from_model(model.clone())?;
+        let release_id = model.release_id.as_deref().or(link.release_id.as_deref());
+        let release = release_id
+            .and_then(|id| metadata.release_by_id.get(id))
+            .cloned()
+            .map(cached_release_from_model)
+            .transpose()?
+            .unwrap_or_else(|| Cached {
+                value: canonical.value.release.clone(),
+                fetched_at: canonical.fetched_at,
+                expires_at: canonical.expires_at,
+            });
+        return Ok(Some((release, Some(canonical.value.variant))));
+    }
+    let Some(release_id) = link.release_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(release) = metadata.release_by_id.get(release_id).cloned() else {
+        return Ok(None);
+    };
+    Ok(Some((cached_release_from_model(release)?, None)))
 }
 
 fn snapshot_from_model<T: DeserializeOwned>(model: tracker_snapshot::Model) -> Result<Cached<T>> {
@@ -6533,32 +8993,40 @@ fn parse_cleanup_mode(value: &str) -> Result<ImportCleanupMode> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use chrono::{Duration, Utc};
     use sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database as SeaDatabase,
+        EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
     };
+    use sea_orm_migration::MigratorTrait;
     use tempfile::tempdir;
     use uuid::Uuid;
 
     use crate::{
         entity::{
-            background_job, canonical_torrent, dedupe_catalog_membership, download_release_link,
-            release_source, release_track_index,
+            artist_source, background_job, canonical_artist, canonical_release,
+            canonical_release_credit, canonical_torrent, dedupe_catalog_membership,
+            download_client_scan, download_release_link, library_admission, library_asset,
+            library_asset_reference, library_projection_dirty, release_source, release_track_index,
+            tracker_snapshot,
         },
+        migration::Migrator,
         model::{
             ArtistCatalogRelease, ArtistCatalogRole, CanonicalTorrent, ChannelPackItem,
             ChannelRunStatus, ChannelRunTrigger, ClientDownloadState, ImportCleanupMode,
-            ImportTaskState, LiveDownloadStatus, PackItemPlanState, ProviderCircuitState,
-            RecommendationMatchState, RecommendationSource, ReleaseSummary, TorrentVariant,
-            TrumpedDownloadRef,
+            ImportTaskState, LibraryAvailability, LibraryCopy, LibraryRelease, LiveDownloadStatus,
+            PackItemPlanState, Provenance, ProviderCircuitState, RecommendationMatchState,
+            RecommendationSource, ReleaseSummary, TorrentVariant, TrumpedDownloadRef,
         },
         plex::PlexScanTarget,
         tracker::fallback_artist_credit,
     };
 
     use super::{
-        CreateReplacementImport, Database, DownloadObservation, EnqueueBackgroundJob,
-        StoredProviderState,
+        CreateReplacementImport, DOWNLOAD_WRITE_BATCH_SIZE, Database, DownloadObservation,
+        EnqueueBackgroundJob, StoredProviderState,
     };
 
     fn tracker_release(
@@ -7376,6 +9844,30 @@ mod tests {
             .expect("second claim")
             .expect("recovered job");
         assert_eq!(claimed.id, id);
+        assert!(
+            !db.heartbeat_background_job(
+                id,
+                "wrong-worker",
+                std::time::Duration::from_secs(60),
+                0,
+                None,
+                Some("wrong owner"),
+            )
+            .await
+            .expect("wrong-owner heartbeat")
+        );
+        assert!(
+            db.heartbeat_background_job(
+                id,
+                "worker-two",
+                std::time::Duration::from_secs(60),
+                1,
+                Some(2),
+                Some("working"),
+            )
+            .await
+            .expect("owned heartbeat")
+        );
         assert_eq!(
             db.release_background_job_lease("worker-two")
                 .await
@@ -8022,6 +10514,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_snapshot_mutations_cross_bounded_transaction_batches() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("download-batches.sqlite"))
+            .await
+            .expect("database");
+        let download_count = DOWNLOAD_WRITE_BATCH_SIZE * 2 + 3;
+        let observations = (0..download_count)
+            .map(|index| {
+                let info_hash = format!("{index:040x}");
+                DownloadObservation {
+                    torrent_name: Some(format!("Download {index}")),
+                    live: LiveDownloadStatus {
+                        client: "music".into(),
+                        info_hash,
+                        state: ClientDownloadState::Downloading,
+                        client_state: "downloading".into(),
+                        diagnostic: None,
+                        progress: 0.5,
+                        size: 100,
+                        downloaded: 50,
+                        uploaded: 0,
+                        download_speed: 1,
+                        upload_speed: 0,
+                        eta: Some(50),
+                        ratio: 0.0,
+                        save_path: "/downloads/music".into(),
+                        content_path: None,
+                        added_at: Some(Utc::now()),
+                        completed_at: None,
+                    },
+                    announce_host: None,
+                    tracker: None,
+                    plex_target: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        db.observe_downloads(&observations)
+            .await
+            .expect("batched observations");
+        assert_eq!(
+            download_release_link::Entity::find()
+                .count(&db.connection)
+                .await
+                .expect("observed links"),
+            download_count as u64
+        );
+
+        let removed = observations[..DOWNLOAD_WRITE_BATCH_SIZE + 1]
+            .iter()
+            .map(|observation| observation.live.info_hash.clone())
+            .collect::<Vec<_>>();
+        db.mark_downloads_removed("music", &removed)
+            .await
+            .expect("batched removals");
+        assert_eq!(
+            download_release_link::Entity::find()
+                .count(&db.connection)
+                .await
+                .expect("remaining links"),
+            (download_count - removed.len()) as u64
+        );
+
+        db.complete_client_scan("music", Utc::now() + Duration::seconds(1))
+            .await
+            .expect("batched full-scan cleanup");
+        assert_eq!(
+            download_release_link::Entity::find()
+                .count(&db.connection)
+                .await
+                .expect("cleaned links"),
+            0
+        );
+        assert!(
+            download_client_scan::Entity::find_by_id("music")
+                .one(&db.connection)
+                .await
+                .expect("scan state")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn release_level_matches_leave_torrent_identity_unknown_but_complete_import_review() {
         let directory = tempdir().expect("temporary directory");
         let db = Database::open(&directory.path().join("release-match.sqlite"))
@@ -8462,6 +11037,20 @@ mod tests {
                 .iter()
                 .all(|artist| artist.canonical_id.is_some())
         );
+        assert_eq!(detail.release.artists.len(), 1);
+        let artist_sources = artist_source::Entity::find()
+            .all(&db.connection)
+            .await
+            .expect("artist sources");
+        assert_eq!(artist_sources.len(), 2);
+        assert_eq!(
+            artist_sources
+                .iter()
+                .map(|source| &source.canonical_artist_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
         let source_ids = db
             .release_ids_for_sources(&[
                 ("ops".into(), 100),
@@ -8488,5 +11077,899 @@ mod tests {
                 .expect("stable identity"),
             Some(ops_id)
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_artist_audit_only_repairs_strong_evidence() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("artist-repair.sqlite"))
+            .await
+            .expect("database");
+        let now = Utc::now().to_rfc3339();
+        let release_id = Uuid::new_v4();
+        let shared = [Uuid::new_v4(), Uuid::new_v4()];
+        let ambiguous = [Uuid::new_v4(), Uuid::new_v4()];
+        for (index, artist_id) in shared.into_iter().chain(ambiguous).enumerate() {
+            let name = if index < 2 {
+                "Shared Artist"
+            } else {
+                "Name Only"
+            };
+            canonical_artist::ActiveModel {
+                id: Set(artist_id.to_string()),
+                name: Set(name.into()),
+                normalized_name: Set(crate::release_matcher::normalized(name)),
+                artwork: Set(None),
+                metadata_json: Set(serde_json::json!({ "name": name })),
+                provenance_json: Set(serde_json::json!({})),
+                overrides_json: Set(serde_json::json!({})),
+                created_at: Set(now.clone()),
+                updated_at: Set(now.clone()),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("canonical artist");
+            let tracker = if index % 2 == 0 { "ops" } else { "red" };
+            artist_source::ActiveModel {
+                tracker: Set(tracker.into()),
+                source_key: Set(format!("id:{}", index + 1)),
+                artist_id: Set(Some(index as i64 + 1)),
+                canonical_artist_id: Set(artist_id.to_string()),
+                name: Set(name.into()),
+                normalized_name: Set(crate::release_matcher::normalized(name)),
+                matcher_version: Set(super::ARTIST_MATCHER_VERSION),
+                source_json: Set(serde_json::json!({ "name": name })),
+                fetched_at: Set(now.clone()),
+                expires_at: Set(now.clone()),
+                last_error: Set(None),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("artist source");
+            if index < 2 {
+                canonical_release_credit::ActiveModel {
+                    release_id: Set(release_id.to_string()),
+                    artist_id: Set(artist_id.to_string()),
+                    role: Set("primary".into()),
+                    source_count: Set(1),
+                }
+                .insert(&db.connection)
+                .await
+                .expect("release credit");
+            }
+        }
+        for (index, (tracker, group_id, artist_id)) in
+            [("ops", 10_i64, shared[0]), ("red", 20_i64, shared[1])]
+                .into_iter()
+                .enumerate()
+        {
+            let mut summary = tracker_release(
+                tracker,
+                group_id,
+                group_id * 10,
+                "Shared Release",
+                2026,
+                "Album",
+            )
+            .release;
+            summary.artists = vec![crate::model::ArtistCredit {
+                canonical_id: Some(artist_id),
+                key: format!("id:{}", index + 1),
+                tracker: tracker.into(),
+                artist_id: Some(index as i64 + 1),
+                name: "Shared Artist".into(),
+                role: crate::model::ArtistRole::Primary,
+                source: crate::model::ArtistCreditSource::Structured,
+            }];
+            release_source::ActiveModel {
+                tracker: Set(tracker.into()),
+                group_id: Set(group_id),
+                release_id: Set(release_id.to_string()),
+                normalized_title: Set("shared release".into()),
+                normalized_artist: Set("shared artist".into()),
+                year: Set(Some(2026)),
+                release_type: Set(Some("Album".into())),
+                matcher_version: Set(crate::release_matcher::MATCHER_VERSION),
+                source_json: Set(serde_json::to_value(summary).expect("release summary")),
+                fetched_at: Set(now.clone()),
+                expires_at: Set(now.clone()),
+                last_error: Set(None),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("release source");
+        }
+        download_release_link::ActiveModel {
+            client: Set("music".into()),
+            info_hash: Set("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            announce_host: Set(None),
+            torrent_name: Set(Some("Shared Artist - Shared Release".into())),
+            tracker: Set(Some("ops".into())),
+            group_id: Set(Some(10)),
+            torrent_id: Set(Some(100)),
+            release_id: Set(Some(release_id.to_string())),
+            resolution_state: Set("linked".into()),
+            attempts: Set(0),
+            next_retry_at: Set(None),
+            error_code: Set(None),
+            error_message: Set(None),
+            first_seen_at: Set(now.clone()),
+            last_seen_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+            present: Set(true),
+            missing_since: Set(None),
+            library_added_at: Set(Some(now.clone())),
+            completed_at: Set(Some(now.clone())),
+            observed_json: Set(None),
+            observed_at: Set(None),
+            client_added_at: Set(None),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("library link");
+        let historical_release = Uuid::new_v4();
+        for artist_id in ambiguous {
+            canonical_release_credit::ActiveModel {
+                release_id: Set(historical_release.to_string()),
+                artist_id: Set(artist_id.to_string()),
+                role: Set("primary".into()),
+                source_count: Set(1),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("historical release credit");
+        }
+
+        let plan = db
+            .audit_canonical_identity_repair()
+            .await
+            .expect("identity audit");
+        assert_eq!(plan.components.len(), 1);
+        assert_eq!(plan.ambiguous_names, 0);
+        db.apply_canonical_identity_repair(&plan.fingerprint, 10)
+            .await
+            .expect("identity repair");
+        let mut remaining_shared = 0;
+        for id in shared {
+            if canonical_artist::Entity::find_by_id(id.to_string())
+                .one(&db.connection)
+                .await
+                .expect("shared artist lookup")
+                .is_some()
+            {
+                remaining_shared += 1;
+            }
+        }
+        assert_eq!(remaining_shared, 1);
+        for id in ambiguous {
+            assert!(
+                canonical_artist::Entity::find_by_id(id.to_string())
+                    .one(&db.connection)
+                    .await
+                    .expect("ambiguous artist lookup")
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_artist_repair_migration_upgrades_populated_database() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("artist-repair-upgrade.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let connection = SeaDatabase::connect(&url).await.expect("legacy database");
+        Migrator::up(&connection, Some(15))
+            .await
+            .expect("legacy migrations");
+        connection
+            .execute_unprepared(
+                r#"
+                ALTER TABLE artist_sources DROP COLUMN matcher_version;
+                INSERT INTO canonical_artists
+                    (id, name, normalized_name, artwork, metadata_json, provenance_json, overrides_json, created_at, updated_at)
+                VALUES
+                    ('00000000-0000-0000-0000-000000000001', 'Artist', 'artist', NULL, '{}', '{}', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO artist_sources
+                    (tracker, source_key, artist_id, canonical_artist_id, name, normalized_name, source_json, fetched_at, expires_at, last_error)
+                VALUES
+                    ('ops', 'id:1', 1, '00000000-0000-0000-0000-000000000001', 'Artist', 'artist', '{}', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', NULL);
+                "#,
+            )
+            .await
+            .expect("legacy artist source");
+        connection.close().await.expect("close legacy database");
+
+        let db = Database::open(&path).await.expect("upgraded database");
+        let source = artist_source::Entity::find_by_id(("ops".to_owned(), "id:1".to_owned()))
+            .one(&db.connection)
+            .await
+            .expect("artist source lookup")
+            .expect("artist source");
+        assert_eq!(source.matcher_version, 0);
+    }
+
+    #[tokio::test]
+    async fn local_library_closure_migration_normalizes_legacy_asset_failures() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("library-closure-upgrade.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let connection = SeaDatabase::connect(&url).await.expect("legacy database");
+        Migrator::up(&connection, Some(17))
+            .await
+            .expect("legacy migrations");
+        connection
+            .execute_unprepared(
+                r#"
+                ALTER TABLE library_assets DROP COLUMN retry_after;
+                ALTER TABLE library_assets DROP COLUMN materializer_version;
+                INSERT INTO library_assets
+                    (source_hash, source_url, state, blob_hash, original_extension, mime_type,
+                     width, height, byte_size, error_code, error_message, fetched_at, updated_at)
+                VALUES
+                    ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'https://example.test/missing.jpg', 'failed', NULL, NULL, NULL,
+                     NULL, NULL, NULL, 'materialization_failed',
+                     'artwork is definitively absent (404 Not Found)', NULL,
+                     '2026-08-31T00:00:00Z');
+                "#,
+            )
+            .await
+            .expect("legacy asset");
+        connection.close().await.expect("close legacy database");
+
+        let db = Database::open(&path).await.expect("upgraded database");
+        let asset = library_asset::Entity::find_by_id("a".repeat(64))
+            .one(&db.connection)
+            .await
+            .expect("asset lookup")
+            .expect("asset");
+        assert_eq!(asset.state, "absent");
+        assert_eq!(asset.materializer_version, 1);
+        assert!(asset.retry_after.is_none());
+        assert_eq!(
+            library_asset_reference::Entity::find()
+                .count(&db.connection)
+                .await
+                .expect("reference table"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn change_events_are_durable_ordered_and_prunable() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("changes.sqlite");
+        let db = Database::open(&path).await.expect("database");
+        let first = db
+            .append_change_event("activity,channels", "first")
+            .await
+            .expect("first event");
+        let second = db
+            .append_resource_change_event(
+                "catalog",
+                "library",
+                "second",
+                Some(serde_json::json!({ "releaseId": "release" })),
+            )
+            .await
+            .expect("second event");
+        assert!(second > first);
+        let replay = db.change_events_after(first, 10).await.expect("replay");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].id, second);
+        assert_eq!(replay[0].reason, "second");
+        assert_eq!(replay[0].resources, "library");
+        assert_eq!(
+            replay[0].payload,
+            Some(serde_json::json!({ "releaseId": "release" }))
+        );
+        drop(db);
+
+        let reopened = Database::open(&path).await.expect("reopened database");
+        assert_eq!(
+            reopened.latest_change_cursor().await.expect("cursor"),
+            second
+        );
+        assert_eq!(
+            reopened
+                .prune_change_events(Utc::now() + Duration::seconds(1))
+                .await
+                .expect("prune"),
+            2
+        );
+        assert!(
+            reopened
+                .oldest_change_cursor()
+                .await
+                .expect("oldest")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn library_projection_publishes_only_semantic_document_changes() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("projection-publication.sqlite"))
+            .await
+            .expect("database");
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear initial rebuild marker");
+        let release_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut release = LibraryRelease {
+            release: ReleaseSummary {
+                id: Some(release_id),
+                tracker: "ops".into(),
+                group_id: 1,
+                title: "Stable projection".into(),
+                artist: Some("Artist".into()),
+                artists: vec![fallback_artist_credit("ops", "Artist")],
+                year: Some(2026),
+                artwork: None,
+                release_type: Some("Album".into()),
+                sources: Vec::new(),
+                album_coverage: None,
+            },
+            variants: Vec::new(),
+            release_copies: vec![LibraryCopy {
+                client: "music".into(),
+                info_hash: "hash".into(),
+                present: true,
+                completed_at: now,
+                last_seen_at: now,
+                missing_since: None,
+            }],
+            availability: LibraryAvailability::Present,
+            added_at: now,
+            provenance: Provenance {
+                tracker: "ops".into(),
+                fetched_at: Some(now),
+                cache_age_seconds: Some(0),
+                stale: false,
+                sources: Vec::new(),
+            },
+        };
+        assert!(
+            db.store_library_projection(true, &[], &[release.clone()], &[], &[], &HashSet::new(),)
+                .await
+                .expect("initial projection")
+        );
+        assert_eq!(db.library_projection_state().await.expect("state").0, 1);
+
+        library_projection_dirty::ActiveModel {
+            release_id: Set(release_id.to_string()),
+            version: Set(1),
+            updated_at: Set(now.to_rfc3339()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("telemetry invalidation");
+        release.provenance.fetched_at = Some(now + Duration::hours(1));
+        release.provenance.cache_age_seconds = Some(60);
+        release.provenance.stale = true;
+        release.release_copies[0].last_seen_at = now + Duration::minutes(1);
+        let dirty = db.library_projection_dirty(10).await.expect("dirty rows");
+        assert!(
+            !db.store_library_projection(
+                false,
+                &dirty,
+                &[release.clone()],
+                &[],
+                &[],
+                &HashSet::new(),
+            )
+            .await
+            .expect("telemetry-only refresh")
+        );
+        assert_eq!(db.library_projection_state().await.expect("state").0, 1);
+        assert!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("cleared dirty rows")
+                .is_empty()
+        );
+
+        library_projection_dirty::ActiveModel {
+            release_id: Set(release_id.to_string()),
+            version: Set(1),
+            updated_at: Set((now + Duration::hours(1)).to_rfc3339()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("semantic invalidation");
+        release.release_copies[0].present = false;
+        let dirty = db.library_projection_dirty(10).await.expect("dirty rows");
+        assert!(
+            db.store_library_projection(false, &dirty, &[release], &[], &[], &HashSet::new(),)
+                .await
+                .expect("semantic refresh")
+        );
+        assert_eq!(db.library_projection_state().await.expect("state").0, 2);
+    }
+
+    #[tokio::test]
+    async fn library_projection_triggers_track_semantic_catalog_changes_only() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("projection-dirty.sqlite"))
+            .await
+            .expect("database");
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear initial rebuild marker");
+        let release_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        canonical_release::ActiveModel {
+            id: Set(release_id.to_string()),
+            title: Set("Projected release".into()),
+            normalized_title: Set("projected release".into()),
+            artist: Set(Some("Artist".into())),
+            year: Set(Some(2026)),
+            release_type: Set(Some("Album".into())),
+            artwork: Set(None),
+            metadata_json: Set(serde_json::json!({})),
+            provenance_json: Set(serde_json::json!({})),
+            overrides_json: Set(serde_json::json!({})),
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("canonical release");
+        let dirty = db.library_projection_dirty(10).await.expect("dirty rows");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].release_id, release_id.to_string());
+
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear release invalidation");
+        db.connection
+            .execute_unprepared(&format!(
+                r#"
+                INSERT INTO download_release_links
+                    (client, info_hash, announce_host, torrent_name, tracker, group_id,
+                     torrent_id, release_id, resolution_state, attempts, next_retry_at,
+                     error_code, error_message, first_seen_at, last_seen_at, updated_at,
+                     present, missing_since, library_added_at, completed_at, observed_json,
+                     observed_at, client_added_at)
+                VALUES
+                    ('music', 'hash', NULL, NULL, 'ops', 1, 2, '{release_id}',
+                     'linked', 0, NULL, NULL, NULL, '{now}', '{now}', '{now}',
+                     1, NULL, '{now}', '{now}', NULL, NULL, NULL);
+                "#
+            ))
+            .await
+            .expect("download link");
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear link invalidation");
+        db.connection
+            .execute_unprepared(
+                "UPDATE download_release_links SET present = present, observed_json = '{}' WHERE client = 'music' AND info_hash = 'hash'",
+            )
+            .await
+            .expect("telemetry-only download update");
+        assert!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("dirty rows")
+                .is_empty(),
+            "writing an unchanged semantic column must not invalidate the catalog"
+        );
+        db.connection
+            .execute_unprepared(
+                "UPDATE download_release_links SET present = 0 WHERE client = 'music' AND info_hash = 'hash'",
+            )
+            .await
+            .expect("semantic download update");
+        assert_eq!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("dirty rows")
+                .len(),
+            1,
+            "a real availability transition must invalidate its release"
+        );
+
+        library_asset::ActiveModel {
+            source_hash: Set("a".repeat(64)),
+            source_url: Set("https://example.test/art.jpg".into()),
+            state: Set("pending".into()),
+            blob_hash: Set(None),
+            original_extension: Set(None),
+            mime_type: Set(None),
+            width: Set(None),
+            height: Set(None),
+            byte_size: Set(None),
+            error_code: Set(None),
+            error_message: Set(None),
+            retry_after: Set(None),
+            materializer_version: Set(1),
+            fetched_at: Set(None),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("asset");
+        assert_eq!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("dirty rows")
+                .len(),
+            1,
+            "asset readiness is not a catalog dependency"
+        );
+
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear semantic invalidation");
+        db.connection
+            .execute_unprepared(&format!(
+                "UPDATE canonical_releases SET updated_at = '{now}' WHERE id = '{release_id}'"
+            ))
+            .await
+            .expect("canonical telemetry update");
+        assert!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("dirty rows")
+                .is_empty(),
+            "canonical timestamps are not projection inputs"
+        );
+
+        release_source::ActiveModel {
+            tracker: Set("ops".into()),
+            group_id: Set(1),
+            release_id: Set(release_id.to_string()),
+            normalized_title: Set("projected release".into()),
+            normalized_artist: Set("artist".into()),
+            year: Set(Some(2026)),
+            release_type: Set(Some("Album".into())),
+            matcher_version: Set(1),
+            source_json: Set(serde_json::json!({ "title": "Projected release" })),
+            fetched_at: Set(now.clone()),
+            expires_at: Set(now.clone()),
+            last_error: Set(None),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("release source");
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear source invalidation");
+        db.connection
+            .execute_unprepared(
+                "UPDATE release_sources SET fetched_at = '2027-01-01T00:00:00Z', expires_at = '2027-01-02T00:00:00Z' WHERE tracker = 'ops' AND group_id = 1",
+            )
+            .await
+            .expect("release source telemetry update");
+        assert!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("dirty rows")
+                .is_empty(),
+            "release source cache timestamps are not projection inputs"
+        );
+
+        let artist_id = Uuid::new_v4();
+        canonical_artist::ActiveModel {
+            id: Set(artist_id.to_string()),
+            name: Set("Artist".into()),
+            normalized_name: Set("artist".into()),
+            artwork: Set(None),
+            metadata_json: Set(serde_json::json!({})),
+            provenance_json: Set(serde_json::json!({})),
+            overrides_json: Set(serde_json::json!({})),
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("canonical artist");
+        canonical_release_credit::ActiveModel {
+            release_id: Set(release_id.to_string()),
+            artist_id: Set(artist_id.to_string()),
+            role: Set("primary".into()),
+            source_count: Set(1),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("release credit");
+        artist_source::ActiveModel {
+            tracker: Set("ops".into()),
+            source_key: Set("id:1".into()),
+            artist_id: Set(Some(1)),
+            canonical_artist_id: Set(artist_id.to_string()),
+            name: Set("Artist".into()),
+            normalized_name: Set("artist".into()),
+            matcher_version: Set(1),
+            source_json: Set(serde_json::json!({ "name": "Artist" })),
+            fetched_at: Set(now.clone()),
+            expires_at: Set(now.clone()),
+            last_error: Set(None),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("artist source");
+        library_projection_dirty::Entity::delete_many()
+            .exec(&db.connection)
+            .await
+            .expect("clear artist invalidation");
+        db.connection
+            .execute_unprepared(
+                "UPDATE artist_sources SET fetched_at = '2027-01-01T00:00:00Z', expires_at = '2027-01-02T00:00:00Z' WHERE tracker = 'ops' AND source_key = 'id:1'",
+            )
+            .await
+            .expect("artist source telemetry update");
+        assert!(
+            db.library_projection_dirty(10)
+                .await
+                .expect("dirty rows")
+                .is_empty(),
+            "artist source cache timestamps are not projection inputs"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_closure_is_scoped_and_admission_is_continuously_reconciled() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("library-closure.sqlite"))
+            .await
+            .expect("database");
+        let now = Utc::now().to_rfc3339();
+        let release_id = Uuid::new_v4();
+        let artist_id = Uuid::new_v4();
+        let release_artwork = "https://example.test/release.jpg";
+        let artist_artwork = "https://example.test/artist.jpg";
+        let catalog_artwork = "https://example.test/catalog.jpg";
+        canonical_release::ActiveModel {
+            id: Set(release_id.to_string()),
+            title: Set("Release".into()),
+            normalized_title: Set("release".into()),
+            artist: Set(Some("Artist".into())),
+            year: Set(Some(2026)),
+            release_type: Set(Some("Album".into())),
+            artwork: Set(Some(release_artwork.into())),
+            metadata_json: Set(serde_json::json!({})),
+            provenance_json: Set(serde_json::json!({})),
+            overrides_json: Set(serde_json::json!({})),
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("canonical release");
+        canonical_artist::ActiveModel {
+            id: Set(artist_id.to_string()),
+            name: Set("Artist".into()),
+            normalized_name: Set("artist".into()),
+            artwork: Set(Some(artist_artwork.into())),
+            metadata_json: Set(serde_json::json!({})),
+            provenance_json: Set(serde_json::json!({})),
+            overrides_json: Set(serde_json::json!({})),
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("canonical artist");
+        canonical_release_credit::ActiveModel {
+            release_id: Set(release_id.to_string()),
+            artist_id: Set(artist_id.to_string()),
+            role: Set("primary".into()),
+            source_count: Set(1),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("primary credit");
+        artist_source::ActiveModel {
+            tracker: Set("ops".into()),
+            source_key: Set("id:42".into()),
+            artist_id: Set(Some(42)),
+            canonical_artist_id: Set(artist_id.to_string()),
+            name: Set("Artist".into()),
+            normalized_name: Set("artist".into()),
+            matcher_version: Set(1),
+            source_json: Set(serde_json::json!({})),
+            fetched_at: Set(now.clone()),
+            expires_at: Set(now.clone()),
+            last_error: Set(None),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("artist source");
+        tracker_snapshot::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            tracker: Set("ops".into()),
+            resource_kind: Set("artist".into()),
+            resource_key: Set("42".into()),
+            normalized_json: Set(serde_json::json!({})),
+            sanitized_raw_json: Set(serde_json::json!({})),
+            fetched_at: Set(now.clone()),
+            expires_at: Set(now.clone()),
+            schema_version: Set(1),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("artist snapshot");
+        download_release_link::ActiveModel {
+            client: Set("music".into()),
+            info_hash: Set("a".repeat(40)),
+            announce_host: Set(None),
+            torrent_name: Set(Some("Release".into())),
+            tracker: Set(Some("ops".into())),
+            group_id: Set(Some(1)),
+            torrent_id: Set(Some(10)),
+            release_id: Set(Some(release_id.to_string())),
+            resolution_state: Set("linked".into()),
+            attempts: Set(0),
+            next_retry_at: Set(None),
+            error_code: Set(None),
+            error_message: Set(None),
+            first_seen_at: Set(now.clone()),
+            last_seen_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+            present: Set(true),
+            missing_since: Set(None),
+            library_added_at: Set(Some(now.clone())),
+            completed_at: Set(Some(now.clone())),
+            observed_json: Set(None),
+            observed_at: Set(None),
+            client_added_at: Set(None),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("held release");
+        let mut group = catalog_membership_group("ops", 7, 42, "Album");
+        group.release.artwork = Some(catalog_artwork.into());
+        dedupe_catalog_membership::ActiveModel {
+            tracker: Set("ops".into()),
+            artist_id: Set(42),
+            group_id: Set(7),
+            group_json: Set(serde_json::to_value(group).expect("catalog JSON")),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("catalog membership");
+        let mut unrelated = catalog_membership_group("red", 8, 999, "Album");
+        unrelated.release.artwork = Some("https://example.test/unrelated.jpg".into());
+        dedupe_catalog_membership::ActiveModel {
+            tracker: Set("red".into()),
+            artist_id: Set(999),
+            group_id: Set(8),
+            group_json: Set(serde_json::to_value(unrelated).expect("catalog JSON")),
+            updated_at: Set(now.clone()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("unrelated catalog membership");
+
+        db.reconcile_library_asset_references()
+            .await
+            .expect("asset references");
+        let references = library_asset_reference::Entity::find()
+            .all(&db.connection)
+            .await
+            .expect("references");
+        assert_eq!(references.len(), 3);
+        assert!(
+            references
+                .iter()
+                .all(|reference| !reference.source_url.contains("unrelated"))
+        );
+        for (url, state) in [
+            (release_artwork, "ready"),
+            (artist_artwork, "absent"),
+            (catalog_artwork, "unsupported"),
+        ] {
+            let source_hash = crate::asset::AssetStore::source_hash(url);
+            library_asset::ActiveModel {
+                source_hash: Set(source_hash.clone()),
+                source_url: Set(url.into()),
+                state: Set(state.into()),
+                blob_hash: Set((state == "ready").then_some(source_hash)),
+                original_extension: Set((state == "ready").then_some("jpg".into())),
+                mime_type: Set((state == "ready").then_some("image/jpeg".into())),
+                width: Set(None),
+                height: Set(None),
+                byte_size: Set(None),
+                error_code: Set(None),
+                error_message: Set(None),
+                retry_after: Set(None),
+                materializer_version: Set(crate::asset::MATERIALIZER_VERSION),
+                fetched_at: Set(None),
+                updated_at: Set(now.clone()),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("asset");
+        }
+        assert_eq!(
+            db.reconcile_library_admissions(100)
+                .await
+                .expect("admission"),
+            1
+        );
+        let admission = library_admission::Entity::find_by_id(release_id.to_string())
+            .one(&db.connection)
+            .await
+            .expect("admission lookup")
+            .expect("admission");
+        assert_eq!(admission.state, "published");
+        assert!(admission.admitted_at.is_some());
+
+        let missing_artist = Uuid::new_v4();
+        canonical_release_credit::ActiveModel {
+            release_id: Set(release_id.to_string()),
+            artist_id: Set(missing_artist.to_string()),
+            role: Set("primary".into()),
+            source_count: Set(1),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("missing primary credit");
+        db.reconcile_library_admissions(100)
+            .await
+            .expect("readmission");
+        let admission = library_admission::Entity::find_by_id(release_id.to_string())
+            .one(&db.connection)
+            .await
+            .expect("admission lookup")
+            .expect("admission");
+        assert_eq!(admission.state, "preparing");
+        assert_eq!(
+            admission.error_code.as_deref(),
+            Some("artist_source_missing")
+        );
+        assert!(admission.admitted_at.is_some());
+
+        let replacement_artwork = "https://example.test/release-v2.jpg";
+        let release = canonical_release::Entity::find_by_id(release_id.to_string())
+            .one(&db.connection)
+            .await
+            .expect("release lookup")
+            .expect("release");
+        let mut release = release.into_active_model();
+        release.artwork = Set(Some(replacement_artwork.into()));
+        release
+            .update(&db.connection)
+            .await
+            .expect("release artwork update");
+        let artist = canonical_artist::Entity::find_by_id(artist_id.to_string())
+            .one(&db.connection)
+            .await
+            .expect("artist lookup")
+            .expect("artist");
+        let mut artist = artist.into_active_model();
+        artist.artwork = Set(None);
+        artist
+            .update(&db.connection)
+            .await
+            .expect("artist artwork removal");
+        dedupe_catalog_membership::Entity::delete_many()
+            .filter(dedupe_catalog_membership::Column::Tracker.eq("ops"))
+            .filter(dedupe_catalog_membership::Column::ArtistId.eq(42))
+            .filter(dedupe_catalog_membership::Column::GroupId.eq(7))
+            .exec(&db.connection)
+            .await
+            .expect("catalog removal");
+
+        db.reconcile_library_asset_references()
+            .await
+            .expect("asset reference diff");
+        let references = library_asset_reference::Entity::find()
+            .all(&db.connection)
+            .await
+            .expect("reconciled references");
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].owner_kind, "release");
+        assert_eq!(references[0].source_url, replacement_artwork);
     }
 }

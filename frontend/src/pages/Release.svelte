@@ -15,11 +15,13 @@
   } from "../lib/api";
   import AddDownloadDialog from "../lib/AddDownloadDialog.svelte";
   import StaleNotice from "../lib/StaleNotice.svelte";
+  import CachedImage from "../lib/CachedImage.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
   import PreferredVariants from "../lib/PreferredVariants.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import DownloadDiagnostic from "../lib/DownloadDiagnostic.svelte";
   import { sanitizeReleaseDescription } from "../lib/releaseDescription";
+  import { liveDownloads, variantDownloads } from "../lib/liveState";
   import {
     closeOverlay,
     navigateView,
@@ -52,8 +54,7 @@
     queryFn: () => api<Envelope<ReleaseDetail>>(
       `/api/v1/releases/${encodeURIComponent(initialId)}`
       + (requestedTorrent ? `?torrent=${requestedTorrent}` : "")
-    ),
-    refetchInterval: 15_000
+    )
   });
   const crossSeedPlans = createQuery({
     queryKey: ["cross-seed-plans", initialId],
@@ -66,10 +67,14 @@
 
   const selectedVariant = $derived(
     $release.data?.data.variants.find((variant) => variant.torrentId === requestedTorrent)
-      ?? $release.data?.data.variants.find((variant) => variant.downloads.length > 0)
+      ?? $release.data?.data.variants.find((variant) => variantDownloads(variant, $liveDownloads).length > 0)
   );
   const live = $derived(
-    selectReleaseAttachment(selectedVariant?.downloads ?? [], requestedClient, requestedHash)
+    selectReleaseAttachment(
+      selectedVariant ? variantDownloads(selectedVariant, $liveDownloads) : [],
+      requestedClient,
+      requestedHash
+    )
   );
   const attachmentUnavailable = $derived(
     attachmentRequested && $release.data != null && live == null
@@ -153,12 +158,7 @@
     <div class="cover hero-cover">
       <Disc3 size={48} />
       {#if detail.release.artwork}
-        <img
-          src={detail.release.artwork}
-          alt=""
-          referrerpolicy="no-referrer"
-          onerror={(event) => (event.currentTarget as HTMLImageElement).remove()}
-        />
+        <CachedImage src={detail.release.artwork} loading="eager" />
       {/if}
     </div>
     <div>

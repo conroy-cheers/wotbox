@@ -1,6 +1,8 @@
 mod acquisition;
 mod api;
+mod asset;
 mod background;
+mod change;
 mod channel;
 mod config;
 mod db;
@@ -15,8 +17,9 @@ mod release_matcher;
 mod tracker;
 
 use anyhow::{Context, Result};
-use api::{AppState, router, spawn_channel_scheduler, spawn_reconciler};
+use api::{AppState, router};
 use background::spawn_background_workers;
+use change::spawn_application_observers;
 use clap::Parser;
 use config::{Cli, Config};
 use tower_http::{
@@ -33,8 +36,7 @@ async fn main() -> Result<()> {
     let config = Config::load(cli.config.as_deref())?;
     let state = AppState::new(&config).await?;
     let background_runtime = spawn_background_workers(state.clone()).await?;
-    spawn_reconciler(state.clone());
-    spawn_channel_scheduler(state.clone());
+    let observer_runtime = spawn_application_observers(state.clone());
 
     let app = router(state)
         .layer(CompressionLayer::new())
@@ -47,17 +49,31 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {address}"))?;
     tracing::info!(%address, base_path = %config.base_path, "Wotbox listening");
     let (server_shutdown, server_shutdown_signal) = tokio::sync::oneshot::channel();
-    let shutdown = tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = server_shutdown.send(());
-        background_runtime.shutdown().await;
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_signal.await;
+            })
+            .await
     });
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = server_shutdown_signal.await;
-        })
-        .await?;
-    shutdown.await?;
+    tokio::select! {
+        result = &mut server => {
+            result??;
+            return Ok(());
+        }
+        () = shutdown_signal() => {}
+    }
+    let _ = server_shutdown.send(());
+    background_runtime.shutdown().await;
+    observer_runtime.shutdown().await;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut server).await {
+        Ok(result) => result??,
+        Err(_) => {
+            tracing::warn!("HTTP connections did not drain before shutdown deadline");
+            server.abort();
+            let _ = server.await;
+        }
+    }
     Ok(())
 }
 

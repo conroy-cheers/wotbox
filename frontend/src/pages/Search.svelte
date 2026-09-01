@@ -70,6 +70,64 @@
     };
   });
   const results = createQuery(resultOptions);
+  const localResultOptions = derived(searchValues, (values) => {
+    const params = new URLSearchParams();
+    if (values.query) params.set("query", values.query);
+    if (values.artist) params.set("artist", values.artist);
+    if (values.year) params.set("year", values.year);
+    if (values.format) params.set("format", values.format);
+    if (values.media) params.set("media", values.media);
+    if (values.tracker) params.set("tracker", values.tracker);
+    if (values.page > 1) params.set("page", String(values.page));
+    return {
+      queryKey: ["local-search", values],
+      queryFn: () => api<Envelope<SearchPage>>(`/api/v1/search/local?${params}`),
+      enabled: Boolean(values.submitted),
+      staleTime: 30_000
+    };
+  });
+  const localResults = createQuery(localResultOptions);
+  const displayed = derived([results, localResults], ([$remote, $local]) => {
+    if (!$remote.data) return $local.data;
+    if (!$local.data) return $remote.data;
+    const groups = new Map<string, SearchGroup>();
+    for (const group of $local.data.data.groups) {
+      groups.set(group.id ?? `${group.tracker}:${group.groupId}`, group);
+    }
+    for (const group of $remote.data.data.groups) {
+      const key = group.id ?? `${group.tracker}:${group.groupId}`;
+      const local = groups.get(key);
+      if (!local) {
+        groups.set(key, group);
+        continue;
+      }
+      const torrents = new Map(
+        local.torrents.map((torrent) => [
+          `${torrent.tracker ?? local.tracker}:${torrent.torrentId}`,
+          torrent
+        ])
+      );
+      for (const torrent of group.torrents) {
+        torrents.set(`${torrent.tracker ?? group.tracker}:${torrent.torrentId}`, torrent);
+      }
+      groups.set(key, {
+        ...group,
+        image: local.image ?? group.image,
+        torrents: [...torrents.values()]
+      });
+    }
+    return {
+      ...$remote.data,
+      data: {
+        ...$remote.data.data,
+        groups: [...groups.values()],
+        totalResults: Math.max(
+          $remote.data.data.totalResults ?? 0,
+          groups.size
+        )
+      }
+    };
+  });
   const attach = createMutation({
     mutationFn: (releaseId: string) =>
       api<ChannelPack>(`/api/v1/channel-packs/${channelPack}/items/${channelItem}/attach`, {
@@ -139,8 +197,8 @@
   }
 
   $effect(() => {
-    if (!requestedAddTorrent || selected || !$results.data) return;
-    for (const group of $results.data.data.groups) {
+    if (!requestedAddTorrent || selected || !$displayed) return;
+    for (const group of $displayed.data.groups) {
       const torrent = group.torrents.find((candidate) => candidate.torrentId === requestedAddTorrent);
       if (torrent) {
         selected = { group, torrent };
@@ -155,6 +213,7 @@
       && ["all_trackers_unavailable", "tracker_unavailable", "provider_unavailable"].includes(
         $results.error.code ?? ""
       )
+      && !$localResults.data?.data.groups.length
     ) {
       const params = new URLSearchParams();
       if (query) params.set("q", query);
@@ -213,7 +272,7 @@
   </div>
 </form>
 
-<StaleNotice provenance={$results.data?.provenance} />
+<StaleNotice provenance={$displayed?.provenance} />
 
 {#if channelPack && channelItem && channelPlanVersion}
   <div class="notice-banner">
@@ -222,10 +281,10 @@
 {/if}
 {#if $attach.isError}<div class="error-panel">{$attach.error.message}</div>{/if}
 
-{#if $results.data?.data.sourceStatus.some((source) => source.state !== "ready")}
+{#if $displayed?.data.sourceStatus.some((source) => source.state !== "ready")}
   <div class="notice-banner">
     <strong>Some tracker results are unavailable.</strong>
-    {$results.data.data.sourceStatus
+    {$displayed.data.sourceStatus
       .filter((source) => source.state !== "ready")
       .map((source) => source.tracker.toUpperCase())
       .join(", ")}
@@ -233,9 +292,9 @@
   </div>
 {/if}
 
-{#if $results.data?.data.deduplication}
+{#if $displayed?.data.deduplication}
   <DeduplicationProgress
-    status={$results.data.data.deduplication}
+    status={$displayed.data.deduplication}
     detail="Singles remain visible until their tracker track lists are confidently matched."
   />
 {/if}
@@ -246,26 +305,26 @@
     <h2>Search with precision</h2>
     <p>Start broad, then use format and media filters to find the edition you want.</p>
   </div>
-{:else if $results.isPending}
+{:else if $results.isPending && !$displayed}
   <div class="result-list">
     {#each [1, 2, 3] as _}<div class="release-card skeleton-card"></div>{/each}
   </div>
-{:else if $results.isError}
+{:else if $results.isError && !$displayed}
   <div class="error-panel">{$results.error.message}</div>
-{:else if $results.data?.data.groups.length}
+{:else if $displayed?.data.groups.length}
   <div class="result-summary">
-    <span>{$results.data.data.totalResults?.toLocaleString() ?? $results.data.data.groups.length} results</span>
+    <span>{$displayed.data.totalResults?.toLocaleString() ?? $displayed.data.groups.length} results</span>
     <div class="result-summary-actions">
-      {#if coveredCount($results.data.data.groups)}
+      {#if coveredCount($displayed.data.groups)}
         <button class="secondary-button compact-button" onclick={toggleCovered}>
-          {showRedundantSingles ? "Hide" : "Show"} {coveredCount($results.data.data.groups)} album-covered {coveredCount($results.data.data.groups) === 1 ? "single" : "singles"}
+          {showRedundantSingles ? "Hide" : "Show"} {coveredCount($displayed.data.groups)} album-covered {coveredCount($displayed.data.groups) === 1 ? "single" : "singles"}
         </button>
       {/if}
-      <span>Page {$results.data.data.currentPage} of {$results.data.data.totalPages}</span>
+      <span>Page {$displayed.data.currentPage} of {$displayed.data.totalPages}</span>
     </div>
   </div>
   <div class="result-list">
-    {#each visibleGroups($results.data.data.groups) as group}
+    {#each visibleGroups($displayed.data.groups) as group}
       <article class="release-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(group.releaseType)}`}>
         <ReleaseCover image={group.image} />
         <div class="release-content">
@@ -321,25 +380,25 @@
       </article>
     {/each}
   </div>
-  {#if $results.data.data.totalPages > 1}
+  {#if $displayed.data.totalPages > 1}
     <nav class="pagination" aria-label="Search result pages">
-      {#if $results.data.data.currentPage > 1}
+      {#if $displayed.data.currentPage > 1}
         <a
           class="secondary-button compact-button"
           rel="prev"
           href={browserViewPath("/search", viewQuery({
-            page: $results.data.data.currentPage - 1,
+            page: $displayed.data.currentPage - 1,
             add: undefined
           }))}
         >Previous</a>
       {/if}
-      <span>Page {$results.data.data.currentPage} of {$results.data.data.totalPages}</span>
-      {#if $results.data.data.currentPage < $results.data.data.totalPages}
+      <span>Page {$displayed.data.currentPage} of {$displayed.data.totalPages}</span>
+      {#if $displayed.data.currentPage < $displayed.data.totalPages}
         <a
           class="secondary-button compact-button"
           rel="next"
           href={browserViewPath("/search", viewQuery({
-            page: $results.data.data.currentPage + 1,
+            page: $displayed.data.currentPage + 1,
             add: undefined
           }))}
         >Next</a>

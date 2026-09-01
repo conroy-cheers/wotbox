@@ -7,11 +7,13 @@ use sea_orm_migration::{
 use crate::entity::{
     artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
     canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
-    channel_config, channel_pack, channel_pack_item, channel_run, dedupe_catalog_membership,
-    download_client_scan, download_event, download_job, download_release_link,
-    external_release_link, import_supersession, import_task, match_candidate, provider_state,
-    release_source, release_track_index, runtime_preference, single_album_coverage,
-    tracker_snapshot,
+    change_event, channel_config, channel_pack, channel_pack_item, channel_run,
+    dedupe_catalog_membership, download_client_scan, download_event, download_job,
+    download_release_link, external_release_link, import_supersession, import_task,
+    library_admission, library_artist_projection, library_artist_release_projection, library_asset,
+    library_asset_reference, library_projection_dirty, library_projection_state,
+    library_release_projection, match_candidate, provider_state, release_source,
+    release_track_index, runtime_preference, single_album_coverage, tracker_snapshot,
 };
 
 pub struct Migrator;
@@ -34,7 +36,892 @@ impl MigratorTrait for Migrator {
             Box::new(ChannelProviderWaitSchema),
             Box::new(CanonicalReleaseReconciliationSchema),
             Box::new(ExternalReleaseLinksSchema),
+            Box::new(ChangeEventSchema),
+            Box::new(CanonicalArtistRepairSchema),
+            Box::new(LocalLibraryStoreSchema),
+            Box::new(LocalLibraryClosureSchema),
+            Box::new(LocalLibraryClosureIndexes),
+            Box::new(IncrementalLibraryProjectionSchema),
+            Box::new(ProjectionTriggerSemantics),
+            Box::new(ProjectionSemanticUpdates),
         ]
+    }
+}
+
+struct ProjectionSemanticUpdates;
+
+impl MigrationName for ProjectionSemanticUpdates {
+    fn name(&self) -> &str {
+        "m20260901_000022_projection_semantic_updates"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ProjectionSemanticUpdates {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                DROP TRIGGER IF EXISTS library_projection_admission_update;
+                CREATE TRIGGER library_projection_admission_update
+                AFTER UPDATE ON library_admissions
+                WHEN OLD.state IS NOT NEW.state
+                  OR OLD.error_code IS NOT NEW.error_code
+                  OR OLD.error_message IS NOT NEW.error_message
+                  OR OLD.admitted_at IS NOT NEW.admitted_at
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_canonical_release_update;
+                CREATE TRIGGER library_projection_canonical_release_update
+                AFTER UPDATE ON canonical_releases
+                WHEN OLD.title IS NOT NEW.title
+                  OR OLD.normalized_title IS NOT NEW.normalized_title
+                  OR OLD.artist IS NOT NEW.artist
+                  OR OLD.year IS NOT NEW.year
+                  OR OLD.release_type IS NOT NEW.release_type
+                  OR OLD.artwork IS NOT NEW.artwork
+                  OR OLD.metadata_json IS NOT NEW.metadata_json
+                  OR OLD.provenance_json IS NOT NEW.provenance_json
+                  OR OLD.overrides_json IS NOT NEW.overrides_json
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_release_credit_update;
+                CREATE TRIGGER library_projection_release_credit_update
+                AFTER UPDATE ON canonical_release_credits
+                WHEN OLD.release_id IS NOT NEW.release_id
+                  OR OLD.artist_id IS NOT NEW.artist_id
+                  OR OLD.role IS NOT NEW.role
+                  OR OLD.source_count IS NOT NEW.source_count
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    UNION SELECT NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_canonical_torrent_update;
+                CREATE TRIGGER library_projection_canonical_torrent_update
+                AFTER UPDATE ON canonical_torrents
+                WHEN OLD.group_id IS NOT NEW.group_id
+                  OR OLD.release_id IS NOT NEW.release_id
+                  OR OLD.info_hash IS NOT NEW.info_hash
+                  OR json_remove(OLD.canonical_json,
+                        '$.variant.seeders', '$.variant.leechers', '$.variant.snatched')
+                     IS NOT json_remove(NEW.canonical_json,
+                        '$.variant.seeders', '$.variant.leechers', '$.variant.snatched')
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE OLD.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE NEW.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_release_source_update;
+                CREATE TRIGGER library_projection_release_source_update
+                AFTER UPDATE ON release_sources
+                WHEN OLD.release_id IS NOT NEW.release_id
+                  OR OLD.normalized_title IS NOT NEW.normalized_title
+                  OR OLD.normalized_artist IS NOT NEW.normalized_artist
+                  OR OLD.year IS NOT NEW.year
+                  OR OLD.release_type IS NOT NEW.release_type
+                  OR OLD.matcher_version IS NOT NEW.matcher_version
+                  OR OLD.source_json IS NOT NEW.source_json
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    UNION SELECT NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_artist_update;
+                CREATE TRIGGER library_projection_artist_update
+                AFTER UPDATE ON canonical_artists
+                WHEN OLD.name IS NOT NEW.name
+                  OR OLD.normalized_name IS NOT NEW.normalized_name
+                  OR OLD.artwork IS NOT NEW.artwork
+                  OR OLD.metadata_json IS NOT NEW.metadata_json
+                  OR OLD.provenance_json IS NOT NEW.provenance_json
+                  OR OLD.overrides_json IS NOT NEW.overrides_json
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits WHERE artist_id = NEW.id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_artist_source_change_update;
+                CREATE TRIGGER library_projection_artist_source_change_update
+                AFTER UPDATE ON artist_sources
+                WHEN OLD.artist_id IS NOT NEW.artist_id
+                  OR OLD.canonical_artist_id IS NOT NEW.canonical_artist_id
+                  OR OLD.name IS NOT NEW.name
+                  OR OLD.normalized_name IS NOT NEW.normalized_name
+                  OR OLD.matcher_version IS NOT NEW.matcher_version
+                  OR OLD.source_json IS NOT NEW.source_json
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits
+                     WHERE artist_id IN (OLD.canonical_artist_id, NEW.canonical_artist_id)
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_coverage_update;
+                CREATE TRIGGER library_projection_coverage_update
+                AFTER UPDATE ON single_album_coverages
+                WHEN OLD.tracker IS NOT NEW.tracker
+                  OR OLD.single_group_id IS NOT NEW.single_group_id
+                  OR OLD.state IS NOT NEW.state
+                  OR OLD.coverage_json IS NOT NEW.coverage_json
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE (lower(tracker) = lower(OLD.tracker) AND group_id = OLD.single_group_id)
+                        OR (lower(tracker) = lower(NEW.tracker) AND group_id = NEW.single_group_id)
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_legacy_credit_update;
+                CREATE TRIGGER library_projection_legacy_credit_update
+                AFTER UPDATE ON canonical_release_artists
+                WHEN OLD.artist_id IS NOT NEW.artist_id
+                  OR OLD.name IS NOT NEW.name
+                  OR OLD.sort_name IS NOT NEW.sort_name
+                  OR OLD.source IS NOT NEW.source
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE (lower(tracker) = lower(OLD.tracker) AND group_id = OLD.group_id)
+                        OR (lower(tracker) = lower(NEW.tracker) AND group_id = NEW.group_id)
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_alias_update;
+                CREATE TRIGGER library_projection_alias_update
+                AFTER UPDATE ON canonical_aliases
+                WHEN OLD.target_id IS NOT NEW.target_id
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                DROP TRIGGER IF EXISTS library_projection_preferences_update;
+                CREATE TRIGGER library_projection_preferences_update
+                AFTER UPDATE ON runtime_preferences
+                WHEN OLD.value_json IS NOT NEW.value_json
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+struct ProjectionTriggerSemantics;
+
+impl MigrationName for ProjectionTriggerSemantics {
+    fn name(&self) -> &str {
+        "m20260901_000021_projection_trigger_semantics"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ProjectionTriggerSemantics {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                DROP TRIGGER IF EXISTS library_projection_download_link_update;
+                CREATE TRIGGER library_projection_download_link_update
+                AFTER UPDATE OF release_id, resolution_state, present, library_added_at,
+                                completed_at, missing_since, tracker, group_id, torrent_id
+                ON download_release_links
+                WHEN OLD.release_id IS NOT NEW.release_id
+                  OR OLD.resolution_state IS NOT NEW.resolution_state
+                  OR OLD.present IS NOT NEW.present
+                  OR OLD.library_added_at IS NOT NEW.library_added_at
+                  OR OLD.completed_at IS NOT NEW.completed_at
+                  OR OLD.missing_since IS NOT NEW.missing_since
+                  OR OLD.tracker IS NOT NEW.tracker
+                  OR OLD.group_id IS NOT NEW.group_id
+                  OR OLD.torrent_id IS NOT NEW.torrent_id
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE OLD.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET
+                        version = version + 1,
+                        updated_at = excluded.updated_at;
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE NEW.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET
+                        version = version + 1,
+                        updated_at = excluded.updated_at;
+                END;
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+struct IncrementalLibraryProjectionSchema;
+
+impl MigrationName for IncrementalLibraryProjectionSchema {
+    fn name(&self) -> &str {
+        "m20260901_000020_incremental_library_projection"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for IncrementalLibraryProjectionSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, library_release_projection::Entity).await?;
+        create_entity(manager, &schema, library_artist_projection::Entity).await?;
+        create_entity(manager, &schema, library_artist_release_projection::Entity).await?;
+        create_entity(manager, &schema, library_projection_dirty::Entity).await?;
+        create_entity(manager, &schema, library_projection_state::Entity).await?;
+        add_column_if_missing(
+            manager,
+            &schema,
+            change_event::Entity,
+            change_event::Column::Resources,
+        )
+        .await?;
+        add_column_if_missing(
+            manager,
+            &schema,
+            change_event::Entity,
+            change_event::Column::PayloadJson,
+        )
+        .await?;
+
+        for index in [
+            Index::create()
+                .if_not_exists()
+                .name("idx_library_release_projection_title")
+                .table(library_release_projection::Entity)
+                .col(library_release_projection::Column::NormalizedTitle)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_library_release_projection_search")
+                .table(library_release_projection::Entity)
+                .col(library_release_projection::Column::SearchText)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_library_release_projection_availability")
+                .table(library_release_projection::Entity)
+                .col(library_release_projection::Column::Availability)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_library_artist_projection_name")
+                .table(library_artist_projection::Entity)
+                .col(library_artist_projection::Column::NormalizedName)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_library_artist_release_release")
+                .table(library_artist_release_projection::Entity)
+                .col(library_artist_release_projection::Column::ReleaseId)
+                .to_owned(),
+        ] {
+            manager.create_index(index).await?;
+        }
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                INSERT OR IGNORE INTO library_projection_state
+                    (id, revision, schema_version, ready, updated_at)
+                VALUES (1, 0, 1, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+                INSERT OR IGNORE INTO library_projection_dirty
+                    (release_id, version, updated_at)
+                VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_download_link_insert
+                AFTER INSERT ON download_release_links
+                WHEN NEW.release_id IS NOT NULL
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET
+                        version = version + 1,
+                        updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_download_link_update
+                AFTER UPDATE OF release_id, resolution_state, present, library_added_at,
+                                completed_at, missing_since, tracker, group_id, torrent_id
+                ON download_release_links
+                WHEN OLD.release_id IS NOT NEW.release_id
+                  OR OLD.resolution_state IS NOT NEW.resolution_state
+                  OR OLD.present IS NOT NEW.present
+                  OR OLD.library_added_at IS NOT NEW.library_added_at
+                  OR OLD.completed_at IS NOT NEW.completed_at
+                  OR OLD.missing_since IS NOT NEW.missing_since
+                  OR OLD.tracker IS NOT NEW.tracker
+                  OR OLD.group_id IS NOT NEW.group_id
+                  OR OLD.torrent_id IS NOT NEW.torrent_id
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE OLD.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET
+                        version = version + 1,
+                        updated_at = excluded.updated_at;
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE NEW.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET
+                        version = version + 1,
+                        updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_download_link_delete
+                AFTER DELETE ON download_release_links
+                WHEN OLD.release_id IS NOT NULL
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET
+                        version = version + 1,
+                        updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_admission_insert
+                AFTER INSERT ON library_admissions
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_admission_update
+                AFTER UPDATE ON library_admissions
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_admission_delete
+                AFTER DELETE ON library_admissions
+                BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_canonical_release_insert
+                AFTER INSERT ON canonical_releases BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_canonical_release_update
+                AFTER UPDATE ON canonical_releases BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_canonical_release_delete
+                AFTER DELETE ON canonical_releases BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (OLD.id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_release_credit_insert
+                AFTER INSERT ON canonical_release_credits BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_release_credit_update
+                AFTER UPDATE ON canonical_release_credits BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_release_credit_delete
+                AFTER DELETE ON canonical_release_credits BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_canonical_torrent_insert
+                AFTER INSERT ON canonical_torrents WHEN NEW.release_id IS NOT NULL BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_canonical_torrent_update
+                AFTER UPDATE ON canonical_torrents BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE OLD.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE NEW.release_id IS NOT NULL
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_canonical_torrent_delete
+                AFTER DELETE ON canonical_torrents WHEN OLD.release_id IS NOT NULL BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_release_source_insert
+                AFTER INSERT ON release_sources BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_release_source_update
+                AFTER UPDATE ON release_sources BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (NEW.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_release_source_delete
+                AFTER DELETE ON release_sources BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES (OLD.release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_artist_insert
+                AFTER INSERT ON canonical_artists BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits WHERE artist_id = NEW.id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_artist_update
+                AFTER UPDATE ON canonical_artists BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits WHERE artist_id = NEW.id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_artist_delete
+                AFTER DELETE ON canonical_artists BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_artist_source_change_insert
+                AFTER INSERT ON artist_sources BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits WHERE artist_id = NEW.canonical_artist_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_artist_source_change_update
+                AFTER UPDATE ON artist_sources BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits
+                     WHERE artist_id IN (OLD.canonical_artist_id, NEW.canonical_artist_id)
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_artist_source_change_delete
+                AFTER DELETE ON artist_sources BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM canonical_release_credits WHERE artist_id = OLD.canonical_artist_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_coverage_insert
+                AFTER INSERT ON single_album_coverages BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE lower(tracker) = lower(NEW.tracker) AND group_id = NEW.single_group_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_coverage_update
+                AFTER UPDATE ON single_album_coverages BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE lower(tracker) = lower(NEW.tracker) AND group_id = NEW.single_group_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_coverage_delete
+                AFTER DELETE ON single_album_coverages BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE lower(tracker) = lower(OLD.tracker) AND group_id = OLD.single_group_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_legacy_credit_insert
+                AFTER INSERT ON canonical_release_artists BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE lower(tracker) = lower(NEW.tracker) AND group_id = NEW.group_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_legacy_credit_update
+                AFTER UPDATE ON canonical_release_artists BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE (lower(tracker) = lower(OLD.tracker) AND group_id = OLD.group_id)
+                        OR (lower(tracker) = lower(NEW.tracker) AND group_id = NEW.group_id)
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_legacy_credit_delete
+                AFTER DELETE ON canonical_release_artists BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    SELECT release_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      FROM release_sources
+                     WHERE lower(tracker) = lower(OLD.tracker) AND group_id = OLD.group_id
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_alias_insert
+                AFTER INSERT ON canonical_aliases BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_alias_update
+                AFTER UPDATE ON canonical_aliases BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_alias_delete
+                AFTER DELETE ON canonical_aliases BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS library_projection_preferences_insert
+                AFTER INSERT ON runtime_preferences BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                CREATE TRIGGER IF NOT EXISTS library_projection_preferences_update
+                AFTER UPDATE ON runtime_preferences BEGIN
+                    INSERT INTO library_projection_dirty(release_id, version, updated_at)
+                    VALUES ('*', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(release_id) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at;
+                END;
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+struct LocalLibraryClosureIndexes;
+
+impl MigrationName for LocalLibraryClosureIndexes {
+    fn name(&self) -> &str {
+        "m20260831_000019_local_library_closure_indexes"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for LocalLibraryClosureIndexes {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_artist_sources_tracker_artist")
+                    .table(artist_source::Entity)
+                    .col(artist_source::Column::Tracker)
+                    .col(artist_source::Column::ArtistId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Application data migrations are intentionally forward-only.
+        Ok(())
+    }
+}
+
+struct LocalLibraryClosureSchema;
+
+impl MigrationName for LocalLibraryClosureSchema {
+    fn name(&self) -> &str {
+        "m20260831_000018_local_library_closure"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for LocalLibraryClosureSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        add_column_if_missing(
+            manager,
+            &schema,
+            library_asset::Entity,
+            library_asset::Column::RetryAfter,
+        )
+        .await?;
+        add_column_if_missing(
+            manager,
+            &schema,
+            library_asset::Entity,
+            library_asset::Column::MaterializerVersion,
+        )
+        .await?;
+        create_entity(manager, &schema, library_asset_reference::Entity).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_library_asset_references_url")
+                    .table(library_asset_reference::Entity)
+                    .col(library_asset_reference::Column::SourceUrl)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                UPDATE library_assets
+                   SET state = CASE
+                       WHEN state <> 'failed' THEN state
+                       WHEN error_message LIKE '%definitively absent%' THEN 'absent'
+                       WHEN error_message LIKE '%unsupported static artwork format%'
+                         OR error_message LIKE '%recognize artwork format%'
+                         OR error_message LIKE '%decode artwork%'
+                         OR error_message LIKE '%encoded limit%'
+                         OR error_message LIKE '%decoded limit%'
+                         OR error_message LIKE '%megapixel%' THEN 'unsupported'
+                       WHEN EXISTS (
+                           SELECT 1 FROM background_jobs j
+                            WHERE j.deduplication_key = 'materialize-library-asset:' || library_assets.source_hash || ':v1'
+                              AND j.state IN ('pending', 'running', 'retrying')
+                       ) THEN 'retrying'
+                       ELSE 'failed_terminal'
+                   END,
+                       retry_after = CASE
+                           WHEN state = 'failed'
+                            AND error_message NOT LIKE '%definitively absent%'
+                            AND error_message NOT LIKE '%unsupported static artwork format%'
+                            AND error_message NOT LIKE '%recognize artwork format%'
+                            AND error_message NOT LIKE '%decode artwork%'
+                            AND error_message NOT LIKE '%encoded limit%'
+                            AND error_message NOT LIKE '%decoded limit%'
+                            AND error_message NOT LIKE '%megapixel%'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM background_jobs j
+                                 WHERE j.deduplication_key = 'materialize-library-asset:' || library_assets.source_hash || ':v1'
+                                   AND j.state IN ('pending', 'running', 'retrying')
+                            ) THEN datetime('now', '+7 days')
+                           ELSE NULL
+                       END,
+                       materializer_version = 1;
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Application data migrations are intentionally forward-only.
+        Ok(())
+    }
+}
+
+struct LocalLibraryStoreSchema;
+
+impl MigrationName for LocalLibraryStoreSchema {
+    fn name(&self) -> &str {
+        "m20260831_000017_local_library_store"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for LocalLibraryStoreSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, library_asset::Entity).await?;
+        create_entity(manager, &schema, library_admission::Entity).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .unique()
+                    .name("idx_library_assets_source_url")
+                    .table(library_asset::Entity)
+                    .col(library_asset::Column::SourceUrl)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_library_assets_state")
+                    .table(library_asset::Entity)
+                    .col(library_asset::Column::State)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                INSERT OR IGNORE INTO library_admissions
+                    (release_id, state, error_code, error_message, admitted_at, updated_at)
+                SELECT DISTINCT release_id, 'published', NULL, NULL,
+                       COALESCE(library_added_at, updated_at),
+                       COALESCE(library_added_at, updated_at)
+                  FROM download_release_links
+                 WHERE library_added_at IS NOT NULL
+                   AND release_id IS NOT NULL;
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+struct CanonicalArtistRepairSchema;
+
+impl MigrationName for CanonicalArtistRepairSchema {
+    fn name(&self) -> &str {
+        "m20260830_000016_canonical_artist_repair"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for CanonicalArtistRepairSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        if !manager
+            .has_column("artist_sources", "matcher_version")
+            .await?
+        {
+            manager
+                .get_connection()
+                .execute_unprepared(
+                    "ALTER TABLE artist_sources ADD COLUMN matcher_version INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+        }
+        add_column_if_missing(
+            manager,
+            &schema,
+            canonical_backfill_state::Entity,
+            canonical_backfill_state::Column::Fingerprint,
+        )
+        .await?;
+        add_column_if_missing(
+            manager,
+            &schema,
+            canonical_backfill_state::Entity,
+            canonical_backfill_state::Column::DetailsJson,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+struct ChangeEventSchema;
+
+impl MigrationName for ChangeEventSchema {
+    fn name(&self) -> &str {
+        "m20260830_000015_change_events"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for ChangeEventSchema {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(manager, &schema, change_event::Entity).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_change_events_created")
+                    .table(change_event::Entity)
+                    .col(change_event::Column::CreatedAt)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                UPDATE background_jobs
+                   SET state = 'cancelled',
+                       cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE kind = 'scan_download_client'
+                   AND state IN ('pending', 'running', 'retrying', 'waiting');
+                "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
     }
 }
 

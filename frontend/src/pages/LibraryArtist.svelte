@@ -14,15 +14,14 @@
   import ReleaseCover from "../lib/ReleaseCover.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
-  import StaleNotice from "../lib/StaleNotice.svelte";
+  import CachedImage from "../lib/CachedImage.svelte";
+  import { liveDownloads, variantDownloads } from "../lib/liveState";
   import {
     api,
     appPath,
-    type ArtistCatalogPage,
     type ArtistCatalogRelease,
     type ArtistCatalogRole,
     type DownloadSelection,
-    type Envelope,
     type LibraryArtistPage
   } from "../lib/api";
   import {
@@ -67,35 +66,17 @@
     staleTime: 30_000
   });
 
-  const catalogOptions = derived(artist, ($artist) => {
-    return {
-      queryKey: ["artist-catalog", initialId] as const,
-      queryFn: () => api<Envelope<ArtistCatalogPage>>(
-        `/api/v1/artists/${encodeURIComponent(initialId)}`
-      ),
-      enabled: true,
-      staleTime: 60_000,
-      refetchInterval: (query: { state: { data?: Envelope<ArtistCatalogPage> } }) => {
-        const sources = query.state.data?.provenance.sources ?? [];
-        return sources.some((source) =>
-          ["pending", "running", "retrying", "completed"].includes(source.refreshState ?? "")
-        ) ? 5_000 : false;
-      },
-      retry: false
-    };
-  });
-  const catalog = createQuery(catalogOptions);
-
   async function retryCatalog(): Promise<void> {
-    await api<Envelope<ArtistCatalogPage>>(
-      `/api/v1/artists/${encodeURIComponent(initialId)}?refresh=true`
+    await api<void>(
+      `/api/v1/library/artists/${encodeURIComponent(initialId)}/refresh`,
+      { method: "POST" }
     );
-    await $catalog.refetch();
+    await $artist.refetch();
   }
 
   const filteredGroups = derived(
-    [artist, catalog, search, format, ownership, sort],
-    ([$artist, $catalog, $search, $format, $ownership, $sort]) => {
+    [artist, search, format, ownership, sort, liveDownloads],
+    ([$artist, $search, $format, $ownership, $sort, $liveDownloads]) => {
       const libraryGroups: ArtistCatalogRelease[] = ($artist.data?.items ?? []).map((item) => {
         const credit = item.release.artists.find((candidate) => candidate.canonicalId === initialId);
         return {
@@ -111,7 +92,7 @@
       const byRelease = new Map(
         libraryGroups.map((group) => [group.release.id ?? `${group.release.tracker}:${group.release.groupId}`, group])
       );
-      for (const group of $catalog.data?.data.groups ?? []) {
+      for (const group of $artist.data?.catalog.groups ?? []) {
         const key = group.release.id ?? `${group.release.tracker}:${group.release.groupId}`;
         const libraryGroup = byRelease.get(key);
         byRelease.set(key, libraryGroup
@@ -134,7 +115,7 @@
           return false;
         }
         if ($ownership === "downloading" && !item.variants.some((variant) =>
-          variant.downloads.some((download) =>
+          variantDownloads(variant, $liveDownloads).some((download) =>
             ["downloading", "queued", "checking", "stalled"].includes(download.state)
           )
         )) {
@@ -194,7 +175,7 @@
   });
 
   function isAddable(variant: ArtistCatalogRelease["variants"][number]): boolean {
-    return variant.downloads.length === 0
+    return variantDownloads(variant, $liveDownloads).length === 0
       && variant.library?.availability !== "present";
   }
 
@@ -227,7 +208,7 @@
 
   $effect(() => {
     if (!requestedAddTorrent || selected) return;
-    const candidates = $catalog.data?.data.groups ?? $filteredGroups;
+    const candidates = $artist.data?.catalog.groups ?? $filteredGroups;
     for (const group of candidates) {
       const torrent = group.variants.find((candidate) => candidate.torrentId === requestedAddTorrent);
       if (torrent) {
@@ -252,60 +233,41 @@
   <div class="error-panel">{$artist.error.message}</div>
 {:else if $artist.data}
   <header class="artist-hero">
-    <div class="artist-mosaic artist-hero-mosaic" class:single={Boolean($catalog.data?.data.artist.artwork) || $artist.data.artist.artworks.length < 2}>
-      {#if $catalog.data?.data.artist.artwork}
-        <img src={$catalog.data.data.artist.artwork} alt="" referrerpolicy="no-referrer" />
+    <div class="artist-mosaic artist-hero-mosaic" class:single={Boolean($artist.data.catalog.artist.artwork) || $artist.data.artist.artworks.length < 2}>
+      {#if $artist.data.catalog.artist.artwork}
+        <CachedImage src={$artist.data.catalog.artist.artwork} loading="eager" />
       {:else if $artist.data.artist.artworks.length}
         {#each $artist.data.artist.artworks as artwork}
-          <img src={artwork} alt="" referrerpolicy="no-referrer" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = "none")} />
+          <CachedImage src={artwork} />
         {/each}
       {:else}
         <Disc3 size={48} />
       {/if}
     </div>
     <div>
-      <p class="eyebrow">Canonical artist · {$artist.data.artist.tracker.toUpperCase()} source</p>
-      <h1>{$catalog.data?.data.artist.name ?? $artist.data.artist.name}</h1>
+      <p class="eyebrow">Canonical artist · {[...new Set($artist.data.artist.sources.map((source) => source.tracker.toUpperCase()))].join(" + ") || $artist.data.artist.tracker.toUpperCase()} sources</p>
+      <h1>{$artist.data.catalog.artist.name ?? $artist.data.artist.name}</h1>
       <p>
         {$artist.data.artist.releaseCount} {$artist.data.artist.releaseCount === 1 ? "release" : "releases"} in your library
-        {#if $catalog.data} · {$catalog.data.data.groups.length} across configured catalogs{/if}
+        · {$artist.data.catalog.groups.length} across configured catalogs
       </p>
       {#if $artist.data.artist.missingCount}
         <span class="availability-warning"><AlertTriangle size={13} /> {$artist.data.artist.missingCount} need attention</span>
       {/if}
+      <button class="text-button" type="button" onclick={retryCatalog}>Refresh catalog</button>
     </div>
   </header>
 
-  {#if $artist.data.artist.artistId == null}
+  {#if !$artist.data.artist.sources.some((source) => source.artistId != null)}
     <div class="index-banner">
       <span class="index-pulse"></span>
       <p><strong>Tracker catalog pending</strong> This artist’s stable Gazelle identity is still being resolved. Your Library releases remain available below.</p>
     </div>
-  {:else if $catalog.isPending}
-    <div class="index-banner">
-      <span class="index-pulse"></span>
-      <p><strong>Loading catalog sources</strong> Your Library releases are already visible while each Gazelle source refreshes independently.</p>
-    </div>
-  {:else if $catalog.isError}
-    <div class="error-panel compact">
-      <span>
-        <strong>Tracker discography unavailable.</strong>
-        {$catalog.error.message}. Showing your Library releases instead; Wotbox will retry
-        automatically.
-      </span>
-      <button
-        type="button"
-        class="secondary-button compact-button"
-        onclick={() => $catalog.refetch()}
-      >Retry now</button>
-    </div>
   {/if}
 
-  <StaleNotice provenance={$catalog.data?.provenance} onrefresh={retryCatalog} />
-
-  {#if $catalog.data?.data.deduplication}
+  {#if $artist.data.catalog.deduplication}
     <DeduplicationProgress
-      status={$catalog.data.data.deduplication}
+      status={$artist.data.catalog.deduplication}
       detail="Singles remain visible until their tracker track lists are confidently matched."
     />
   {/if}

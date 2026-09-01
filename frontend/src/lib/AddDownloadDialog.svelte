@@ -1,5 +1,6 @@
 <script lang="ts">
   import { createMutation, createQuery, useQueryClient } from "@tanstack/svelte-query";
+  import { derived, writable } from "svelte/store";
   import { Dialog } from "bits-ui";
   import { Check } from "@lucide/svelte";
   import {
@@ -29,7 +30,8 @@
   let initializedTorrent = $state("");
   let submittedJob = $state<DownloadJob | null>(null);
   let monitorError = $state("");
-  let monitorGeneration = 0;
+  let completedJobId = "";
+  const monitoredJobId = writable("");
   const queryClient = useQueryClient();
   const processing = $derived(
     submittedJob !== null
@@ -44,6 +46,12 @@
     queryKey: ["preferences"],
     queryFn: () => api<RuntimePreferences>("/api/v1/preferences")
   });
+  const jobStatusOptions = derived(monitoredJobId, (id) => ({
+    queryKey: ["download-job", id] as const,
+    queryFn: () => api<DownloadJob>(`/api/v1/download-jobs/${id}`),
+    enabled: Boolean(id)
+  }));
+  const jobStatus = createQuery(jobStatusOptions);
   const activeTracker = $derived(selection?.torrent.tracker ?? tracker);
   const policy = $derived(
     ($preferences.data?.release ?? defaultReleasePreferences).trackerPolicies
@@ -103,7 +111,8 @@
     onSuccess: (job) => {
       submittedJob = job;
       monitorError = "";
-      void monitorDownload(job);
+      queryClient.setQueryData(["download-job", job.id], job);
+      monitoredJobId.set(job.id);
     }
   });
 
@@ -116,40 +125,22 @@
     }
   }
 
-  async function monitorDownload(initial: DownloadJob) {
-    const generation = ++monitorGeneration;
-    let job = initial;
-    try {
-      while (["queued", "fetching_metadata", "submitting"].includes(job.state)) {
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-        if (generation !== monitorGeneration) return;
-        job = await api<DownloadJob>(`/api/v1/download-jobs/${job.id}`);
-        if (generation !== monitorGeneration) return;
-        submittedJob = job;
-      }
-      if (job.state === "active" || job.state === "complete") {
-        await Promise.all([
-          queryClient.invalidateQueries({ queryKey: ["downloads"] }),
-          queryClient.invalidateQueries({ queryKey: ["library-artist"] }),
-          queryClient.invalidateQueries({ queryKey: ["artist-catalog"] }),
-          queryClient.invalidateQueries({ queryKey: ["search"] })
-        ]);
-        if (generation === monitorGeneration) finish();
-      } else if (job.state !== "failed") {
-        monitorError = "Wotbox returned an unknown download state. The download may not have been submitted.";
-      }
-    } catch (error) {
-      if (generation === monitorGeneration) {
-        monitorError = error instanceof Error
-          ? `Could not confirm the download status: ${error.message}`
-          : "Could not confirm the download status.";
-      }
+  $effect(() => {
+    const job = $jobStatus.data;
+    if (job) submittedJob = job;
+    if ($jobStatus.isError) monitorError = `Could not confirm the download status: ${$jobStatus.error.message}`;
+    if (job && ["active", "complete"].includes(job.state) && completedJobId !== job.id) {
+      completedJobId = job.id;
+      finish();
+    } else if (job && !["queued", "fetching_metadata", "submitting", "active", "complete", "failed"].includes(job.state)) {
+      monitorError = "Wotbox returned an unknown download state. The download may not have been submitted.";
     }
-  }
+  });
 
   function submit() {
     if (!selection || !selectedProfile || processing) return;
     submittedJob = null;
+    monitoredJobId.set("");
     monitorError = "";
     $addDownload.mutate({
       tracker: activeTracker,
@@ -160,8 +151,8 @@
   }
 
   function finish() {
-    monitorGeneration++;
     submittedJob = null;
+    monitoredJobId.set("");
     monitorError = "";
     initializedTorrent = "";
     oncomplete?.();
@@ -170,8 +161,8 @@
 
   function close() {
     if (processing) return;
-    monitorGeneration++;
     submittedJob = null;
+    monitoredJobId.set("");
     monitorError = "";
     initializedTorrent = "";
     onclose();

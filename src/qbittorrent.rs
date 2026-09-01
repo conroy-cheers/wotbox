@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, multipart};
 use serde::Deserialize;
-use std::{future::Future, time::Duration};
+use serde_json::{Map, Value};
+use std::{collections::HashMap, future::Future, time::Duration};
+use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{
@@ -35,14 +37,6 @@ pub trait DownloadClient: Send + Sync {
     ) -> Result<Option<ObservedDownload>> {
         self.download(info_hash).await
     }
-    async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>>;
-    async fn downloads_by_hashes_with_class(
-        &self,
-        info_hashes: &[String],
-        _class: RequestClass,
-    ) -> Result<Vec<ObservedDownload>> {
-        self.downloads_by_hashes(info_hashes).await
-    }
     async fn tracker_statuses_with_class(
         &self,
         _info_hash: &str,
@@ -58,6 +52,28 @@ pub trait DownloadClient: Send + Sync {
         file_name: &str,
         profile: &DownloadProfile,
     ) -> Result<()>;
+    async fn sync_downloads(&self, _reset: bool) -> Result<DownloadClientDelta> {
+        Ok(DownloadClientDelta {
+            downloads: self.downloads(100_000, 0).await?,
+            removed: Vec::new(),
+            full_update: true,
+            inventory_changed: true,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadClientDelta {
+    pub downloads: Vec<ObservedDownload>,
+    pub removed: Vec<String>,
+    pub full_update: bool,
+    pub inventory_changed: bool,
+}
+
+#[derive(Default)]
+struct QbitSyncState {
+    rid: i64,
+    torrents: HashMap<String, Value>,
 }
 
 pub struct QbittorrentClient {
@@ -67,6 +83,7 @@ pub struct QbittorrentClient {
     client: Client,
     governor: Option<ProviderGovernor>,
     provider_id: String,
+    sync_state: Mutex<QbitSyncState>,
 }
 
 impl QbittorrentClient {
@@ -83,6 +100,7 @@ impl QbittorrentClient {
             client: Client::builder().timeout(Duration::from_secs(30)).build()?,
             governor: None,
             provider_id,
+            sync_state: Mutex::new(QbitSyncState::default()),
         })
     }
 
@@ -226,6 +244,14 @@ struct AddTorrentResult {
 #[derive(Debug, Deserialize)]
 struct SyncMainData {
     #[serde(default)]
+    rid: i64,
+    #[serde(default)]
+    full_update: bool,
+    #[serde(default)]
+    torrents: HashMap<String, Value>,
+    #[serde(default)]
+    torrents_removed: Vec<String>,
+    #[serde(default)]
     server_state: QbitServerState,
 }
 
@@ -332,6 +358,81 @@ fn unix_timestamp(value: i64) -> Option<DateTime<Utc>> {
 
 #[async_trait]
 impl DownloadClient for QbittorrentClient {
+    async fn sync_downloads(&self, reset: bool) -> Result<DownloadClientDelta> {
+        let mut state = self.sync_state.lock().await;
+        let requested_rid = if reset { 0 } else { state.rid };
+        let response = self
+            .execute(RequestClass::Background, || async {
+                let response = self
+                    .request(reqwest::Method::GET, "/api/v2/sync/maindata")
+                    .query(&[("rid", requested_rid)])
+                    .send()
+                    .await
+                    .map_err(transient)?;
+                let response = successful(response, "qBittorrent main data").await?;
+                response.json::<SyncMainData>().await.map_err(transient)
+            })
+            .await?;
+        let full_update = response.full_update || reset;
+        let response_hashes = response
+            .torrents
+            .keys()
+            .map(|hash| hash.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut removed = response
+            .torrents_removed
+            .iter()
+            .map(|hash| hash.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        if full_update {
+            removed.extend(
+                state
+                    .torrents
+                    .keys()
+                    .filter(|hash| !response_hashes.contains(*hash))
+                    .cloned(),
+            );
+        }
+        let inventory_changed = !removed.is_empty()
+            || response_hashes
+                .iter()
+                .any(|hash| !state.torrents.contains_key(hash));
+        if full_update {
+            state.torrents.clear();
+        }
+        let changed_hashes = response.torrents.keys().cloned().collect::<Vec<_>>();
+        for (hash, patch) in response.torrents {
+            let hash = hash.to_ascii_lowercase();
+            let target = state
+                .torrents
+                .entry(hash.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            merge_object(target, patch);
+            if let Value::Object(object) = target {
+                object.insert("hash".into(), Value::String(hash));
+            }
+        }
+        for hash in &removed {
+            state.torrents.remove(hash);
+        }
+        state.rid = response.rid;
+        let downloads = changed_hashes
+            .iter()
+            .filter_map(|hash| state.torrents.get(&hash.to_ascii_lowercase()))
+            .cloned()
+            .map(serde_json::from_value::<QbitTorrent>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|torrent| torrent.normalized(&self.name))
+            .collect();
+        Ok(DownloadClientDelta {
+            downloads,
+            removed: removed.into_iter().collect(),
+            full_update,
+            inventory_changed,
+        })
+    }
+
     async fn free_space(&self) -> Result<i64> {
         self.execute(RequestClass::Manual, || async {
             let response = self
@@ -380,23 +481,6 @@ impl DownloadClient for QbittorrentClient {
             .await?
             .into_iter()
             .next())
-    }
-
-    async fn downloads_by_hashes(&self, info_hashes: &[String]) -> Result<Vec<ObservedDownload>> {
-        self.downloads_by_hashes_with_class(info_hashes, RequestClass::Background)
-            .await
-    }
-
-    async fn downloads_by_hashes_with_class(
-        &self,
-        info_hashes: &[String],
-        class: RequestClass,
-    ) -> Result<Vec<ObservedDownload>> {
-        if info_hashes.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.fetch_downloads(Some(&info_hashes.join("|")), None, None, class)
-            .await
     }
 
     async fn tracker_statuses_with_class(
@@ -516,6 +600,17 @@ impl DownloadClient for QbittorrentClient {
             return Ok(());
         }
         bail!("qBittorrent rejected add request: {body}")
+    }
+}
+
+fn merge_object(target: &mut Value, patch: Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                target.insert(key, value);
+            }
+        }
+        (target, patch) => *target = patch,
     }
 }
 
@@ -647,6 +742,70 @@ mod tests {
         assert!(!public_json.contains("tracker.invalid"));
         assert!(!public_json.contains("A tracker download"));
         assert!(!public_json.contains("\"tags\""));
+    }
+
+    #[tokio::test]
+    async fn merges_incremental_main_data_and_reports_removals() {
+        let server = MockServer::start().await;
+        let info_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/maindata"))
+            .and(query_param("rid", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "rid": 1,
+                "full_update": true,
+                "torrents": {
+                    (info_hash): {
+                        "name": "Incremental album",
+                        "state": "downloading",
+                        "progress": 0.4,
+                        "size": 100,
+                        "downloaded": 40,
+                        "tracker": "https://tracker.invalid/announce"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/maindata"))
+            .and(query_param("rid", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "rid": 2,
+                "torrents": { (info_hash): { "progress": 1.0, "state": "stalledUP" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/sync/maindata"))
+            .and(query_param("rid", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "rid": 3,
+                "full_update": true,
+                "torrents": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        let initial = client.sync_downloads(true).await.expect("initial sync");
+        assert!(initial.full_update);
+        assert!(initial.inventory_changed);
+        assert_eq!(initial.downloads[0].name, "Incremental album");
+        let update = client.sync_downloads(false).await.expect("delta sync");
+        assert!(!update.inventory_changed);
+        assert_eq!(update.downloads[0].name, "Incremental album");
+        assert_eq!(update.downloads[0].live.state, ClientDownloadState::Seeding);
+        let removed = client
+            .sync_downloads(false)
+            .await
+            .expect("full snapshot removal sync");
+        assert!(removed.inventory_changed);
+        assert!(removed.downloads.is_empty());
+        assert_eq!(removed.removed, [info_hash]);
     }
 
     #[tokio::test]

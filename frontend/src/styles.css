@@ -296,6 +296,8 @@ main { margin-left: 240px; width: min(1220px, calc(100% - 240px)); padding: 54px
 .stale-notice .inline-link { margin-left: auto; color: #f0dc9b; font-size: 10px; white-space: nowrap; }
 .error-panel { border: 1px solid #63373c; background: rgba(147,55,63,.11); color: #ffabb0; }
 .error-panel.compact { margin-top: 14px; margin-bottom: 0; }
+.live-update-notice { display: flex; align-items: center; gap: 10px; padding: 9px 18px; background: #4a3618; color: #ffdca0; border-bottom: 1px solid #76592a; font-size: 12px; }
+.live-update-notice button { color: inherit; text-decoration: underline; background: none; border: 0; padding: 0; cursor: pointer; }
 .submission-status { display: flex; align-items: center; gap: 10px; padding: 11px 13px; margin-top: 14px; border: 1px solid #4d476c; border-radius: 9px; color: #d1c8ff; background: rgba(118,100,213,.11); }
 .submission-status > span:last-child, .submission-error > span { display: flex; flex-direction: column; gap: 2px; }
 .submission-status strong, .submission-error strong { font-size: 12px; }

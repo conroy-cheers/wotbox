@@ -16,6 +16,7 @@
     type DisplayVariant
   } from "./releasePreferences";
   import { releaseViewPath, type ReleaseSource } from "./routing";
+  import { liveDownloads, variantDownloads } from "./liveState";
   import StatusPill from "./StatusPill.svelte";
 
   let {
@@ -156,7 +157,7 @@
   }
 
   function variantPath(variant: DisplayVariant): string {
-    const download = variant.downloads[0];
+    const download = currentDownloads(variant)[0];
     return releaseViewPath(
       releaseId,
       variant.torrentId,
@@ -166,6 +167,10 @@
         : undefined,
       expanded
     );
+  }
+
+  function currentDownloads(variant: DisplayVariant) {
+    return variantDownloads(variant, $liveDownloads);
   }
 </script>
 
@@ -187,6 +192,7 @@
   {@const mediaAllowed = isMediaAllowed(variant, policy)}
   {@const allowed = isDownloadable(variant)}
   {@const action = fulfillmentAction(variant)}
+  {@const downloads = currentDownloads(variant)}
   {@const canAdd = Boolean(onadd) && allowed && (!fulfillment || action?.enabled === true)}
   {@const library = libraryState(variant)}
   {@const policyTooltipId = `policy-${variant.tracker ?? tracker}-${variant.torrentId}`}
@@ -234,9 +240,9 @@
       {#if library?.availability === "missing"}<span class="missing-badge">Missing</span>{/if}
     </div>
     <div class="variant-actions">
-      {#if variant.downloads.length}
+      {#if downloads.length}
         <a class="download-status-link" href={variantPath(variant)}>
-          <StatusPill state={variant.downloads[0].state} />
+          <StatusPill state={downloads[0].state} />
         </a>
       {:else if library?.availability === "present" || !onadd || (fulfillment && !action)}
         <a class="secondary-button compact-button" href={variantPath(variant)}>View</a>

@@ -5,6 +5,7 @@
   import { ArrowDownToLine, BookOpen, GitMerge, LayoutDashboard, Radio, Search, Settings2 } from "@lucide/svelte";
   import { appPath, basePath } from "./lib/api";
   import ProviderBanner from "./lib/ProviderBanner.svelte";
+  import LiveUpdates from "./lib/LiveUpdates.svelte";
   import Dashboard from "./pages/Dashboard.svelte";
   import Downloads from "./pages/Downloads.svelte";
   import Channels from "./pages/Channels.svelte";
@@ -131,6 +132,7 @@
       </div>
     </aside>
     <main>
+      <LiveUpdates />
       <ProviderBanner />
       {#key route.key}
         {#if route.name === "dashboard"}

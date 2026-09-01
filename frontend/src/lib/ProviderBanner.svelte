@@ -6,8 +6,7 @@
 
   const providers = createQuery({
     queryKey: ["providers"],
-    queryFn: () => api<ProviderStatus[]>("/api/v1/providers"),
-    refetchInterval: 10_000
+    queryFn: () => api<ProviderStatus[]>("/api/v1/providers")
   });
   const affected = $derived(
     ($providers.data ?? []).filter((provider) =>

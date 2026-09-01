@@ -41,13 +41,11 @@
   });
   const providers = createQuery({
     queryKey: ["providers"],
-    queryFn: () => api<ProviderStatus[]>("/api/v1/providers"),
-    refetchInterval: 10_000
+    queryFn: () => api<ProviderStatus[]>("/api/v1/providers")
   });
   const plex = createQuery({
     queryKey: ["plex-integration"],
-    queryFn: () => api<PlexIntegrationStatus>("/api/v1/integrations/plex"),
-    refetchInterval: 5_000
+    queryFn: () => api<PlexIntegrationStatus>("/api/v1/integrations/plex")
   });
   let qualityTiers = $state<QualityPreference[][]>(
     structuredClone(defaultReleasePreferences.qualityTiers)
@@ -311,7 +309,6 @@
         `/api/v1/providers/${encodeURIComponent(provider.id)}/${action}`,
         { method: "POST" }
       );
-      await queryClient.invalidateQueries({ queryKey: ["providers"] });
     } catch (cause) {
       providerError = cause instanceof Error ? cause.message : "Unable to update provider";
     } finally {
@@ -336,7 +333,6 @@
         });
         savedChannelPayloads = { ...savedChannelPayloads, [channel.id]: serialized };
       }
-      await queryClient.invalidateQueries({ queryKey: ["channels"] });
       channelSaveState = channelDrafts.some(
         (channel) => JSON.stringify(channel) !== savedChannelPayloads[channel.id]
       ) ? "pending" : "idle";
@@ -363,10 +359,6 @@
       plexMessage = queued.jobIds.length === 1
         ? "Plex library scan queued."
         : `${queued.jobIds.length} Plex library scans queued.`;
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["plex-integration"] }),
-        queryClient.invalidateQueries({ queryKey: ["background-jobs"] })
-      ]);
     } catch (cause) {
       plexError = cause instanceof Error ? cause.message : "Unable to notify Plex";
     } finally {

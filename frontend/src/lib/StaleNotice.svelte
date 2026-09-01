@@ -11,8 +11,7 @@
 
   const providers = createQuery({
     queryKey: ["providers"],
-    queryFn: () => api<ProviderStatus[]>("/api/v1/providers"),
-    refetchInterval: 10_000
+    queryFn: () => api<ProviderStatus[]>("/api/v1/providers")
   });
   const affected = $derived((provenance?.sources ?? []).filter((source) => source.state !== "fresh"));
 

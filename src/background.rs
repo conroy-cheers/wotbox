@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     api::{AppState, cleanup_download_stage, enrich_library_artist_credits, process_download},
-    db::{DownloadObservation, EnqueueBackgroundJob, StoredBackgroundJob},
+    change::{ChangeScope, ChangeSet},
+    db::{EnqueueBackgroundJob, StoredBackgroundJob},
     dedupe::{compute_raw_coverage, track_index_from_group},
     model::{
         ArtistCatalogRole, CanonicalTorrent, DownloadState, ImportCleanupMode, ImportTaskState,
@@ -34,27 +35,31 @@ use crate::{
 pub const RESOLVE_DOWNLOAD_HASH: &str = "resolve_download_hash";
 pub const INDEX_TRACKLIST: &str = "index_tracklist";
 pub const COMPUTE_SINGLE_COVERAGE: &str = "compute_single_coverage";
-pub const SCAN_DOWNLOAD_CLIENT: &str = "scan_download_client";
 pub const CANONICAL_BACKFILL: &str = "canonical_backfill";
 pub const RECONCILE_CANONICAL_RELEASES: &str = "reconcile_canonical_releases";
+pub const REPAIR_CANONICAL_IDENTITIES: &str = "repair_canonical_identities";
 pub const ENRICH_LIBRARY_ARTISTS: &str = "enrich_library_artists";
 pub const NOTIFY_PLEX: &str = "notify_plex";
 pub const SUBMIT_DOWNLOAD: &str = "submit_download";
 pub const PROCESS_IMPORT: &str = "process_import";
 pub const REFRESH_ARTIST_CATALOG: &str = "refresh_artist_catalog";
 pub const MATCH_DOWNLOAD_RELEASES: &str = "match_download_releases";
+pub const RECONCILE_LIBRARY_STORE: &str = "reconcile_library_store";
+pub const MATERIALIZE_LIBRARY_ASSET: &str = "materialize_library_asset";
 
-const WORKER_LANES: [&str; 6] = [
+const WORKER_LANES: [&str; 8] = [
     "event",
     "sync",
     "sync",
     "maintenance",
     "download",
     "download",
+    "media",
+    "media",
 ];
 const LEASE_DURATION: Duration = Duration::from_secs(120);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Clone)]
 pub struct BackgroundJobNotifier {
@@ -103,8 +108,22 @@ impl BackgroundRuntime {
             }
         }
         for owner in self.owners {
-            if let Err(error) = self.db.release_background_job_lease(&owner).await {
-                tracing::warn!(%owner, %error, "could not release background job lease");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(%owner, "skipped background job lease release after shutdown deadline");
+                break;
+            }
+            match tokio::time::timeout(remaining, self.db.release_background_job_lease(&owner))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%owner, %error, "could not release background job lease");
+                }
+                Err(_) => {
+                    tracing::warn!(%owner, "background job lease release timed out");
+                    break;
+                }
             }
         }
     }
@@ -356,24 +375,6 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
         .prune_background_jobs(ChronoDuration::days(30))
         .await?;
     state.db.ensure_incomplete_download_submissions().await?;
-    for name in state.download_clients.keys() {
-        enqueue(
-            state,
-            EnqueueBackgroundJob {
-                deduplication_key: &format!("scan-download-client:{name}"),
-                kind: SCAN_DOWNLOAD_CLIENT,
-                payload: json!({ "client": name }),
-                provider_id: Some(format!("qbittorrent:{name}")),
-                lane: "maintenance",
-                priority: 50,
-                max_attempts: 20,
-                next_run_at: None,
-                parent_id: None,
-                recurring_interval_seconds: Some(300),
-            },
-        )
-        .await?;
-    }
     enqueue(
         state,
         EnqueueBackgroundJob {
@@ -387,6 +388,22 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
             next_run_at: None,
             parent_id: None,
             recurring_interval_seconds: None,
+        },
+    )
+    .await?;
+    enqueue(
+        state,
+        EnqueueBackgroundJob {
+            deduplication_key: "reconcile-library-store:v1",
+            kind: RECONCILE_LIBRARY_STORE,
+            payload: json!({}),
+            provider_id: None,
+            lane: "maintenance",
+            priority: -10,
+            max_attempts: 20,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: Some(300),
         },
     )
     .await?;
@@ -523,6 +540,17 @@ async fn run_claimed_job(
         provider = job.provider_id.as_deref().unwrap_or("local"),
         "running background job"
     );
+    if job.kind != MATERIALIZE_LIBRARY_ASSET {
+        state
+            .publish(
+                ChangeSet::new(
+                    format!("background_job_started:{}", job.kind),
+                    [ChangeScope::Operations],
+                )
+                .with_resources(["background-jobs"]),
+            )
+            .await;
+    }
     let operation_state = state.clone();
     let operation_job = job.clone();
     let mut operation = AbortOnDrop {
@@ -627,6 +655,47 @@ async fn run_claimed_job(
     };
     if let Err(error) = result {
         tracing::error!(job_id = %job.id, %error, "could not persist background job outcome");
+    } else {
+        let scopes = match job.kind.as_str() {
+            REFRESH_ARTIST_CATALOG | RECONCILE_LIBRARY_STORE => vec![ChangeScope::Operations],
+            MATERIALIZE_LIBRARY_ASSET => vec![ChangeScope::Assets],
+            SUBMIT_DOWNLOAD | PROCESS_IMPORT | MATCH_DOWNLOAD_RELEASES | RESOLVE_DOWNLOAD_HASH => {
+                vec![
+                    ChangeScope::Operations,
+                    ChangeScope::Activity,
+                    ChangeScope::Channels,
+                ]
+            }
+            _ => vec![ChangeScope::Operations],
+        };
+        let mut change = ChangeSet::new(format!("background_job:{}", job.kind), scopes);
+        if job.kind == MATERIALIZE_LIBRARY_ASSET {
+            if let Ok(payload) = serde_json::from_value::<LibraryAssetPayload>(job.payload.clone())
+            {
+                change = change.with_resources([format!("asset:{}", payload.source_hash)]);
+            }
+        } else {
+            let mut resources = vec!["background-jobs"];
+            match job.kind.as_str() {
+                SUBMIT_DOWNLOAD => resources.push("download-jobs"),
+                PROCESS_IMPORT => resources.push("imports"),
+                MATCH_DOWNLOAD_RELEASES | RESOLVE_DOWNLOAD_HASH => {
+                    resources.push("download-inventory")
+                }
+                INDEX_TRACKLIST
+                | COMPUTE_SINGLE_COVERAGE
+                | CANONICAL_BACKFILL
+                | RECONCILE_CANONICAL_RELEASES
+                | REPAIR_CANONICAL_IDENTITIES
+                | ENRICH_LIBRARY_ARTISTS
+                | REFRESH_ARTIST_CATALOG => resources.push("catalog"),
+                NOTIFY_PLEX => resources.push("plex"),
+                RECONCILE_LIBRARY_STORE => {}
+                _ => {}
+            }
+            change = change.with_resources(resources);
+        }
+        state.publish(change).await;
     }
 }
 
@@ -635,9 +704,9 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
         RESOLVE_DOWNLOAD_HASH => resolve_download_hash(state, &job.payload).await,
         INDEX_TRACKLIST => index_tracklist(state, job.id, &job.payload).await,
         COMPUTE_SINGLE_COVERAGE => compute_single_coverage(state, &job.payload).await,
-        SCAN_DOWNLOAD_CLIENT => scan_download_client(state, &job.payload).await,
         CANONICAL_BACKFILL => canonical_backfill(state).await,
         RECONCILE_CANONICAL_RELEASES => reconcile_canonical_releases(state).await,
+        REPAIR_CANONICAL_IDENTITIES => repair_canonical_identities(state, &job.payload).await,
         ENRICH_LIBRARY_ARTISTS => {
             enrich_library_artist_credits(state).await?;
             Ok(JobOutcome::Complete)
@@ -647,6 +716,8 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
         PROCESS_IMPORT => process_import(state, &job.payload).await,
         REFRESH_ARTIST_CATALOG => refresh_artist_catalog(state, &job.payload).await,
         MATCH_DOWNLOAD_RELEASES => match_download_releases(state).await,
+        RECONCILE_LIBRARY_STORE => reconcile_library_store(state).await,
+        MATERIALIZE_LIBRARY_ASSET => materialize_library_asset(state, job).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
     }
 }
@@ -810,6 +881,138 @@ async fn refresh_artist_catalog(state: &Arc<AppState>, payload: &Value) -> Resul
     )
     .await?;
     Ok(JobOutcome::Complete)
+}
+
+async fn reconcile_library_store(state: &Arc<AppState>) -> Result<JobOutcome> {
+    for (tracker, artist_id) in state.db.library_artist_catalogs_due(25).await? {
+        enqueue_artist_catalog_refresh(state, &tracker, artist_id, false, false).await?;
+    }
+    state.db.reconcile_library_asset_references().await?;
+    for source_url in state.db.library_artwork_sources(500).await? {
+        state.db.ensure_library_asset(&source_url).await?;
+    }
+    let changed = state.db.reconcile_library_admissions(100).await?;
+    if changed > 0 {
+        tracing::debug!(
+            changed,
+            "library admissions changed; projection refresh queued"
+        );
+    }
+    let unreferenced = state
+        .db
+        .prune_unreferenced_library_assets(Utc::now() - ChronoDuration::days(30), 100)
+        .await?;
+    for (blob_hash, extension) in unreferenced {
+        if let Err(error) = state.asset_store.remove_blob(&blob_hash, &extension).await {
+            tracing::warn!(%blob_hash, %error, "could not remove unreferenced Library asset blob");
+        }
+    }
+    state.background_jobs.wake();
+    Ok(JobOutcome::Complete)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryAssetPayload {
+    source_hash: String,
+    source_url: String,
+}
+
+async fn materialize_library_asset(
+    state: &Arc<AppState>,
+    job: &StoredBackgroundJob,
+) -> Result<JobOutcome> {
+    let payload: LibraryAssetPayload = serde_json::from_value(job.payload.clone())?;
+    let outcome = match state.asset_store.materialize(&payload.source_url).await {
+        Ok(asset) => {
+            anyhow::ensure!(
+                asset.source_hash == payload.source_hash,
+                "Library asset source identity changed during materialization"
+            );
+            state.db.complete_library_asset(&asset).await?;
+            Ok(JobOutcome::Complete)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            match error.kind() {
+                crate::asset::AssetFailureKind::Absent => {
+                    state
+                        .db
+                        .set_library_asset_failure(
+                            &payload.source_hash,
+                            "absent",
+                            error.code(),
+                            &message,
+                            None,
+                        )
+                        .await?;
+                    Ok(JobOutcome::Complete)
+                }
+                crate::asset::AssetFailureKind::Unsupported => {
+                    state
+                        .db
+                        .set_library_asset_failure(
+                            &payload.source_hash,
+                            "unsupported",
+                            error.code(),
+                            &message,
+                            None,
+                        )
+                        .await?;
+                    Ok(JobOutcome::Complete)
+                }
+                crate::asset::AssetFailureKind::Retryable
+                    if job.attempts.saturating_add(1) >= job.max_attempts =>
+                {
+                    state
+                        .db
+                        .set_library_asset_failure(
+                            &payload.source_hash,
+                            "failed_terminal",
+                            error.code(),
+                            &message,
+                            Some(Utc::now() + ChronoDuration::days(7)),
+                        )
+                        .await?;
+                    Ok(JobOutcome::Fail {
+                        code: error.code(),
+                        message,
+                    })
+                }
+                crate::asset::AssetFailureKind::Retryable => {
+                    state
+                        .db
+                        .set_library_asset_failure(
+                            &payload.source_hash,
+                            "retrying",
+                            error.code(),
+                            &message,
+                            None,
+                        )
+                        .await?;
+                    let exponent = job.attempts.min(7);
+                    let base = 30_u64.saturating_mul(1_u64 << exponent).min(3600);
+                    let jitter = (u128::from_le_bytes(*job.id.as_bytes()) % 11) as u64;
+                    Ok(JobOutcome::Retry {
+                        delay: Duration::from_secs(base + jitter),
+                        increment_attempt: true,
+                        code: error.code(),
+                        message,
+                    })
+                }
+            }
+        }
+    };
+    state
+        .publish(
+            ChangeSet::new(
+                format!("asset:{}", payload.source_hash),
+                [ChangeScope::Assets],
+            )
+            .with_resources([format!("asset:{}", payload.source_hash)]),
+        )
+        .await;
+    outcome
 }
 
 #[derive(Deserialize)]
@@ -1650,57 +1853,6 @@ fn has_primary_role(roles: &[ArtistCatalogRole]) -> bool {
     roles.contains(&ArtistCatalogRole::Primary)
 }
 
-#[derive(Deserialize)]
-struct ClientPayload {
-    client: String,
-}
-
-async fn scan_download_client(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
-    const PAGE_SIZE: u32 = 200;
-    let payload: ClientPayload = serde_json::from_value(payload.clone())?;
-    let client = state
-        .download_clients
-        .get(&payload.client)
-        .with_context(|| format!("download client {} is not configured", payload.client))?;
-    let scan_started_at = Utc::now();
-    let mut offset = 0;
-    loop {
-        let downloads = client
-            .downloads_with_class(PAGE_SIZE, offset, RequestClass::Background)
-            .await?;
-        let count = downloads.len();
-        let observations = downloads
-            .iter()
-            .map(|download| DownloadObservation {
-                torrent_name: Some(download.name.clone()),
-                live: download.live.clone(),
-                announce_host: download.announce_host.clone(),
-                tracker: download
-                    .announce_host
-                    .as_ref()
-                    .and_then(|host| state.announce_hosts.get(host))
-                    .cloned(),
-                plex_target: state
-                    .plex
-                    .as_ref()
-                    .and_then(|plex| plex.target_for_path(&download.live.save_path)),
-            })
-            .collect::<Vec<_>>();
-        state.db.observe_downloads(&observations).await?;
-        state.background_jobs.wake();
-        offset += count as u32;
-        if count < PAGE_SIZE as usize || offset >= 100_000 {
-            break;
-        }
-    }
-    state
-        .db
-        .complete_client_scan(&payload.client, scan_started_at)
-        .await?;
-    state.db.sync_import_tasks().await?;
-    Ok(JobOutcome::Complete)
-}
-
 async fn canonical_backfill(state: &Arc<AppState>) -> Result<JobOutcome> {
     match state.db.backfill_canonical_identities(20).await? {
         0 => Ok(JobOutcome::Complete),
@@ -1722,6 +1874,32 @@ async fn reconcile_canonical_releases(state: &Arc<AppState>) -> Result<JobOutcom
             code: "more_work",
             message: "Continuing cross-tracker release reconciliation".into(),
         }),
+    }
+}
+
+async fn repair_canonical_identities(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+    let fingerprint = payload
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .context("canonical identity repair job is missing its audit fingerprint")?;
+    state
+        .db
+        .apply_canonical_identity_repair(fingerprint, 10)
+        .await?;
+    let complete = state
+        .db
+        .canonical_identity_repair_status()
+        .await?
+        .is_some_and(|status| status.remaining == 0);
+    if complete {
+        Ok(JobOutcome::Complete)
+    } else {
+        Ok(JobOutcome::Retry {
+            delay: Duration::from_millis(250),
+            increment_attempt: false,
+            code: "more_work",
+            message: "Continuing canonical artist identity repair".into(),
+        })
     }
 }
 

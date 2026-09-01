@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createMutation, createQuery, useQueryClient } from "@tanstack/svelte-query";
+  import { createMutation, createQuery } from "@tanstack/svelte-query";
   import { ArrowDownToLine, ArrowRight, Clock3, RefreshCw } from "@lucide/svelte";
   import { derived, writable } from "svelte/store";
   import { api, formatBytes, formatSpeed, relativeTime, type DownloadsPage, type ImportsPage, type ImportTask } from "../lib/api";
@@ -9,28 +9,25 @@
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import { positiveInteger, releaseViewPath, replaceView } from "../lib/routing";
+  import { currentDownload, liveDownloads } from "../lib/liveState";
 
   const initial = new URLSearchParams(location.search);
-  const queryClient = useQueryClient();
   let view = $state<"imports" | "transfers">(initial.get("view") === "transfers" ? "transfers" : "imports");
   let importFilter = $state<"active" | "review" | "history">("active");
   const limit = writable(Math.min(positiveInteger(initial, "limit", 100), 500));
   let urlSyncReady = false;
   const queryOptions = derived(limit, ($limit) => ({
     queryKey: ["downloads", $limit] as const,
-    queryFn: () => api<DownloadsPage>(`/api/v1/downloads?limit=${$limit}`),
-    refetchInterval: 15_000
+    queryFn: () => api<DownloadsPage>(`/api/v1/downloads?limit=${$limit}`)
   }));
   const downloads = createQuery(queryOptions);
   const imports = createQuery({
     queryKey: ["imports"],
-    queryFn: () => api<ImportsPage>("/api/v1/imports?limit=500"),
-    refetchInterval: 10_000
+    queryFn: () => api<ImportsPage>("/api/v1/imports?limit=500")
   });
   const importAction = createMutation({
     mutationFn: ({ id, action }: { id: string; action: "retry" | "dismiss" }) =>
-      api<void>(`/api/v1/imports/${id}/${action}`, { method: "POST" }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["imports"] })
+      api<void>(`/api/v1/imports/${id}/${action}`, { method: "POST" })
   });
 
   $effect(() => {
@@ -176,7 +173,7 @@
   {/if}
   <div class="download-grid">
     {#each $downloads.data.items as item}
-      {@const download = item.download}
+      {@const download = currentDownload(item.download, $liveDownloads)}
       <article class="download-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
         <div class="download-card-heading">
           <div class="release-mark large">{item.release.title.slice(0, 1).toUpperCase()}</div>
@@ -190,6 +187,11 @@
             <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
           </div>
           <StatusPill state={download.state} />
+          {#if item.libraryPublication?.state === "preparing"}
+            <span class="status-pill queued">Preparing Library</span>
+          {:else if item.libraryPublication?.state === "blocked"}
+            <span class="status-pill error">Library blocked</span>
+          {/if}
         </div>
         <div class="progress-track" aria-label={`${Math.round(download.progress * 100)}% complete`}>
           <span style={`width: ${Math.max(1, download.progress * 100)}%`}></span>
@@ -208,7 +210,7 @@
         {/if}
         <footer>
           <div class="download-card-meta">
-            <span>{item.liveStale ? `Live status cached${item.liveObservedAt ? ` · ${relativeTime(item.liveObservedAt)}` : ""}` : item.provenance.stale ? "Tracker metadata stale · refreshing" : download.addedAt ? `Added ${relativeTime(download.addedAt)}` : download.clientState}</span>
+            <span>{item.libraryPublication?.state === "preparing" ? "Preparing metadata and artwork for the offline Library" : item.liveStale ? `Live status cached${item.liveObservedAt ? ` · ${relativeTime(item.liveObservedAt)}` : ""}` : item.provenance.stale ? "Tracker metadata stale · refreshing" : download.addedAt ? `Added ${relativeTime(download.addedAt)}` : download.clientState}</span>
             <span>Ratio {download.ratio.toFixed(2)} · ↑ {formatSpeed(download.uploadSpeed)}</span>
           </div>
           <a class="download-release-link" href={releasePath(item)}>

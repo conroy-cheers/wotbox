@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Disc3 } from "@lucide/svelte";
+  import CachedImage from "./CachedImage.svelte";
 
   let {
     image,
@@ -13,21 +14,12 @@
     iconSize?: number;
   } = $props();
 
-  function hideBrokenImage(event: Event) {
-    (event.currentTarget as HTMLImageElement).remove();
-  }
 </script>
 
 {#snippet artwork()}
   <Disc3 size={iconSize} aria-hidden="true" />
   {#if image}
-    <img
-      src={image}
-      alt=""
-      referrerpolicy="no-referrer"
-      loading="lazy"
-      onerror={hideBrokenImage}
-    />
+    <CachedImage src={image} />
   {/if}
 {/snippet}
 

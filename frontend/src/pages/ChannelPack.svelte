@@ -20,6 +20,7 @@
   import ReleaseDownloads from "../lib/ReleaseDownloads.svelte";
   import StatusPill from "../lib/StatusPill.svelte";
   import TrackerLinks from "../lib/TrackerLinks.svelte";
+  import { liveDownloads, releaseDownloads } from "../lib/liveState";
 
   let { id }: { id: string } = $props();
   const initialId = untrack(() => id);
@@ -33,12 +34,10 @@
 
   const pack = createQuery({
     queryKey: ["channel-pack", initialId],
-    queryFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}`),
-    refetchInterval: 15_000
+    queryFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}`)
   });
   const replan = createMutation({
-    mutationFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}/replan`, { method: "POST" }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] })
+    mutationFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}/replan`, { method: "POST" })
   });
   const attach = createMutation({
     mutationFn: ({ ordinal, releaseId, version }: { ordinal: number; releaseId: string; version: number }) =>
@@ -48,7 +47,6 @@
       }),
     onSuccess: (updated) => {
       queryClient.setQueryData(["channel-pack", initialId], updated);
-      queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] });
     }
   });
   const decide = createMutation({
@@ -65,15 +63,9 @@
         method: "POST",
         body: JSON.stringify({ planVersion: version, ordinals })
       }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] });
-      queryClient.invalidateQueries({ queryKey: ["channels-overview"] });
-      queryClient.invalidateQueries({ queryKey: ["downloads"] });
-    },
     onError: (error) => {
       if (error instanceof ApiError && error.code === "pack_state_changed") {
         selectedOrdinals = new Set();
-        queryClient.invalidateQueries({ queryKey: ["channel-pack", initialId] });
       }
     }
   });
@@ -130,6 +122,10 @@
 
   function downloadStates(downloads: ChannelPack["items"][number]["downloads"]): ClientDownloadState[] {
     return [...new Set(downloads.map((download) => download.live.state))];
+  }
+
+  function currentDownloads(downloads: ChannelPack["items"][number]["downloads"]) {
+    return releaseDownloads(downloads, $liveDownloads);
   }
 
   $effect(() => {
@@ -215,6 +211,7 @@
 
   <div class="result-list pack-items">
     {#each visibleItems(current) as item}
+      {@const downloads = currentDownloads(item.downloads)}
       <article class="release-card pack-item">
         <div class="pack-rank">
           {#if current.decision === "open" && selectable(item)}
@@ -258,13 +255,13 @@
               · mapped to this containing release
             </div>
           {/if}
-          {#if item.downloads.length}
+          {#if downloads.length}
             <details class="pack-source-downloads">
               <summary>
-                {item.downloads.length} trumped {item.downloads.length === 1 ? "download" : "downloads"}
-                {#each downloadStates(item.downloads) as state}<StatusPill {state} />{/each}
+                {downloads.length} trumped {downloads.length === 1 ? "download" : "downloads"}
+                {#each downloadStates(downloads) as state}<StatusPill {state} />{/each}
               </summary>
-              <ReleaseDownloads downloads={item.downloads} />
+              <ReleaseDownloads {downloads} />
             </details>
           {/if}
           {#if item.replacement}
@@ -278,8 +275,9 @@
                 {item.replacement.state}
               </span>
             </section>
-            {#if item.replacement.downloads.length}
-              <ReleaseDownloads downloads={item.replacement.downloads} />
+            {@const replacementDownloads = currentDownloads(item.replacement.downloads)}
+            {#if replacementDownloads.length}
+              <ReleaseDownloads downloads={replacementDownloads} />
             {/if}
           {/if}
           {#if item.release}

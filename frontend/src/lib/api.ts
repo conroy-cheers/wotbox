@@ -49,6 +49,33 @@ export type CanonicalBackfillProgress = {
   total: number;
   remaining: number;
   lastError?: string;
+  identityRepair?: CanonicalIdentityRepairStatus;
+};
+
+export type ArtistRepairComponent = {
+  targetId: string;
+  memberIds: string[];
+  normalizedName: string;
+  evidence: string[];
+};
+
+export type CanonicalIdentityRepairPlan = {
+  matcherVersion: number;
+  fingerprint: string;
+  components: ArtistRepairComponent[];
+  ambiguousNames: number;
+  rejectedPairs: number;
+  staleReleaseSnapshots: number;
+};
+
+export type CanonicalIdentityRepairStatus = {
+  state: "audit_ready" | "applying" | "complete";
+  processed: number;
+  total: number;
+  remaining: number;
+  fingerprint?: string;
+  lastError?: string;
+  plan?: CanonicalIdentityRepairPlan;
 };
 
 export type Account = {
@@ -351,6 +378,10 @@ export type CanonicalDownload = {
   provenance: Provenance;
   liveObservedAt?: string;
   liveStale: boolean;
+  libraryPublication?: {
+    state: "preparing" | "published" | "blocked";
+    errorCode?: string;
+  };
 };
 
 export type DownloadsPage = {
@@ -446,6 +477,13 @@ export type LibraryArtistSummary = {
   tracker: string;
   artistId?: number;
   creditSource: "structured" | "display_fallback";
+  sources: {
+    key: string;
+    tracker: string;
+    artistId?: number;
+    creditSource: "structured" | "display_fallback";
+    name: string;
+  }[];
   name: string;
   releaseCount: number;
   missingCount: number;
@@ -469,6 +507,7 @@ export type LibraryArtistsPage = {
 export type LibraryArtistPage = {
   artist: LibraryArtistSummary;
   items: LibraryRelease[];
+  catalog: ArtistCatalogPage;
   total: number;
   index: LibraryIndexStatus;
 };
@@ -738,6 +777,8 @@ export type ChannelOverview = {
   channel: ChannelConfig;
   activeRun?: ChannelRun;
   latestPack?: ChannelPackSummary;
+  recentPacks: ChannelPackSummary[];
+  packCount: number;
 };
 
 export type ChannelPackItem = {
@@ -891,7 +932,13 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       ...init?.headers
     }
   });
-  const body = await response.json().catch(() => null);
+  const contentType = response.headers.get("content-type") ?? "";
+  const body = contentType.includes("application/json")
+    ? await response.json().catch(() => null)
+    : null;
+  if (response.redirected && !response.url.includes(`${basePath}/api/`)) {
+    throw new ApiError("Your session expired. Reload the page to sign in again.", 401, "authentication_required");
+  }
   if (!response.ok) {
     const message = body?.error?.message ?? `Request failed with HTTP ${response.status}`;
     throw new ApiError(
