@@ -653,6 +653,7 @@ export type ProviderStatus = {
   safeBackgroundMinimumIntervalMs: number;
   maxConcurrency: number;
   safeMaxConcurrency: number;
+  activeRequests: number;
   queued: {
     interactive: number;
     download: number;

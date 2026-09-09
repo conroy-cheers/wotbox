@@ -23,6 +23,7 @@ function provider(overrides: Partial<ProviderStatus> = {}): ProviderStatus {
     maxConcurrency: 1,
     safeMaxConcurrency: 1,
     queued: { interactive: 0, download: 0, manual: 0, scheduled: 0, background: 0 },
+    activeRequests: 0,
     canPause: true,
     canResume: false,
     ...overrides

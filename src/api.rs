@@ -6354,6 +6354,10 @@ where
                     (StatusCode::TOO_MANY_REQUESTS, "provider_busy")
                 }
                 ProviderRequestError::Unknown(_) => (StatusCode::NOT_FOUND, "provider_not_found"),
+                ProviderRequestError::AdmissionStorage { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider_admission_storage",
+                ),
                 _ if provider.is_unavailable() => {
                     (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable")
                 }

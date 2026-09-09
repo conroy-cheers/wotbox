@@ -1942,6 +1942,14 @@ async fn classify_error(
                     message,
                 };
             }
+            ProviderRequestError::AdmissionStorage { .. } => {
+                return JobOutcome::Retry {
+                    delay: Duration::from_secs(5),
+                    increment_attempt: false,
+                    code: "provider_admission_storage",
+                    message,
+                };
+            }
             ProviderRequestError::Busy { .. } | ProviderRequestError::Stopped(_) => {
                 return JobOutcome::Retry {
                     delay: Duration::from_secs(5),
@@ -2022,6 +2030,7 @@ fn provider_error_is_admission_or_blocked(error: &anyhow::Error) -> bool {
                 error,
                 ProviderRequestError::Unavailable { .. }
                     | ProviderRequestError::Busy { .. }
+                    | ProviderRequestError::AdmissionStorage { .. }
                     | ProviderRequestError::Deferred { .. }
                     | ProviderRequestError::Stopped(_)
                     | ProviderRequestError::Upstream {

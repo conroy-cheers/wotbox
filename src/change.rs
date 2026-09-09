@@ -200,6 +200,7 @@ fn provider_change_fingerprint(mut statuses: Vec<crate::model::ProviderStatus>) 
         status.last_request_at = None;
         status.last_success_at = None;
         status.last_background_request_at = None;
+        status.active_requests = 0;
     }
     serde_json::to_string(&statuses).unwrap_or_default()
 }
@@ -420,6 +421,7 @@ mod tests {
             max_concurrency: 1,
             safe_max_concurrency: 1,
             queued: ProviderQueueCounts::default(),
+            active_requests: 0,
             can_pause: true,
             can_resume: false,
         }
@@ -432,6 +434,7 @@ mod tests {
         telemetry.last_request_at = Utc.timestamp_opt(1_700_000_000, 0).single();
         telemetry.last_success_at = Utc.timestamp_opt(1_700_000_001, 0).single();
         telemetry.last_background_request_at = Utc.timestamp_opt(1_700_000_002, 0).single();
+        telemetry.active_requests = 1;
         assert_eq!(
             provider_change_fingerprint(vec![original.clone()]),
             provider_change_fingerprint(vec![telemetry])

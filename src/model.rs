@@ -512,6 +512,7 @@ pub struct ProviderStatus {
     pub safe_background_minimum_interval_ms: u64,
     pub max_concurrency: u32,
     pub safe_max_concurrency: u32,
+    pub active_requests: u32,
     pub queued: ProviderQueueCounts,
     pub can_pause: bool,
     pub can_resume: bool,

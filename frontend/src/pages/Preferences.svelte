@@ -677,6 +677,7 @@
               <p class="provider-message">{provider.message}</p>
             {/if}
             <div class="provider-metrics">
+              <span><strong>{provider.activeRequests}/{provider.maxConcurrency}</strong> active</span>
               <span><strong>{queued}</strong> queued</span>
               <span><strong>{provider.consecutiveFailures}</strong> consecutive failures</span>
               {#if provider.retryAt}<span>Retry after <strong>{new Date(provider.retryAt).toLocaleString()}</strong></span>{/if}

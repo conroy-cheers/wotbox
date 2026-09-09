@@ -184,6 +184,8 @@ pub enum ProviderRequestError {
     },
     #[error("{provider} request queue is busy")]
     Busy { provider: String },
+    #[error("{provider} request admission could not be persisted: {message}")]
+    AdmissionStorage { provider: String, message: String },
     #[error("{provider} background request deferred until {retry_at}")]
     Deferred {
         provider: String,
@@ -206,6 +208,7 @@ impl ProviderRequestError {
         match self {
             Self::Unavailable { provider, .. }
             | Self::Busy { provider }
+            | Self::AdmissionStorage { provider, .. }
             | Self::Deferred { provider, .. }
             | Self::Upstream { provider, .. }
             | Self::Unknown(provider)
@@ -216,7 +219,11 @@ impl ProviderRequestError {
     pub fn is_unavailable(&self) -> bool {
         matches!(
             self,
-            Self::Unavailable { .. } | Self::Busy { .. } | Self::Deferred { .. } | Self::Stopped(_)
+            Self::Unavailable { .. }
+                | Self::Busy { .. }
+                | Self::AdmissionStorage { .. }
+                | Self::Deferred { .. }
+                | Self::Stopped(_)
         ) || matches!(
             self,
             Self::Upstream {
@@ -249,11 +256,7 @@ struct ProviderHandle {
 
 struct Waiter {
     request_limit: Option<ProviderRequestLimit>,
-    sender: oneshot::Sender<std::result::Result<Grant, ProviderRequestError>>,
-}
-
-struct Grant {
-    request_limit_reset_at: Option<DateTime<Utc>>,
+    sender: oneshot::Sender<std::result::Result<Permit, ProviderRequestError>>,
 }
 
 struct RequestWindow {
@@ -265,7 +268,7 @@ enum Command {
     Acquire {
         class: RequestClass,
         request_limit: Option<ProviderRequestLimit>,
-        sender: oneshot::Sender<std::result::Result<Grant, ProviderRequestError>>,
+        sender: oneshot::Sender<std::result::Result<Permit, ProviderRequestError>>,
     },
     Complete(Option<ProviderFailure>, oneshot::Sender<()>),
     Abandoned,
@@ -309,7 +312,17 @@ struct Actor {
     queues: [VecDeque<Waiter>; PRIORITY_COUNT],
     request_windows: HashMap<&'static str, RequestWindow>,
     active: u32,
+    // Weak: the actor must not keep its own command channel alive.
+    sender: mpsc::WeakUnboundedSender<Command>,
     receiver: mpsc::UnboundedReceiver<Command>,
+    #[cfg(test)]
+    persist_hook: std::sync::Mutex<Option<PersistHook>>,
+}
+
+#[cfg(test)]
+struct PersistHook {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<bool>,
 }
 
 impl ProviderGovernor {
@@ -370,7 +383,10 @@ impl ProviderGovernor {
                 queues: array::from_fn(|_| VecDeque::new()),
                 request_windows: HashMap::new(),
                 active: 0,
+                sender: sender.downgrade(),
                 receiver,
+                #[cfg(test)]
+                persist_hook: std::sync::Mutex::new(None),
             };
             tokio::spawn(actor.run());
             providers.insert(definition.id.clone(), ProviderHandle { definition, sender });
@@ -468,12 +484,7 @@ impl ProviderGovernor {
                 })?
                 .map_err(|_| ProviderRequestError::Stopped(provider.into()))?
         };
-        let grant = granted?;
-        Ok(Permit {
-            sender: handle.sender.clone(),
-            request_limit_reset_at: grant.request_limit_reset_at,
-            completed: false,
-        })
+        granted
     }
 
     pub async fn statuses(&self) -> Vec<ProviderStatus> {
@@ -573,6 +584,7 @@ impl Actor {
     }
 
     async fn handle(&mut self, command: Command) {
+        self.prune_cancelled_waiters();
         match command {
             Command::Acquire {
                 class,
@@ -679,6 +691,7 @@ impl Actor {
     }
 
     async fn grant_ready(&mut self) {
+        self.prune_cancelled_waiters();
         self.advance_cooldown().await;
         loop {
             if self.active >= self.stored.max_concurrency
@@ -697,11 +710,22 @@ impl Actor {
             if waiter.sender.is_closed() {
                 continue;
             }
+            let Some(sender) = self.sender.upgrade() else {
+                return;
+            };
             self.active += 1;
+            // Own the reservation before the first await. The actor, oneshot,
+            // and caller transfer this same guard; every cancellation path drops it.
+            let mut permit = Permit {
+                sender,
+                request_limit_reset_at: None,
+                completed: false,
+            };
             let granted_at = Utc::now();
             let request_limit_reset_at = waiter
                 .request_limit
                 .map(|limit| self.record_request_limit(limit, granted_at));
+            permit.request_limit_reset_at = request_limit_reset_at;
             self.stored.last_request_at = Some(granted_at);
             if matches!(
                 queue,
@@ -711,16 +735,18 @@ impl Actor {
                 self.stored.last_background_request_at = Some(granted_at);
             }
             if let Err(error) = self.persist().await {
-                self.active = self.active.saturating_sub(1);
-                let _ = waiter.sender.send(Err(ProviderRequestError::Stopped(
-                    self.definition.id.clone(),
-                )));
+                let _ = waiter
+                    .sender
+                    .send(Err(ProviderRequestError::AdmissionStorage {
+                        provider: self.definition.id.clone(),
+                        message: error.to_string(),
+                    }));
                 tracing::error!(provider = %self.definition.id, %error, "could not persist provider request permit");
                 return;
             }
-            let _ = waiter.sender.send(Ok(Grant {
-                request_limit_reset_at,
-            }));
+            // A failed send returns (and drops) the permit. A successful but
+            // unread send is owned by the receiver and dropped on cancellation.
+            let _ = waiter.sender.send(Ok(permit));
             if self.stored.minimum_interval_ms > 0 {
                 return;
             }
@@ -998,6 +1024,12 @@ impl Actor {
         self.queues.iter().map(VecDeque::len).sum()
     }
 
+    fn prune_cancelled_waiters(&mut self) {
+        for queue in &mut self.queues {
+            queue.retain(|waiter| !waiter.sender.is_closed());
+        }
+    }
+
     fn status(&self) -> ProviderStatus {
         let queued = ProviderQueueCounts {
             interactive: self.queues[0].len(),
@@ -1028,6 +1060,7 @@ impl Actor {
                 .as_millis() as u64,
             max_concurrency: self.stored.max_concurrency,
             safe_max_concurrency: self.definition.safe_max_concurrency,
+            active_requests: self.active,
             queued,
             can_pause: matches!(
                 self.stored.state,
@@ -1041,6 +1074,16 @@ impl Actor {
     }
 
     async fn persist(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let hook = self.persist_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                let _ = hook.entered.send(());
+                if hook.release.await.unwrap_or(false) {
+                    anyhow::bail!("injected admission storage failure");
+                }
+            }
+        }
         self.db.put_provider_state(&self.stored).await
     }
 }
@@ -1102,6 +1145,251 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    // Drive admission directly, so cancellation happens at the exact boundary
+    // under test, without relying on sleeps or scheduler timing.
+    async fn admission_fixture() -> (tempfile::TempDir, Actor, ProviderGovernor) {
+        let directory = tempdir().unwrap();
+        let db = Database::open(&directory.path().join("admission.sqlite"))
+            .await
+            .unwrap();
+        let definition = ProviderDefinition {
+            id: "test".into(),
+            display_name: "Test".into(),
+            kind: "test".into(),
+            safe_minimum_interval: Duration::ZERO,
+            safe_background_minimum_interval: Duration::ZERO,
+            safe_max_concurrency: 1,
+        };
+        let seed = ProviderGovernor::new(
+            db.clone(),
+            vec![definition.clone()],
+            &ApiPreferences::default(),
+        )
+        .await
+        .unwrap();
+        drop(seed);
+        let stored = db.provider_state("test").await.unwrap().unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let actor = Actor {
+            db,
+            definition: definition.clone(),
+            stored,
+            queues: array::from_fn(|_| VecDeque::new()),
+            request_windows: HashMap::new(),
+            active: 0,
+            sender: sender.downgrade(),
+            receiver,
+            persist_hook: std::sync::Mutex::new(None),
+        };
+        let governor = ProviderGovernor {
+            providers: Arc::new(HashMap::from([(
+                "test".into(),
+                ProviderHandle { definition, sender },
+            )])),
+        };
+        (directory, actor, governor)
+    }
+
+    async fn queue_admission(
+        actor: &mut Actor,
+    ) -> oneshot::Receiver<std::result::Result<Permit, ProviderRequestError>> {
+        let (sender, receiver) = oneshot::channel();
+        actor
+            .handle(Command::Acquire {
+                class: RequestClass::Download,
+                request_limit: None,
+                sender,
+            })
+            .await;
+        receiver
+    }
+
+    async fn assert_released_and_progress(mut actor: Actor, governor: ProviderGovernor) {
+        assert_eq!(actor.active, 1);
+        let command = actor.receiver.try_recv().expect("reservation release");
+        assert!(matches!(command, Command::Abandoned));
+        actor.handle(command).await;
+        assert_eq!(actor.active, 0);
+        assert!(
+            actor.receiver.try_recv().is_err(),
+            "must release exactly once"
+        );
+        let task = tokio::spawn(actor.run());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            governor.execute("test", RequestClass::Download, || async { Ok(()) }),
+        )
+        .await
+        .expect("next request must run")
+        .unwrap();
+        drop(governor);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("actor must shut down without a sender cycle")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_admission_persistence_releases_slot() {
+        let (_directory, mut actor, governor) = admission_fixture().await;
+        let receiver = queue_admission(&mut actor).await;
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        *actor.persist_hook.lock().unwrap() = Some(PersistHook {
+            entered,
+            release: release_rx,
+        });
+        tokio::join!(actor.grant_ready(), async move {
+            entered_rx.await.unwrap();
+            drop(receiver);
+            release.send(false).unwrap();
+        });
+        assert_released_and_progress(actor, governor).await;
+    }
+
+    #[tokio::test]
+    async fn unread_grant_releases_slot() {
+        let (_directory, mut actor, governor) = admission_fixture().await;
+        let receiver = queue_admission(&mut actor).await;
+        actor.grant_ready().await;
+        drop(receiver);
+        assert_released_and_progress(actor, governor).await;
+    }
+
+    #[tokio::test]
+    async fn admission_storage_failure_releases_slot_and_is_retryable() {
+        let (_directory, mut actor, governor) = admission_fixture().await;
+        let receiver = queue_admission(&mut actor).await;
+        let (entered, _) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        release.send(true).unwrap();
+        *actor.persist_hook.lock().unwrap() = Some(PersistHook {
+            entered,
+            release: release_rx,
+        });
+        actor.grant_ready().await;
+        let error = receiver.await.unwrap().err().expect("storage failure");
+        assert!(matches!(
+            error,
+            ProviderRequestError::AdmissionStorage { .. }
+        ));
+        assert!(error.is_unavailable());
+        // A failed admission still consumes its conservative pacing timestamp.
+        assert!(actor.stored.last_request_at.is_some());
+        assert_released_and_progress(actor, governor).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_operation_releases_slot() {
+        let (_directory, actor, governor) = admission_fixture().await;
+        let actor_task = tokio::spawn(actor.run());
+        let (started, started_rx) = oneshot::channel();
+        let request_governor = governor.clone();
+        let request = tokio::spawn(async move {
+            request_governor
+                .execute("test", RequestClass::Download, || async move {
+                    started.send(()).unwrap();
+                    std::future::pending::<std::result::Result<(), ProviderFailure>>().await
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        assert_eq!(governor.status("test").await.unwrap().active_requests, 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            governor.execute("test", RequestClass::Download, || async { Ok(()) }),
+        )
+        .await
+        .expect("next request must run")
+        .unwrap();
+        assert_eq!(governor.status("test").await.unwrap().active_requests, 0);
+        drop(governor);
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_waiting_for_completion_ack_does_not_double_release() {
+        let (_directory, mut actor, governor) = admission_fixture().await;
+        let receiver = queue_admission(&mut actor).await;
+        actor.grant_ready().await;
+        let permit = receiver.await.unwrap().ok().unwrap();
+        let completion = tokio::spawn(permit.complete(None));
+        let command = actor.receiver.recv().await.unwrap();
+        assert!(matches!(command, Command::Complete(..)));
+        completion.abort();
+        assert!(completion.await.unwrap_err().is_cancelled());
+        actor.handle(command).await;
+        assert_eq!(actor.active, 0);
+        assert!(actor.receiver.try_recv().is_err());
+        let task = tokio::spawn(actor.run());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            governor.execute("test", RequestClass::Download, || async { Ok(()) }),
+        )
+        .await
+        .expect("next request must run")
+        .unwrap();
+        drop(governor);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiters_are_pruned_while_saturated() {
+        let (_directory, mut actor, _governor) = admission_fixture().await;
+        let receiver = queue_admission(&mut actor).await;
+        actor.grant_ready().await;
+        let _permit = receiver.await.unwrap().ok().unwrap();
+        for _ in 0..MAX_QUEUE_DEPTH {
+            drop(queue_admission(&mut actor).await);
+        }
+        actor.grant_ready().await;
+        assert_eq!(actor.queue_depth(), 0);
+        assert_eq!(actor.status().queued.download, 0);
+        let _next = queue_admission(&mut actor).await;
+        assert_eq!(actor.queue_depth(), 1);
+        assert_eq!(actor.active, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_does_not_refund_request_window() {
+        let (_directory, mut actor, _governor) = admission_fixture().await;
+        let limit = ProviderRequestLimit {
+            bucket: "test-window",
+            max_requests: 1,
+            interval: Duration::from_secs(60),
+            window_safety_margin: Duration::ZERO,
+            failure_retry_after: Duration::from_secs(60),
+        };
+        let (sender, receiver) = oneshot::channel();
+        actor
+            .handle(Command::Acquire {
+                class: RequestClass::Download,
+                request_limit: Some(limit),
+                sender,
+            })
+            .await;
+        actor.grant_ready().await;
+        drop(receiver);
+        let command = actor.receiver.try_recv().unwrap();
+        actor.handle(command).await;
+        assert_eq!(actor.active, 0);
+        let (sender, receiver) = oneshot::channel();
+        actor
+            .handle(Command::Acquire {
+                class: RequestClass::Scheduled,
+                request_limit: Some(limit),
+                sender,
+            })
+            .await;
+        assert!(matches!(
+            receiver.await.unwrap(),
+            Err(ProviderRequestError::Deferred { .. })
+        ));
+        assert_eq!(actor.request_windows["test-window"].requests, 1);
+    }
 
     #[test]
     fn lower_only_overrides_reject_unsafe_values() {
