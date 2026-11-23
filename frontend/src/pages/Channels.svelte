@@ -26,6 +26,7 @@
     switch (channel.kind) {
       case "country_chart": return `Country Top ${channel.countryChart?.albumCount ?? 100}`;
       case "lastfm": return "Last.fm Discovery";
+      case "library_albums": return "Library albums";
       case "trumped_downloads": return "Trumped downloads";
     }
   }

@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{
-    DateTime, Datelike, Duration as ChronoDuration, LocalResult, NaiveTime, TimeZone, Utc, Weekday,
+    DateTime, Datelike, Duration as ChronoDuration, IsoWeek, LocalResult, NaiveTime, TimeZone, Utc,
+    Weekday,
 };
 use chrono_tz::Tz;
 use serde_json::Value;
@@ -39,6 +40,8 @@ use crate::{
 const APPLE_FEED_ROOT: &str = "https://rss.applemarketingtools.com/api/v2";
 const APPLE_SEARCH_ROOT: &str = "https://itunes.apple.com";
 const LASTFM_ROOT: &str = "https://ws.audioscrobbler.com/2.0/";
+const LIBRARY_ALBUM_SOURCE_PREFIX: &str = "library_album:";
+const LIBRARY_ALBUM_PACK_SIZE: usize = 100;
 
 #[derive(Default)]
 struct ReleaseDownloadIndex {
@@ -136,6 +139,9 @@ impl ReleaseDownloadIndex {
 }
 
 pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Result<()> {
+    if channel.id != channel.kind.as_str() {
+        bail!("channel id must be {}", channel.kind.as_str());
+    }
     if !(1..=7).contains(&channel.schedule.weekday) {
         bail!("schedule weekday must be between 1 and 7");
     }
@@ -148,9 +154,6 @@ pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Res
         .context("schedule timezone must be an IANA timezone")?;
     match channel.kind {
         ChannelKind::CountryChart => {
-            if channel.id != "country_chart" {
-                bail!("country chart channel id must be country_chart");
-            }
             let settings = channel
                 .country_chart
                 .as_ref()
@@ -164,9 +167,6 @@ pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Res
             }
         }
         ChannelKind::Lastfm => {
-            if channel.id != "lastfm" {
-                bail!("Last.fm channel id must be lastfm");
-            }
             let settings = channel
                 .lastfm
                 .as_ref()
@@ -193,12 +193,9 @@ pub fn validate_channel(channel: &ChannelConfig, lastfm_configured: bool) -> Res
                 bail!("Last.fm catalog country must be a two-letter code");
             }
         }
-        ChannelKind::TrumpedDownloads => {
-            if channel.id != "trumped_downloads" {
-                bail!("trumped downloads channel id must be trumped_downloads");
-            }
+        ChannelKind::LibraryAlbums | ChannelKind::TrumpedDownloads => {
             if channel.country_chart.is_some() || channel.lastfm.is_some() {
-                bail!("trumped downloads channel does not accept source settings");
+                bail!("{} does not accept source settings", channel.kind.as_str());
             }
         }
     }
@@ -309,7 +306,10 @@ pub async fn refresh_channel(
     channel: ChannelConfig,
     run_id: uuid::Uuid,
 ) -> Result<(uuid::Uuid, ChannelRunStatus)> {
-    let empty_source_is_valid = matches!(channel.kind, ChannelKind::TrumpedDownloads);
+    let empty_source_is_valid = matches!(
+        channel.kind,
+        ChannelKind::LibraryAlbums | ChannelKind::TrumpedDownloads
+    );
     let (sources, mut partial, title) = match channel.kind {
         ChannelKind::CountryChart => {
             let settings = channel
@@ -339,6 +339,11 @@ pub async fn refresh_channel(
                 format!("Last.fm discovery for {}", settings.username),
             )
         }
+        ChannelKind::LibraryAlbums => (
+            library_album_sources(&state, &channel).await?,
+            false,
+            "Missing library albums".into(),
+        ),
         ChannelKind::TrumpedDownloads => {
             let items = trumped_download_sources(&state).await?;
             let count = items.len();
@@ -379,7 +384,11 @@ pub async fn refresh_channel(
         ChannelRunPhase::Matching,
         0,
         Some(source_total),
-        Some("Matching recommendations on configured trackers"),
+        Some(if channel.kind == ChannelKind::LibraryAlbums {
+            "Checking indexed albums against your downloads"
+        } else {
+            "Matching recommendations on configured trackers"
+        }),
     )
     .await?;
     for (index, source) in sources.into_iter().enumerate() {
@@ -435,7 +444,14 @@ pub async fn refresh_channel(
                 }
             }
         };
-        items.push(item);
+        if channel.kind != ChannelKind::LibraryAlbums
+            || !matches!(
+                item.plan_state,
+                PackItemPlanState::AlreadyOwned | PackItemPlanState::AlreadyDownloading
+            )
+        {
+            items.push(item);
+        }
     }
     update_run_progress(
         &state,
@@ -664,6 +680,62 @@ pub fn preference_fingerprint(
         profiles,
     ))?;
     Ok(hex::encode(Sha256::digest(value)))
+}
+
+fn weekly_library_album_sample(mut ids: Vec<uuid::Uuid>, week: IsoWeek) -> Vec<uuid::Uuid> {
+    let mut seed = Sha256::new();
+    seed.update(week.year().to_be_bytes());
+    seed.update(week.week().to_be_bytes());
+    // A per-release key keeps the relative order of albums stable as eligibility changes.
+    ids.sort_by_cached_key(|id| {
+        let mut rank = seed.clone();
+        rank.update(id.as_bytes());
+        (rank.finalize(), *id)
+    });
+    ids.truncate(LIBRARY_ALBUM_PACK_SIZE);
+    ids
+}
+
+async fn library_album_sources(
+    state: &AppState,
+    channel: &ChannelConfig,
+) -> Result<Vec<RecommendationSource>> {
+    let timezone = channel.schedule.timezone.parse::<Tz>()?;
+    let week = Utc::now().with_timezone(&timezone).iso_week();
+    let trackers = state
+        .trackers
+        .keys()
+        .map(|tracker| tracker.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let candidates = state.db.missing_library_artist_album_ids(&trackers).await?;
+    let sample = weekly_library_album_sample(candidates, week);
+    state
+        .db
+        .get_release_summaries(&sample)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, release)| {
+            let id = release
+                .id
+                .context("indexed library album has no release id")?;
+            Ok(RecommendationSource {
+                id: format!("{LIBRARY_ALBUM_SOURCE_PREFIX}{id}"),
+                rank: (index + 1) as u32,
+                artist: release.artist.unwrap_or_default(),
+                title: release.title,
+                year: release.year,
+                artwork: release.artwork,
+                url: None,
+                mbid: None,
+                score: None,
+                catalog_country: None,
+                substituted_from: None,
+                trumped_downloads: Vec::new(),
+                lookup_files: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 async fn fetch_apple_chart(
@@ -1215,6 +1287,11 @@ async fn resolve_source(
     preferences: &RuntimePreferences,
     download_index: &ReleaseDownloadIndex,
 ) -> Result<ChannelPackItem> {
+    if let Some(id) = source.id.strip_prefix(LIBRARY_ALBUM_SOURCE_PREFIX) {
+        let release_id = id.parse().context("invalid indexed library album id")?;
+        return resolve_release_with_index(state, source, release_id, preferences, download_index)
+            .await;
+    }
     if let Some((provider, source_key, fingerprint)) = external_source_identity(&source)
         && let Some(release_id) = state
             .db
@@ -2288,6 +2365,9 @@ pub async fn resolve_release(
     release_id: uuid::Uuid,
     preferences: &RuntimePreferences,
 ) -> Result<ChannelPackItem> {
+    if source.id.starts_with(LIBRARY_ALBUM_SOURCE_PREFIX) {
+        bail!("Library album packs use the indexed album match");
+    }
     let download_index = ReleaseDownloadIndex::load(state).await?;
     resolve_release_with_index(state, source, release_id, preferences, &download_index).await
 }
@@ -2311,6 +2391,16 @@ async fn resolve_release_with_index(
         .get_release_detail(release_id)
         .await?
         .context("canonical release detail is unavailable")?;
+    let library_album = source.id.starts_with(LIBRARY_ALBUM_SOURCE_PREFIX);
+    if library_album
+        && !detail
+            .release
+            .release_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("album"))
+    {
+        bail!("the indexed release is no longer classified as an album");
+    }
     if !source.id.starts_with("trumped:")
         && !is_long_form_release(detail.release.release_type.as_deref())
     {
@@ -2319,6 +2409,8 @@ async fn resolve_release_with_index(
     let mut variants = detail.variants;
     if let Some(tracker) = trumped_tracker {
         variants.retain(|variant| variant.tracker.eq_ignore_ascii_case(tracker));
+    } else if library_album {
+        variants.retain(|variant| state.trackers.contains_key(&variant.tracker));
     }
     for variant in &mut variants {
         variant.eligibility = Some(preferences.release.eligibility(
@@ -2342,7 +2434,10 @@ async fn resolve_release_with_index(
     let (mut owned, mut downloading) = if trumped_tracker.is_some() {
         (false, false)
     } else {
-        state.db.release_download_flags(release_id).await?
+        state
+            .db
+            .release_download_flags(detail.release.id.unwrap_or(release_id))
+            .await?
     };
     if trumped_tracker.is_none() {
         owned |= downloads.iter().any(|download| download.in_library);
@@ -2911,8 +3006,9 @@ fn largest_image(album: &Value) -> Option<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use chrono::{TimeZone, Utc};
+    use chrono::{Datelike, NaiveDate, TimeZone, Utc};
     use serde_json::json;
+    use uuid::Uuid;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -2927,13 +3023,36 @@ mod tests {
     };
 
     use super::{
-        apple_chart_url, apple_sources_from_cache, apply_pack_constraints, base_edition_title,
-        channel_is_due, compare_variants, get_json_with_retry, lastfm_failure, next_occurrence,
-        next_refresh_at, parse_apple_chart, parse_download_release_name, tracker_query_title,
-        trumped_group_score, trumped_identity_component, trumped_manifest_similarity,
-        trumped_search_requests, trumped_source_identities, trumped_source_tracker,
-        validate_channel, validate_channel_refresh,
+        LIBRARY_ALBUM_PACK_SIZE, apple_chart_url, apple_sources_from_cache, apply_pack_constraints,
+        base_edition_title, channel_is_due, compare_variants, get_json_with_retry, lastfm_failure,
+        next_occurrence, next_refresh_at, parse_apple_chart, parse_download_release_name,
+        tracker_query_title, trumped_group_score, trumped_identity_component,
+        trumped_manifest_similarity, trumped_search_requests, trumped_source_identities,
+        trumped_source_tracker, validate_channel, validate_channel_refresh,
+        weekly_library_album_sample,
     };
+
+    #[test]
+    fn library_album_sample_is_stable_within_a_week_and_rotates_between_weeks() {
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 11, 29).unwrap();
+        let next_monday = sunday.succ_opt().unwrap();
+        let ids = (1..=200).map(Uuid::from_u128).collect::<Vec<_>>();
+        let sample = weekly_library_album_sample(ids.clone(), monday.iso_week());
+        assert_eq!(sample.len(), LIBRARY_ALBUM_PACK_SIZE);
+        assert_eq!(
+            weekly_library_album_sample(ids.iter().rev().copied().collect(), sunday.iso_week()),
+            sample
+        );
+
+        let remaining = ids.iter().copied().filter(|id| *id != sample[0]).collect();
+        let refilled = weekly_library_album_sample(remaining, monday.iso_week());
+        assert_eq!(refilled.len(), sample.len());
+        assert_eq!(refilled[..sample.len() - 1], sample[1..]);
+
+        let next_sample = weekly_library_album_sample(ids, next_monday.iso_week());
+        assert!(next_sample.iter().any(|id| !sample.contains(id)));
+    }
 
     #[test]
     fn omits_symbol_only_titles_from_tracker_searches() {

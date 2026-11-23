@@ -202,11 +202,15 @@ changes a torrent.
 Recommendation Channels turn external album discovery into reviewable,
 historical packs. The country chart channel reads Apple's country-specific Top
 Albums feed with a configurable 1–100 release count; the Last.fm channel expands
-recent top artists through similar artists and their leading albums. Each channel has its own weekly,
-timezone-aware schedule and is disabled until explicitly enabled or manually
-refreshed. Refreshing resolves Albums and EPs against configured
-trackers and creates a plan under the normal quality, tracker, freeleech, and
-token rules, but never downloads automatically. A user may accept every
+recent top artists through similar artists and their leading albums. Library
+albums uses tracker catalogs indexed in the background to find albums with a
+primary artist already in the Library. It samples up to 100 albums per pack
+from the full eligible catalog, excluding albums already owned or downloading.
+The shuffle uses stable release IDs and changes each Monday in the channel's
+timezone. Each discovery channel supports manual refreshes and has its own
+timezone-aware weekly schedule, disabled by default. Refreshing resolves
+Albums and EPs against configured trackers and creates a plan under the normal
+quality, tracker, freeleech, and token rules. A user may accept every
 executable plan item or a selected subset, reject the batch while retaining it
 in history, attach a manually found Album/EP to an unresolved recommendation,
 or add individual releases through the normal confirmation dialog. Pack

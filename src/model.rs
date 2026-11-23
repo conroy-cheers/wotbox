@@ -1453,7 +1453,19 @@ pub struct PlexScanQueued {
 pub enum ChannelKind {
     CountryChart,
     Lastfm,
+    LibraryAlbums,
     TrumpedDownloads,
+}
+
+impl ChannelKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CountryChart => "country_chart",
+            Self::Lastfm => "lastfm",
+            Self::LibraryAlbums => "library_albums",
+            Self::TrumpedDownloads => "trumped_downloads",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1579,6 +1591,24 @@ impl ChannelConfig {
             country_chart: None,
             lastfm: Some(LastfmChannelSettings::default()),
             credential_configured: false,
+            next_refresh_at: None,
+            last_successful_at: None,
+            last_attempt_at: None,
+            last_error: None,
+            failure_count: 0,
+            updated_at: now,
+        }
+    }
+
+    pub fn library_albums_default(now: DateTime<Utc>) -> Self {
+        Self {
+            id: ChannelKind::LibraryAlbums.as_str().into(),
+            kind: ChannelKind::LibraryAlbums,
+            enabled: false,
+            schedule: ChannelSchedule::default(),
+            country_chart: None,
+            lastfm: None,
+            credential_configured: true,
             next_refresh_at: None,
             last_successful_at: None,
             last_attempt_at: None,

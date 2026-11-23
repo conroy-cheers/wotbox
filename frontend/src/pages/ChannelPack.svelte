@@ -319,11 +319,11 @@
             {:else}
               <span class="status-pill unknown">{item.planState.replaceAll("_", " ")}</span>
               <span>{item.reason}</span>
-              {#if !item.release}
+              {#if !item.release && current.channelId !== "library_albums"}
                 <a href={`${searchPath(item.source.artist, item.source.title)}&pack=${current.id}&item=${item.ordinal}&version=${current.planVersion}`}>Search and attach</a>
               {/if}
             {/if}
-            {#if current.decision === "open" && item.release}
+            {#if current.decision === "open" && item.release && current.channelId !== "library_albums"}
               <a href={`${searchPath(item.source.artist, item.source.title)}&pack=${current.id}&item=${item.ordinal}&version=${current.planVersion}`}>Change match</a>
             {/if}
           </div>
@@ -332,8 +332,12 @@
     {/each}
     {#if visibleItems(current).length === 0}
       <div class="pack-empty-view">
-        <strong>Nothing in this view</strong>
-        <span>Choose another status tab to review the rest of the pack.</span>
+        {#if current.channelId === "library_albums" && current.items.length === 0}
+          <strong>No missing albums found in the indexed catalogs</strong>
+        {:else}
+          <strong>Nothing in this view</strong>
+          <span>Choose another status tab to review the rest of the pack.</span>
+        {/if}
       </div>
     {/if}
   </div>

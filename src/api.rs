@@ -869,11 +869,11 @@ async fn update_channel(
     }
     requested.country_chart = match requested.kind {
         ChannelKind::CountryChart => requested.country_chart,
-        ChannelKind::Lastfm | ChannelKind::TrumpedDownloads => None,
+        _ => None,
     };
     requested.lastfm = match requested.kind {
         ChannelKind::Lastfm => requested.lastfm,
-        ChannelKind::CountryChart | ChannelKind::TrumpedDownloads => None,
+        _ => None,
     };
     requested.credential_configured =
         !matches!(requested.kind, ChannelKind::Lastfm) || state.lastfm_api_key.is_some();
@@ -6278,8 +6278,10 @@ fn is_ui_route(path: &str) -> bool {
         | ["preferences"] => true,
         ["library", "artists", id] | ["releases", id] => uuid::Uuid::parse_str(id).is_ok(),
         ["channels", channel, "packs", id] => {
-            matches!(*channel, "country_chart" | "lastfm" | "trumped_downloads")
-                && uuid::Uuid::parse_str(id).is_ok()
+            matches!(
+                *channel,
+                "country_chart" | "lastfm" | "library_albums" | "trumped_downloads"
+            ) && uuid::Uuid::parse_str(id).is_ok()
         }
         _ => false,
     }
@@ -6677,6 +6679,7 @@ mod tests {
             "downloads",
             "channels",
             "channels/country_chart/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
+            "channels/library_albums/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
             "channels/trumped_downloads/packs/080bca00-45b3-4d6b-a6c6-ee3312cbff9a",
             "matches",
             "preferences",

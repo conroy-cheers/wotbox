@@ -631,6 +631,43 @@ impl Database {
             .collect()
     }
 
+    pub async fn missing_library_artist_album_ids(&self, trackers: &[String]) -> Result<Vec<Uuid>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                r#"
+                SELECT DISTINCT release.id
+                  FROM library_artist_projections artist
+                  JOIN artist_sources artist_source
+                    ON artist_source.canonical_artist_id = artist.canonical_id
+                  JOIN dedupe_catalog_memberships catalog
+                    ON catalog.tracker = artist_source.tracker
+                   AND catalog.artist_id = artist_source.artist_id
+                  JOIN release_sources source
+                    ON source.tracker = catalog.tracker
+                   AND source.group_id = catalog.group_id
+                  JOIN canonical_releases release ON release.id = source.release_id
+                 WHERE catalog.tracker IN (SELECT value FROM json_each(?))
+                   AND lower(release.release_type) = 'album'
+                   AND lower(json_extract(catalog.group_json, '$.release.releaseType')) = 'album'
+                   AND json_extract(catalog.group_json, '$.listedOnTracker') = 1
+                   AND json_array_length(catalog.group_json, '$.variants') > 0
+                   AND 'primary' IN (SELECT value FROM json_each(catalog.group_json, '$.roles'))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM download_release_links link
+                        WHERE link.release_id = release.id
+                          AND (link.library_added_at IS NOT NULL OR link.present = 1)
+                   )
+                "#,
+                [serde_json::to_string(trackers)?.into()],
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| Ok(row.try_get::<String>("", "id")?.parse()?))
+            .collect()
+    }
+
     pub async fn reconcile_library_asset_references(&self) -> Result<()> {
         const WRITE_BATCH_SIZE: usize = 250;
 
@@ -2199,6 +2236,7 @@ impl Database {
         for channel in [
             ChannelConfig::country_chart_default(now),
             ChannelConfig::lastfm_default(now),
+            ChannelConfig::library_albums_default(now),
             ChannelConfig::trumped_downloads_default(now),
         ] {
             if channel_config::Entity::find_by_id(channel.id.clone())
@@ -2232,11 +2270,7 @@ impl Database {
 
     pub async fn put_channel(&self, channel: &ChannelConfig) -> Result<()> {
         let value = serde_json::to_value(channel)?;
-        let kind = match channel.kind {
-            crate::model::ChannelKind::CountryChart => "country_chart",
-            crate::model::ChannelKind::Lastfm => "lastfm",
-            crate::model::ChannelKind::TrumpedDownloads => "trumped_downloads",
-        };
+        let kind = channel.kind.as_str();
         if let Some(model) = channel_config::Entity::find_by_id(channel.id.clone())
             .one(&self.connection)
             .await?
@@ -5542,6 +5576,30 @@ impl Database {
             record_label,
             variants: torrent_variants,
         }))
+    }
+
+    pub async fn get_release_summaries(&self, ids: &[Uuid]) -> Result<Vec<ReleaseSummary>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                r#"
+                SELECT release.id, release.metadata_json
+                  FROM json_each(?) selected
+                  JOIN canonical_releases release ON release.id = selected.value
+                 ORDER BY selected.key
+                "#,
+                [serde_json::to_string(ids)?.into()],
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let mut release: ReleaseSummary =
+                    serde_json::from_value(row.try_get("", "metadata_json")?)?;
+                release.id = Some(row.try_get::<String>("", "id")?.parse()?);
+                Ok(release)
+            })
+            .collect()
     }
 
     pub async fn get_release_details(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, ReleaseDetail>> {
@@ -9008,9 +9066,9 @@ mod tests {
         entity::{
             artist_source, background_job, canonical_artist, canonical_release,
             canonical_release_credit, canonical_torrent, dedupe_catalog_membership,
-            download_client_scan, download_release_link, library_admission, library_asset,
-            library_asset_reference, library_projection_dirty, release_source, release_track_index,
-            tracker_snapshot,
+            download_client_scan, download_release_link, library_admission,
+            library_artist_projection, library_asset, library_asset_reference,
+            library_projection_dirty, release_source, release_track_index, tracker_snapshot,
         },
         migration::Migrator,
         model::{
@@ -9114,6 +9172,146 @@ mod tests {
             library_availability: None,
             library_added_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn library_album_channel_selects_missing_primary_albums() {
+        let directory = tempdir().expect("temporary directory");
+        let token_file = directory.path().join("tracker-token");
+        std::fs::write(&token_file, "test-token").expect("fixture token");
+        let config = crate::config::Config {
+            database_path: directory.path().join("library-albums.sqlite"),
+            trackers: [
+                ("ops", crate::config::TrackerKind::Ops),
+                ("red", crate::config::TrackerKind::Red),
+            ]
+            .into_iter()
+            .map(|(name, kind)| {
+                (
+                    name.into(),
+                    crate::config::TrackerConfig {
+                        kind,
+                        base_url: "http://127.0.0.1:1".into(),
+                        token_file: token_file.clone(),
+                        announce_hosts: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let state = crate::api::AppState::new(&config)
+            .await
+            .expect("application state");
+        let db = &state.db;
+        let now = Utc::now();
+        let mut wanted_id = None;
+        for (tracker, artist_id, group_id, release_type, role) in [
+            ("ops", 10, 1, "Album", ArtistCatalogRole::Primary),
+            ("ops", 10, 2, "Album", ArtistCatalogRole::Primary),
+            ("red", 10, 2, "Album", ArtistCatalogRole::Primary),
+            ("ops", 10, 3, "Album", ArtistCatalogRole::Primary),
+            ("ops", 10, 4, "EP", ArtistCatalogRole::Primary),
+            ("ops", 10, 5, "Album", ArtistCatalogRole::Guest),
+            ("ops", 99, 6, "Album", ArtistCatalogRole::Primary),
+            ("red", 10, 7, "Album", ArtistCatalogRole::Primary),
+        ] {
+            let mut group = catalog_membership_group(tracker, group_id, artist_id, release_type);
+            group.roles = vec![role];
+            let id = db
+                .put_catalog_group(&group.release, &group.variants, &[], now, now)
+                .await
+                .expect("catalog release");
+            if group_id == 2 {
+                assert_eq!(*wanted_id.get_or_insert(id), id, "canonical release");
+            }
+            dedupe_catalog_membership::ActiveModel {
+                tracker: Set(tracker.into()),
+                artist_id: Set(artist_id),
+                group_id: Set(group_id),
+                group_json: Set(serde_json::to_value(group).expect("catalog group JSON")),
+                updated_at: Set(now.to_rfc3339()),
+            }
+            .insert(&db.connection)
+            .await
+            .expect("catalog membership");
+        }
+        let artist = artist_source::Entity::find_by_id(("ops".into(), "id:10".into()))
+            .one(&db.connection)
+            .await
+            .expect("artist source query")
+            .expect("artist source");
+        library_artist_projection::ActiveModel {
+            artist_key: Set(artist.canonical_artist_id.clone()),
+            canonical_id: Set(Some(artist.canonical_artist_id)),
+            normalized_name: Set(artist.normalized_name),
+            document_json: Set(serde_json::json!({})),
+            updated_at: Set(now.to_rfc3339()),
+        }
+        .insert(&db.connection)
+        .await
+        .expect("library artist");
+        for (group_id, hash) in [(1, "owned"), (3, "active")] {
+            db.seed_download_link("music", hash, "ops", Some(group_id), group_id * 10, true)
+                .await
+                .expect("download link");
+        }
+        let mut owned = download_release_link::Entity::find_by_id(("music".into(), "owned".into()))
+            .one(&db.connection)
+            .await
+            .expect("owned download query")
+            .expect("owned download")
+            .into_active_model();
+        owned.library_added_at = Set(Some(now.to_rfc3339()));
+        owned.present = Set(false);
+        owned.update(&db.connection).await.expect("missing copy");
+
+        let wanted_id = wanted_id.expect("canonical candidate ID");
+        let red_only_id = db
+            .release_id_for_source("red", 7)
+            .await
+            .expect("RED release query")
+            .expect("RED release ID");
+        for (trackers, mut expected) in [
+            (vec!["ops".into()], vec![wanted_id]),
+            (
+                vec!["ops".into(), "red".into()],
+                vec![wanted_id, red_only_id],
+            ),
+        ] {
+            let mut albums = db
+                .missing_library_artist_album_ids(&trackers)
+                .await
+                .expect("missing album IDs");
+            albums.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(albums, expected);
+        }
+
+        let channel = db
+            .get_channel("library_albums")
+            .await
+            .expect("channel query")
+            .expect("library albums channel");
+        let run = db
+            .create_channel_run(&channel.id, ChannelRunTrigger::Manual)
+            .await
+            .expect("create refresh run")
+            .expect("refresh run");
+        let (pack_id, status) = crate::channel::refresh_channel(state.clone(), channel, run.id)
+            .await
+            .expect("refresh library albums");
+        assert_eq!(status, ChannelRunStatus::Successful);
+        let pack = db
+            .get_channel_pack(pack_id, "")
+            .await
+            .expect("pack query")
+            .expect("library album pack");
+        assert_eq!(pack.items.len(), 2);
+        assert!(pack.items.iter().any(|item| {
+            item.match_state == RecommendationMatchState::Matched
+                && item.release.as_ref().and_then(|release| release.id) == Some(wanted_id)
+        }));
     }
 
     #[tokio::test]
@@ -10183,7 +10381,14 @@ mod tests {
             .expect("database");
         db.ensure_default_channels().await.expect("seed channels");
         let channels = db.list_channels().await.expect("channels");
-        assert_eq!(channels.len(), 3);
+        assert_eq!(channels.len(), 4);
+        let library_albums = channels
+            .iter()
+            .find(|channel| channel.id == "library_albums")
+            .expect("library albums");
+        assert!(!library_albums.enabled);
+        crate::channel::validate_channel_refresh(library_albums, false)
+            .expect("manual refresh without external credentials");
         assert!(
             !channels
                 .iter()

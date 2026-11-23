@@ -370,6 +370,7 @@
     switch (channel.kind) {
       case "country_chart": return `Country Top ${channel.countryChart?.albumCount ?? 100}`;
       case "lastfm": return "Last.fm Discovery";
+      case "library_albums": return "Library albums";
       case "trumped_downloads": return "Trumped downloads";
     }
   }
@@ -872,6 +873,9 @@
                 {#if !channel.credentialConfigured}
                   <div class="notice-banner compact">Set <code>lastfm_api_key_file</code> or <code>LASTFM_API_KEY</code> before enabling this channel.</div>
                 {/if}
+              {/if}
+              {#if channel.kind === "library_albums"}
+                <p class="settings-help">Samples missing albums by primary artists in your Library from indexed tracker catalogs. The selection shuffles each Monday in the channel’s timezone.</p>
               {/if}
               {#if channel.kind === "trumped_downloads"}
                 <div class="notice-banner compact">
