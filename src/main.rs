@@ -14,6 +14,7 @@ mod plex;
 mod provider;
 mod qbittorrent;
 mod release_matcher;
+mod submission;
 mod tracker;
 
 use anyhow::{Context, Result};
@@ -35,6 +36,10 @@ async fn main() -> Result<()> {
     init_tracing();
     let config = Config::load(cli.config.as_deref())?;
     let state = AppState::new(&config).await?;
+    let address = format!("{}:{}", config.listen_address, config.port);
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .with_context(|| format!("bind {address}"))?;
     let background_runtime = spawn_background_workers(state.clone()).await?;
     let observer_runtime = spawn_application_observers(state.clone());
 
@@ -43,10 +48,6 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
-    let address = format!("{}:{}", config.listen_address, config.port);
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .with_context(|| format!("bind {address}"))?;
     tracing::info!(%address, base_path = %config.base_path, "Wotbox listening");
     let (server_shutdown, server_shutdown_signal) = tokio::sync::oneshot::channel();
     let mut server = tokio::spawn(async move {
@@ -64,8 +65,7 @@ async fn main() -> Result<()> {
         () = shutdown_signal() => {}
     }
     let _ = server_shutdown.send(());
-    background_runtime.shutdown().await;
-    observer_runtime.shutdown().await;
+    tokio::join!(background_runtime.shutdown(), observer_runtime.shutdown());
     match tokio::time::timeout(std::time::Duration::from_secs(10), &mut server).await {
         Ok(result) => result??,
         Err(_) => {

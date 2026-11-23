@@ -2,10 +2,12 @@
   import { onMount } from "svelte";
   import { useQueryClient } from "@tanstack/svelte-query";
   import { basePath } from "./api";
+  import { parseSnapshotRevision } from "./snapshot";
   import { queryUsesResources, queryUsesScopes } from "./live";
-  import { applyResourceChanges, type ResourceChange } from "./liveState";
+  import { applyResourceChanges, liveDownloads, type ResourceChange } from "./liveState";
 
   const queryClient = useQueryClient();
+  const cursorKey = `wotbox-change-cursor:${basePath}`;
   let outage = $state(false);
   let reconnect: (() => void) | undefined;
 
@@ -46,8 +48,11 @@
     };
 
     const receive = (event: MessageEvent) => {
+      if (event.type === "reset") {
+        liveDownloads.set(new Map());
+        void queryClient.cancelQueries();
+      }
       resetHealth();
-      if (event.lastEventId) sessionStorage.setItem("wotbox-change-cursor", event.lastEventId);
       try {
         const payload = JSON.parse(event.data) as {
           scopes?: string[];
@@ -55,7 +60,9 @@
           reasons?: string[];
           changes?: ResourceChange[];
         };
-        applyResourceChanges(payload.changes ?? []);
+        const overflow = applyResourceChanges(payload.changes ?? [], parseSnapshotRevision(event.lastEventId)?.epoch);
+        if (overflow) pending.add("global");
+        if (event.lastEventId) sessionStorage.setItem(cursorKey, event.lastEventId);
         const scopes = payload.scopes ?? ["global"];
         if (scopes.includes("assets")) {
           window.dispatchEvent(new CustomEvent("wotbox-assets-changed", {
@@ -69,6 +76,7 @@
           }
         }
       } catch {
+        liveDownloads.set(new Map());
         pending.add("global");
       }
       if (pending.size > 0 || pendingResources.size > 0) scheduleFlush();
@@ -77,13 +85,18 @@
     const connect = () => {
       if (stopped) return;
       source?.close();
-      const cursor = sessionStorage.getItem("wotbox-change-cursor");
-      source = new EventSource(`${basePath}/api/v1/events${cursor ? `?after=${encodeURIComponent(cursor)}` : ""}`);
-      source.onopen = resetHealth;
-      source.addEventListener("changes", receive);
-      source.addEventListener("reset", receive);
-      source.addEventListener("ping", resetHealth);
-      source.onerror = () => {
+      const cursor = sessionStorage.getItem(cursorKey);
+      const stream = new EventSource(`${basePath}/api/v1/events${cursor ? `?after=${encodeURIComponent(cursor)}` : ""}`);
+      source = stream;
+      stream.onopen = () => { if (source === stream) resetHealth(); };
+      const receiveCurrent = (event: Event) => {
+        if (source === stream) receive(event as MessageEvent);
+      };
+      stream.addEventListener("changes", receiveCurrent);
+      stream.addEventListener("reset", receiveCurrent);
+      stream.addEventListener("ping", () => { if (source === stream) resetHealth(); });
+      stream.onerror = () => {
+        if (source !== stream) return;
         if (!outageTimer) {
           outageTimer = window.setTimeout(() => {
             outageTimer = undefined;

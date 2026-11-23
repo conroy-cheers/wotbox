@@ -6,6 +6,7 @@ import {
   positiveInteger,
   releaseViewPath,
   selectReleaseAttachment,
+  selectReleaseVariant,
   viewPath
 } from "./routing";
 
@@ -44,6 +45,14 @@ describe("routing helpers", () => {
       "/releases/8972f7ba-e662-4bdf-a470-47774964fd3e?torrent=345678"
       + "&client=music+client&hash=ABC123&from=downloads&expanded=1&details=client"
     );
+  });
+
+  it("requires tracker identity for a torrent ID shared by two sources", () => {
+    const variants = [{ tracker: "ops", torrentId: 42 }, { tracker: "red", torrentId: 42 }];
+    expect(selectReleaseVariant(variants, 42)).toBeUndefined();
+    expect(selectReleaseVariant(variants, 42, "RED")).toBe(variants[1]);
+    expect(releaseViewPath("release", 42, "library", undefined, false, false, "red"))
+      .toBe("/releases/release?torrent=42&tracker=red&from=library");
   });
 
   it("selects only the requested client attachment and compares hashes case-insensitively", () => {

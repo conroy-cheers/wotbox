@@ -26,6 +26,7 @@
     groupId,
     title,
     requestedTorrentId,
+    requestedTracker,
     fulfillment,
     source = "search",
     expanded: controlledExpanded,
@@ -38,6 +39,7 @@
     groupId: number;
     title: string;
     requestedTorrentId?: number;
+    requestedTracker?: string;
     fulfillment?: ReleaseFulfillment;
     source?: ReleaseSource;
     expanded?: boolean;
@@ -63,10 +65,10 @@
     ranked,
     focusTorrentId === undefined
       ? undefined
-      : { tracker: fulfillmentTarget?.tracker, torrentId: focusTorrentId },
+      : { tracker: requestedTracker ?? fulfillmentTarget?.tracker, torrentId: focusTorrentId },
     isDownloadable
   ));
-  const remaining = $derived(ranked.filter((variant) => variant.torrentId !== preferred?.torrentId));
+  const remaining = $derived(ranked.filter((variant) => variant.torrentId !== preferred?.torrentId || variant.tracker !== preferred?.tracker));
 
   function libraryState(variant: DisplayVariant) {
     return "library" in variant ? variant.library : undefined;
@@ -165,7 +167,9 @@
       download
         ? { client: download.client, infoHash: download.infoHash }
         : undefined,
-      expanded
+      expanded,
+      false,
+      variant.tracker
     );
   }
 

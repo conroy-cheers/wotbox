@@ -245,6 +245,7 @@ pub fn is_provider_unavailable(error: &anyhow::Error) -> bool {
 
 #[derive(Clone)]
 pub struct ProviderGovernor {
+    db: Database,
     providers: Arc<HashMap<String, ProviderHandle>>,
 }
 
@@ -259,6 +260,7 @@ struct Waiter {
     sender: oneshot::Sender<std::result::Result<Permit, ProviderRequestError>>,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
 struct RequestWindow {
     reset_at: DateTime<Utc>,
     requests: u32,
@@ -310,7 +312,7 @@ struct Actor {
     definition: ProviderDefinition,
     stored: StoredProviderState,
     queues: [VecDeque<Waiter>; PRIORITY_COUNT],
-    request_windows: HashMap<&'static str, RequestWindow>,
+    request_windows: HashMap<String, RequestWindow>,
     active: u32,
     // Weak: the actor must not keep its own command channel alive.
     sender: mpsc::WeakUnboundedSender<Command>,
@@ -375,13 +377,21 @@ impl ProviderGovernor {
             stored.max_concurrency = max_concurrency;
             db.put_provider_state(&stored).await?;
 
+            let mut windows = db
+                .provider_request_windows(&definition.id)
+                .await?
+                .map(|value| serde_json::from_str::<HashMap<String, RequestWindow>>(&value))
+                .transpose()?
+                .unwrap_or_default();
+            windows.retain(|_, window| window.reset_at > Utc::now());
+
             let (sender, receiver) = mpsc::unbounded_channel();
             let actor = Actor {
                 db: db.clone(),
                 definition: definition.clone(),
                 stored,
                 queues: array::from_fn(|_| VecDeque::new()),
-                request_windows: HashMap::new(),
+                request_windows: windows,
                 active: 0,
                 sender: sender.downgrade(),
                 receiver,
@@ -392,6 +402,7 @@ impl ProviderGovernor {
             providers.insert(definition.id.clone(), ProviderHandle { definition, sender });
         }
         Ok(Self {
+            db,
             providers: Arc::new(providers),
         })
     }
@@ -422,6 +433,12 @@ impl ProviderGovernor {
         Fut: Future<Output = std::result::Result<T, ProviderFailure>>,
     {
         let permit = self.acquire(provider, class, request_limit).await?;
+        self.db.check_current_job_claim().await.map_err(|error| {
+            ProviderRequestError::AdmissionStorage {
+                provider: provider.into(),
+                message: error.to_string(),
+            }
+        })?;
         match operation().await {
             Ok(value) => {
                 permit.complete(None).await;
@@ -989,7 +1006,7 @@ impl Actor {
                 .unwrap_or_else(|_| chrono::Duration::minutes(1));
         let window = self
             .request_windows
-            .entry(limit.bucket)
+            .entry(limit.bucket.to_owned())
             .or_insert_with(|| RequestWindow {
                 reset_at: granted_at + interval,
                 requests: 0,
@@ -1084,7 +1101,16 @@ impl Actor {
                 }
             }
         }
-        self.db.put_provider_state(&self.stored).await
+        if self.request_windows.is_empty() {
+            self.db.put_provider_state(&self.stored).await
+        } else {
+            self.db
+                .put_provider_state_and_windows(
+                    &self.stored,
+                    serde_json::to_string(&self.request_windows)?,
+                )
+                .await
+        }
     }
 }
 
@@ -1183,6 +1209,7 @@ mod tests {
             persist_hook: std::sync::Mutex::new(None),
         };
         let governor = ProviderGovernor {
+            db: actor.db.clone(),
             providers: Arc::new(HashMap::from([(
                 "test".into(),
                 ProviderHandle { definition, sender },

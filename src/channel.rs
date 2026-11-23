@@ -472,18 +472,10 @@ pub async fn refresh_channel(
         Some("Saving recommendation pack"),
     )
     .await?;
-    let pack_id = state
+    state
         .db
-        .create_channel_pack(&channel.id, &title, partial, &fingerprint, &items)
-        .await?;
-    Ok((
-        pack_id,
-        if partial {
-            ChannelRunStatus::Partial
-        } else {
-            ChannelRunStatus::Successful
-        },
-    ))
+        .publish_channel_run_pack(run_id, &title, partial, &fingerprint, &items)
+        .await
 }
 
 async fn resolve_source_with_provider_recovery(
@@ -1507,7 +1499,9 @@ async fn resolve_tracker_source(
     Ok(Some(item))
 }
 
-fn external_source_identity(source: &RecommendationSource) -> Option<(&str, &str, String)> {
+pub(crate) fn external_source_identity(
+    source: &RecommendationSource,
+) -> Option<(&str, &str, String)> {
     let (provider, source_key) = source.id.split_once(':')?;
     if !matches!(provider, "apple" | "lastfm") || source_key.is_empty() {
         return None;

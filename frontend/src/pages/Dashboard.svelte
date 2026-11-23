@@ -7,6 +7,7 @@
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import { releaseViewPath } from "../lib/routing";
+  import { liveDownloads, transferDownloads } from "../lib/liveState";
 
   const accounts = createQuery({
     queryKey: ["accounts"],
@@ -14,8 +15,9 @@
   });
   const downloads = createQuery({
     queryKey: ["downloads"],
-    queryFn: () => api<DownloadsPage>("/api/v1/downloads?limit=6")
+    queryFn: ({ signal }) => api<DownloadsPage>("/api/v1/downloads?limit=6", { signal })
   });
+  const transfers = $derived(transferDownloads($downloads.data?.items ?? [], $liveDownloads));
   const providers = createQuery({
     queryKey: ["providers"],
     queryFn: () => api<ProviderStatus[]>("/api/v1/providers")
@@ -88,9 +90,8 @@
     {#if $downloads.isPending}
       <div class="skeleton-row"></div>
       <div class="skeleton-row"></div>
-    {:else if $downloads.data?.items.length}
-      {#each $downloads.data.items.slice(0, 6) as item}
-        {@const download = item.download}
+    {:else if transfers.length}
+      {#each transfers as { item, download }}
         <article class="activity-row release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
           <div class="release-mark">{item.release.title.slice(0, 1).toUpperCase()}</div>
           <div class="activity-copy">
@@ -99,7 +100,10 @@
                 item.release.id,
                 item.variant?.torrentId,
                 "downloads",
-                { client: download.client, infoHash: download.infoHash }
+                { client: download.client, infoHash: download.infoHash },
+                false,
+                false,
+                item.variant?.tracker
               )}>
                 {item.release.title}
               </a>

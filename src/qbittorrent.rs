@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, multipart};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -19,6 +19,10 @@ use crate::{
 
 #[async_trait]
 pub trait DownloadClient: Send + Sync {
+    fn instance_id(&self) -> Option<String> {
+        None
+    }
+
     async fn free_space(&self) -> Result<i64>;
     async fn downloads(&self, limit: u32, offset: u32) -> Result<Vec<ObservedDownload>>;
     async fn downloads_with_class(
@@ -52,14 +56,16 @@ pub trait DownloadClient: Send + Sync {
         file_name: &str,
         profile: &DownloadProfile,
     ) -> Result<()>;
-    async fn sync_downloads(&self, _reset: bool) -> Result<DownloadClientDelta> {
-        Ok(DownloadClientDelta {
+    async fn sync_downloads(&self, _reset: bool) -> Result<Arc<DownloadClientDelta>> {
+        Ok(Arc::new(DownloadClientDelta {
             downloads: self.downloads(100_000, 0).await?,
             removed: Vec::new(),
             full_update: true,
             inventory_changed: true,
-        })
+        }))
     }
+
+    async fn acknowledge_downloads(&self) {}
 }
 
 #[derive(Debug, Clone)]
@@ -70,10 +76,17 @@ pub struct DownloadClientDelta {
     pub inventory_changed: bool,
 }
 
+struct PendingDelta {
+    rid: i64,
+    patches: HashMap<String, Value>,
+    delta: Arc<DownloadClientDelta>,
+}
+
 #[derive(Default)]
 struct QbitSyncState {
     rid: i64,
     torrents: HashMap<String, Value>,
+    pending: Option<PendingDelta>,
 }
 
 pub struct QbittorrentClient {
@@ -358,8 +371,19 @@ fn unix_timestamp(value: i64) -> Option<DateTime<Utc>> {
 
 #[async_trait]
 impl DownloadClient for QbittorrentClient {
-    async fn sync_downloads(&self, reset: bool) -> Result<DownloadClientDelta> {
+    fn instance_id(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        Some(hex::encode(Sha256::digest(format!(
+            "qbittorrent:{}",
+            self.base_url
+        ))))
+    }
+
+    async fn sync_downloads(&self, reset: bool) -> Result<Arc<DownloadClientDelta>> {
         let mut state = self.sync_state.lock().await;
+        if let Some(pending) = &state.pending {
+            return Ok(pending.delta.clone());
+        }
         let requested_rid = if reset { 0 } else { state.rid };
         let response = self
             .execute(RequestClass::Background, || async {
@@ -373,7 +397,10 @@ impl DownloadClient for QbittorrentClient {
                 response.json::<SyncMainData>().await.map_err(transient)
             })
             .await?;
-        let full_update = response.full_update || reset;
+        if requested_rid == 0 && !response.full_update {
+            bail!("qBittorrent did not confirm a full snapshot for RID zero");
+        }
+        let full_update = response.full_update;
         let response_hashes = response
             .torrents
             .keys()
@@ -397,40 +424,61 @@ impl DownloadClient for QbittorrentClient {
             || response_hashes
                 .iter()
                 .any(|hash| !state.torrents.contains_key(hash));
-        if full_update {
-            state.torrents.clear();
-        }
-        let changed_hashes = response.torrents.keys().cloned().collect::<Vec<_>>();
+        let mut changed = HashMap::with_capacity(response.torrents.len());
+        let mut downloads = Vec::with_capacity(response.torrents.len());
         for (hash, patch) in response.torrents {
             let hash = hash.to_ascii_lowercase();
-            let target = state
-                .torrents
-                .entry(hash.clone())
-                .or_insert_with(|| Value::Object(Map::new()));
-            merge_object(target, patch);
-            if let Value::Object(object) = target {
-                object.insert("hash".into(), Value::String(hash));
+            if removed.contains(&hash) {
+                continue;
             }
+            let mut target = if full_update {
+                None
+            } else {
+                state.torrents.get(&hash).cloned()
+            }
+            .unwrap_or_else(|| Value::Object(Map::new()));
+            merge_object(&mut target, patch);
+            if let Value::Object(object) = &mut target {
+                object.insert("hash".into(), Value::String(hash.clone()));
+            }
+            let torrent = match serde_json::from_value::<QbitTorrent>(target.clone()) {
+                Ok(torrent) => torrent,
+                Err(error) => {
+                    *state = QbitSyncState::default();
+                    return Err(error).context("decode qBittorrent delta, full snapshot required");
+                }
+            };
+            changed.insert(hash, target);
+            downloads.push(torrent.normalized(&self.name));
         }
-        for hash in &removed {
-            state.torrents.remove(hash);
-        }
-        state.rid = response.rid;
-        let downloads = changed_hashes
-            .iter()
-            .filter_map(|hash| state.torrents.get(&hash.to_ascii_lowercase()))
-            .cloned()
-            .map(serde_json::from_value::<QbitTorrent>)
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|torrent| torrent.normalized(&self.name))
-            .collect();
-        Ok(DownloadClientDelta {
+        let delta = Arc::new(DownloadClientDelta {
             downloads,
             removed: removed.into_iter().collect(),
             full_update,
             inventory_changed,
-        })
+        });
+        state.pending = Some(PendingDelta {
+            rid: response.rid,
+            patches: changed,
+            delta: delta.clone(),
+        });
+        Ok(delta)
+    }
+
+    async fn acknowledge_downloads(&self) {
+        let mut state = self.sync_state.lock().await;
+        let Some(pending) = state.pending.take() else {
+            return;
+        };
+        if pending.delta.full_update {
+            state.torrents = pending.patches;
+        } else {
+            state.torrents.extend(pending.patches);
+        }
+        for hash in &pending.delta.removed {
+            state.torrents.remove(hash);
+        }
+        state.rid = pending.rid;
     }
 
     async fn free_space(&self) -> Result<i64> {
@@ -795,10 +843,17 @@ mod tests {
         assert!(initial.full_update);
         assert!(initial.inventory_changed);
         assert_eq!(initial.downloads[0].name, "Incremental album");
+        let replay = client
+            .sync_downloads(false)
+            .await
+            .expect("unacknowledged batch");
+        assert!(std::sync::Arc::ptr_eq(&initial, &replay));
+        client.acknowledge_downloads().await;
         let update = client.sync_downloads(false).await.expect("delta sync");
         assert!(!update.inventory_changed);
         assert_eq!(update.downloads[0].name, "Incremental album");
         assert_eq!(update.downloads[0].live.state, ClientDownloadState::Seeding);
+        client.acknowledge_downloads().await;
         let removed = client
             .sync_downloads(false)
             .await

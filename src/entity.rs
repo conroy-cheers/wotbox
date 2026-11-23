@@ -100,7 +100,7 @@ pub mod library_admission {
 pub mod library_release_projection {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize)]
     #[sea_orm(table_name = "library_release_projections")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -130,7 +130,7 @@ pub mod library_release_projection {
 pub mod library_artist_projection {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize)]
     #[sea_orm(table_name = "library_artist_projections")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -151,7 +151,7 @@ pub mod library_artist_projection {
 pub mod library_artist_release_projection {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize)]
     #[sea_orm(table_name = "library_artist_release_projections")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -975,7 +975,27 @@ pub mod import_supersession {
         pub cleanup_mode: String,
         pub cleanup_state: String,
         pub reason: Option<String>,
+        pub scan_section: Option<i64>,
+        pub scan_root: Option<String>,
         pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod channel_pack_receipt {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "channel_pack_receipts")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub pack_id: String,
+        pub request_json: Json,
+        pub result_json: Json,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

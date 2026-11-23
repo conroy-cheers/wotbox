@@ -28,13 +28,16 @@
     oneOf,
     optionalPositiveInteger,
     replaceView,
-    selectReleaseAttachment
+    selectReleaseAttachment,
+    selectReleaseVariant
   } from "../lib/routing";
 
   let { id }: { id: string } = $props();
   const initialId = untrack(() => id);
   const routePath = `/releases/${encodeURIComponent(initialId)}`;
   const pageParams = new URLSearchParams(location.search);
+  const requestedTracker = pageParams.get("tracker") || undefined;
+  const requestedAddTracker = pageParams.get("addTracker") || undefined;
   const requestedTorrent = Number(pageParams.get("torrent")) || undefined;
   const requestedClient = pageParams.get("client") || undefined;
   const requestedHash = pageParams.get("hash") || undefined;
@@ -50,10 +53,12 @@
   let identifiersOpen = $state(pageParams.get("details") === "client");
   let selected = $state<TorrentVariant | null>(null);
   const release = createQuery({
-    queryKey: ["release", initialId, requestedTorrent],
-    queryFn: () => api<Envelope<ReleaseDetail>>(
+    queryKey: ["release", initialId, requestedTorrent, requestedTracker],
+    queryFn: ({ signal }) => api<Envelope<ReleaseDetail>>(
       `/api/v1/releases/${encodeURIComponent(initialId)}`
       + (requestedTorrent ? `?torrent=${requestedTorrent}` : "")
+      + (requestedTorrent && requestedTracker ? `&tracker=${encodeURIComponent(requestedTracker)}` : ""),
+      { signal }
     )
   });
   const crossSeedPlans = createQuery({
@@ -66,8 +71,9 @@
   });
 
   const selectedVariant = $derived(
-    $release.data?.data.variants.find((variant) => variant.torrentId === requestedTorrent)
-      ?? $release.data?.data.variants.find((variant) => variantDownloads(variant, $liveDownloads).length > 0)
+    requestedTorrent == null
+      ? $release.data?.data.variants.find((variant) => variantDownloads(variant, $liveDownloads).length > 0)
+      : selectReleaseVariant($release.data?.data.variants ?? [], requestedTorrent, requestedTracker)
   );
   const live = $derived(
     selectReleaseAttachment(
@@ -91,12 +97,14 @@
   function updateRoute(expanded = variantsExpanded, details = identifiersOpen) {
     replaceView(routePath, {
       torrent: requestedTorrent,
+      tracker: requestedTracker,
       client: requestedClient,
       hash: requestedHash,
       from: source,
       expanded: expanded ? 1 : undefined,
       details: details ? "client" : undefined,
-      add: requestedAddTorrent
+      add: requestedAddTorrent,
+      addTracker: requestedAddTracker
     });
   }
 
@@ -113,31 +121,32 @@
   function choose(variant: TorrentVariant) {
     navigateView(routePath, {
       torrent: requestedTorrent,
+      tracker: requestedTracker,
       client: requestedClient,
       hash: requestedHash,
       from: source,
-      expanded: variantsExpanded ? Number(initialId) : undefined,
+      expanded: variantsExpanded ? 1 : undefined,
       details: identifiersOpen ? "client" : undefined,
-      add: variant.torrentId
+      add: variant.torrentId,
+      addTracker: variant.tracker
     });
   }
 
   function closeAddDialog() {
     closeOverlay(routePath, {
       torrent: requestedTorrent,
+      tracker: requestedTracker,
       client: requestedClient,
       hash: requestedHash,
       from: source,
-      expanded: variantsExpanded ? Number(initialId) : undefined,
+      expanded: variantsExpanded ? 1 : undefined,
       details: identifiersOpen ? "client" : undefined
     });
   }
 
   $effect(() => {
     if (!requestedAddTorrent || selected || !$release.data) return;
-    selected = $release.data.data.variants.find(
-      (variant) => variant.torrentId === requestedAddTorrent
-    ) ?? null;
+    selected = selectReleaseVariant($release.data.data.variants, requestedAddTorrent, requestedAddTracker) ?? null;
   });
 </script>
 
@@ -176,6 +185,10 @@
     </div>
   </section>
 
+  {#if (requestedTorrent || requestedAddTorrent) && !requestedTracker && !requestedAddTracker
+    && detail.variants.filter((variant) => variant.torrentId === (requestedAddTorrent ?? requestedTorrent)).length > 1}
+    <p role="status">More than one tracker uses this torrent ID. Choose the tracker or edition below.</p>
+  {/if}
   <section class="section">
     <div class="section-heading">
       <div><p class="eyebrow">Editions</p><h2>Torrent variants</h2></div>
@@ -186,7 +199,8 @@
       tracker={detail.release.tracker}
       groupId={detail.release.groupId}
       title={detail.release.title}
-      requestedTorrentId={requestedTorrent}
+      requestedTorrentId={selectedVariant?.torrentId}
+      requestedTracker={selectedVariant?.tracker}
       source={source}
       expanded={variantsExpanded}
       onexpandedchange={toggleExpanded}

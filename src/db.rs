@@ -1,3 +1,10 @@
+mod acquisition;
+mod observation;
+mod projection_stage;
+mod read_snapshot;
+
+use read_snapshot::SnapshotConnection;
+
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -11,9 +18,9 @@ use sea_orm::{
     ActiveModelTrait,
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database as SeaDatabase,
-    DatabaseConnection, DatabaseTransaction, EntityTrait, IntoActiveModel, ModelTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode, Statement,
-    TransactionOptions, TransactionTrait,
+    DatabaseTransaction, EntityTrait, IntoActiveModel, ModelTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, SqliteTransactionMode, Statement, TransactionOptions,
+    TransactionTrait,
     sea_query::{Expr, OnConflict},
 };
 use sea_orm_migration::MigratorTrait;
@@ -26,8 +33,8 @@ use crate::{
     entity::{
         artist_source, background_job, canonical_alias, canonical_artist, canonical_backfill_state,
         canonical_release, canonical_release_artist, canonical_release_credit, canonical_torrent,
-        change_event, channel_config, channel_pack, channel_pack_item, channel_run,
-        dedupe_catalog_membership, download_client_scan, download_event, download_job,
+        change_event, channel_config, channel_pack, channel_pack_item, channel_pack_receipt,
+        channel_run, dedupe_catalog_membership, download_client_scan, download_event, download_job,
         download_release_link, external_release_link, import_supersession, import_task,
         library_admission, library_artist_projection, library_artist_release_projection,
         library_asset, library_asset_reference, library_projection_dirty, library_projection_state,
@@ -38,19 +45,54 @@ use crate::{
     model::{
         ArtistCatalogPage, ArtistCatalogRole, ArtistCreditSource, ArtistRole, BackgroundJobCounts,
         BackgroundJobState, BackgroundJobStatus, BackgroundJobsOverview, CanonicalTorrent,
-        ChannelConfig, ChannelPack, ChannelPackDecision, ChannelPackItem, ChannelPackSummary,
-        ChannelRun, ChannelRunPhase, ChannelRunStatus, ChannelRunTrigger, DownloadIndexCounts,
-        DownloadJob, DownloadState, ImportCleanupMode, ImportSupersession, ImportTask,
-        ImportTaskCounts, ImportTaskState, ImportsPage, LibraryArtistSummary, LibraryAvailability,
-        LibraryRelease, LiveDownloadStatus, ProviderCircuitState, ReleaseDetail, ReleaseDownload,
-        ReleaseSummary, RuntimePreferences, TorrentVariant, TrumpedDownloadRef,
+        ChannelBatchResult, ChannelConfig, ChannelPack, ChannelPackDecision, ChannelPackItem,
+        ChannelPackSummary, ChannelRun, ChannelRunPhase, ChannelRunStatus, ChannelRunTrigger,
+        DownloadIndexCounts, DownloadJob, DownloadProfile, DownloadState, ImportCleanupMode,
+        ImportSupersession, ImportTask, ImportTaskCounts, ImportTaskState, ImportsPage,
+        LibraryArtistSummary, LibraryAvailability, LibraryRelease, LiveDownloadStatus,
+        ProviderCircuitState, ReleaseDetail, ReleaseDownload, ReleaseSummary, RuntimePreferences,
+        TorrentVariant, TrumpedDownloadRef,
     },
     plex::PlexScanTarget,
 };
 
+tokio::task_local! {
+    static JOB_CLAIM: (Uuid, String);
+}
+
+pub(crate) async fn run_with_job_claim<T>(
+    job_id: Uuid,
+    owner: String,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    JOB_CLAIM.scope((job_id, owner), operation).await
+}
+
 #[derive(Clone)]
 pub struct Database {
-    connection: DatabaseConnection,
+    connection: SnapshotConnection,
+    library_status: std::sync::Arc<tokio::sync::Mutex<Option<CachedLibraryStatus>>>,
+}
+
+struct CachedLibraryStatus {
+    revision: (i64, i64),
+    value: crate::model::LibraryIndexStatus,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("This idempotency key is already associated with a different download request")]
+pub struct DownloadRequestConflict;
+
+pub enum CleanupScanStatus {
+    Complete,
+    Pending,
+    Failed,
+}
+
+pub enum PackDecisionResult {
+    Committed(ChannelBatchResult),
+    Conflict,
+    CapacityChanged(String),
 }
 
 pub struct Cached<T> {
@@ -273,6 +315,7 @@ pub struct UnlinkedDownload {
 }
 
 pub struct CreateReplacementImport<'a> {
+    pub request_key: Option<&'a str>,
     pub download_job_id: Option<Uuid>,
     pub target_client: Option<&'a str>,
     pub target_info_hash: Option<&'a str>,
@@ -418,14 +461,30 @@ impl Database {
         let connection = SeaDatabase::connect(options)
             .await
             .context("connect to SQLite")?;
-        Migrator::up(&connection, None)
+        // SQLite migrations in SeaORM otherwise run each DDL statement in autocommit.
+        // Keep the schema and its migration records consistent across a failed upgrade.
+        let migration = connection
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
+            .await
+            .context("begin SQLite schema upgrade")?;
+        Migrator::up(&migration, None)
             .await
             .context("run database migrations")?;
-        Ok(Self { connection })
+        migration
+            .commit()
+            .await
+            .context("commit SQLite schema upgrade")?;
+        Ok(Self {
+            connection: SnapshotConnection::new(connection),
+            library_status: Default::default(),
+        })
     }
 
     pub async fn ping(&self) -> Result<()> {
-        self.connection.ping().await?;
+        self.connection.pool.ping().await?;
         Ok(())
     }
 
@@ -442,6 +501,22 @@ impl Database {
         reason: &str,
         payload: Option<Value>,
     ) -> Result<i64> {
+        let transaction = self.begin_write().await?;
+        let cursor = self
+            .append_resource_change_event_on(&transaction, scopes, resources, reason, payload)
+            .await?;
+        transaction.commit().await?;
+        Ok(cursor)
+    }
+
+    async fn append_resource_change_event_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        scopes: &str,
+        resources: &str,
+        reason: &str,
+        payload: Option<Value>,
+    ) -> Result<i64> {
         let event = change_event::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
             scopes: Set(scopes.to_owned()),
@@ -450,17 +525,32 @@ impl Database {
             payload_json: Set(payload),
             created_at: Set(Utc::now().to_rfc3339()),
         }
-        .insert(&self.connection)
+        .insert(connection)
         .await?;
         Ok(event.id)
     }
 
-    pub async fn latest_change_cursor(&self) -> Result<i64> {
-        Ok(change_event::Entity::find()
-            .order_by_desc(change_event::Column::Id)
-            .one(&self.connection)
+    pub async fn change_epoch(&self) -> Result<String> {
+        let row = self
+            .connection
+            .query_one_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                "SELECT value FROM change_epoch WHERE id = 1",
+            ))
             .await?
-            .map_or(0, |event| event.id))
+            .context("missing change feed epoch")?;
+        Ok(row.try_get("", "value")?)
+    }
+
+    pub async fn latest_change_cursor(&self) -> Result<i64> {
+        read_snapshot::cursor_on(&self.connection).await
+    }
+
+    pub async fn read_snapshot<T>(
+        &self,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<(i64, T)> {
+        self.connection.read_snapshot(operation).await
     }
 
     pub async fn change_events_after(
@@ -503,50 +593,83 @@ impl Database {
             .rows_affected)
     }
 
+    #[cfg(test)]
     pub async fn mark_downloads_removed(&self, client: &str, hashes: &[String]) -> Result<()> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let now = Utc::now().to_rfc3339();
-        let models = download_release_link::Entity::find()
-            .filter(download_release_link::Column::Client.eq(client))
-            .filter(
-                download_release_link::Column::InfoHash
-                    .is_in(hashes.iter().map(|h| h.to_ascii_lowercase())),
-            )
-            .all(&self.connection)
+        let transaction = self.begin_write().await?;
+        self.remove_observed_downloads_on(&transaction, client, hashes)
             .await?;
-        let batch_count = models.len().div_ceil(DOWNLOAD_WRITE_BATCH_SIZE);
-        for (batch_index, batch) in models.chunks(DOWNLOAD_WRITE_BATCH_SIZE).enumerate() {
-            let transaction = self.begin_write().await?;
-            for model in batch.iter().cloned() {
-                if model.library_added_at.is_some() {
-                    let mut active = model.into_active_model();
-                    active.present = Set(false);
-                    if active.missing_since.as_ref().is_none() {
-                        active.missing_since = Set(Some(now.clone()));
-                    }
-                    active.update(&transaction).await?;
-                } else {
-                    model.delete(&transaction).await?;
-                }
-            }
-            transaction.commit().await?;
-            if batch_index + 1 < batch_count {
-                tokio::task::yield_now().await;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn remove_observed_downloads_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        client: &str,
+        hashes: &[String],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        for batch in hashes.chunks(DOWNLOAD_WRITE_BATCH_SIZE) {
+            let models = download_release_link::Entity::find()
+                .filter(download_release_link::Column::Client.eq(client))
+                .filter(
+                    download_release_link::Column::InfoHash
+                        .is_in(batch.iter().map(|hash| hash.to_ascii_lowercase())),
+                )
+                .all(transaction)
+                .await?;
+            for model in models {
+                self.mark_download_link_missing_on(transaction, model, &now)
+                    .await?;
             }
         }
         Ok(())
     }
 
+    async fn mark_download_link_missing_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        model: download_release_link::Model,
+        now: &str,
+    ) -> Result<()> {
+        if model.library_added_at.is_some() {
+            if model.present {
+                let missing_since = model
+                    .missing_since
+                    .clone()
+                    .unwrap_or_else(|| now.to_owned());
+                let mut active = model.into_active_model();
+                active.present = Set(false);
+                active.missing_since = Set(Some(missing_since));
+                let link = active.update(transaction).await?;
+                self.sync_import_link_on(transaction, link).await?;
+            }
+        } else {
+            model.delete(transaction).await?;
+        }
+        Ok(())
+    }
+
     async fn begin_write(&self) -> Result<DatabaseTransaction> {
-        Ok(self
+        self.connection.reject_snapshot_write()?;
+        let transaction = self
             .connection
+            .pool
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
             })
-            .await?)
+            .await?;
+        // The write lock makes the claim check and the step's transaction
+        // indivisible with respect to cancellation and lease recovery.
+        if let Ok((id, owner)) = JOB_CLAIM.try_with(Clone::clone) {
+            anyhow::ensure!(
+                self.owns_background_job_on(&transaction, id, &owner)
+                    .await?,
+                "Background job no longer owns its lease"
+            );
+        }
+        Ok(transaction)
     }
 
     pub async fn get_snapshot<T: DeserializeOwned>(
@@ -825,6 +948,24 @@ impl Database {
     }
 
     pub async fn ensure_library_asset(&self, source_url: &str) -> Result<String> {
+        self.ensure_library_asset_inner(source_url, None).await
+    }
+
+    pub async fn repair_missing_library_asset(
+        &self,
+        source_url: &str,
+        expected_blob: &str,
+    ) -> Result<()> {
+        self.ensure_library_asset_inner(source_url, Some(expected_blob))
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_library_asset_inner(
+        &self,
+        source_url: &str,
+        missing_blob: Option<&str>,
+    ) -> Result<String> {
         let source_hash = crate::asset::AssetStore::source_hash(source_url);
         let transaction = self.begin_write().await?;
         let existing = library_asset::Entity::find_by_id(source_hash.clone())
@@ -833,6 +974,9 @@ impl Database {
         if let Some(model) = existing {
             if model.materializer_version < crate::asset::MATERIALIZER_VERSION
                 || model.state == "failed_terminal"
+                || (model.state == "ready"
+                    && missing_blob.is_some()
+                    && model.blob_hash.as_deref() == missing_blob)
             {
                 let mut active = model.into_active_model();
                 active.state = Set("pending".into());
@@ -895,8 +1039,9 @@ impl Database {
         &self,
         asset: &crate::asset::MaterializedAsset,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let model = library_asset::Entity::find_by_id(asset.source_hash.clone())
-            .one(&self.connection)
+            .one(&transaction)
             .await?
             .context("Library asset disappeared during materialization")?;
         let now = Utc::now().to_rfc3339();
@@ -914,7 +1059,8 @@ impl Database {
         active.materializer_version = Set(crate::asset::MATERIALIZER_VERSION);
         active.fetched_at = Set(Some(now.clone()));
         active.updated_at = Set(now);
-        active.update(&self.connection).await?;
+        active.update(&transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -926,8 +1072,9 @@ impl Database {
         message: &str,
         retry_after: Option<DateTime<Utc>>,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         if let Some(model) = library_asset::Entity::find_by_id(source_hash)
-            .one(&self.connection)
+            .one(&transaction)
             .await?
         {
             let mut active = model.into_active_model();
@@ -937,8 +1084,9 @@ impl Database {
             active.retry_after = Set(retry_after.map(|value| value.to_rfc3339()));
             active.materializer_version = Set(crate::asset::MATERIALIZER_VERSION);
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(&transaction).await?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -949,20 +1097,33 @@ impl Database {
             .await?)
     }
 
+    pub async fn library_asset_blob(
+        &self,
+        hash: &str,
+        version: i32,
+    ) -> Result<Option<library_asset::Model>> {
+        Ok(library_asset::Entity::find()
+            .filter(library_asset::Column::BlobHash.eq(hash))
+            .filter(library_asset::Column::MaterializerVersion.eq(version))
+            .filter(library_asset::Column::State.eq("ready"))
+            .one(&self.connection)
+            .await?)
+    }
+
     pub async fn prune_unreferenced_library_assets(
         &self,
         before: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<(String, String)>> {
-        let rows = self
-            .connection
+    ) -> Result<Vec<(String, String, i32)>> {
+        let transaction = self.begin_write().await?;
+        let rows = transaction
             .query_all_raw(Statement::from_string(
-                self.connection.get_database_backend(),
+                transaction.get_database_backend(),
                 format!(
                     r#"
                     SELECT asset.source_hash AS source_hash,
                            asset.blob_hash AS blob_hash,
-                           asset.original_extension AS original_extension
+                           asset.original_extension AS original_extension, asset.materializer_version
                       FROM library_assets asset
                      WHERE asset.state IN ('ready', 'absent', 'unsupported', 'failed_terminal')
                        AND asset.updated_at < '{}'
@@ -985,57 +1146,161 @@ impl Database {
                     row.try_get::<String>("", "source_hash")?,
                     row.try_get::<Option<String>>("", "blob_hash")?,
                     row.try_get::<Option<String>>("", "original_extension")?,
+                    row.try_get::<i32>("", "materializer_version")?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-        let transaction = self.begin_write().await?;
         let source_hashes = candidates
             .iter()
             .map(|candidate| candidate.0.clone())
             .collect::<Vec<_>>();
-        library_asset::Entity::delete_many()
-            .filter(library_asset::Column::SourceHash.is_in(source_hashes))
-            .exec(&transaction)
-            .await?;
-        let mut removable = Vec::new();
-        for (_, blob_hash, extension) in candidates {
+        if !source_hashes.is_empty() {
+            library_asset::Entity::delete_many()
+                .filter(library_asset::Column::SourceHash.is_in(source_hashes))
+                .exec(&transaction)
+                .await?;
+        }
+        for (_, blob_hash, extension, version) in candidates {
             let (Some(blob_hash), Some(extension)) = (blob_hash, extension) else {
                 continue;
             };
             if library_asset::Entity::find()
                 .filter(library_asset::Column::BlobHash.eq(blob_hash.clone()))
+                .filter(library_asset::Column::MaterializerVersion.eq(version))
                 .count(&transaction)
                 .await?
                 == 0
             {
-                removable.push((blob_hash, extension));
+                transaction.execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "INSERT OR IGNORE INTO library_blob_tombstones (blob_hash, extension, materializer_version) VALUES (?, ?, ?)",
+                    [blob_hash.into(), extension.into(), version.into()],
+                )).await?;
             }
         }
+        transaction.execute_unprepared(
+            "DELETE FROM library_blob_tombstones WHERE EXISTS (
+               SELECT 1 FROM library_assets WHERE library_assets.blob_hash = library_blob_tombstones.blob_hash
+                 AND library_assets.materializer_version = library_blob_tombstones.materializer_version
+             )"
+        ).await?;
+        let pending = transaction.query_all_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT blob_hash, extension, materializer_version FROM library_blob_tombstones ORDER BY blob_hash LIMIT ?",
+            [i64::try_from(limit)?.into()],
+        )).await?;
         transaction.commit().await?;
-        removable.sort_unstable();
-        removable.dedup();
-        Ok(removable)
+        pending
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("", "blob_hash")?,
+                    row.try_get("", "extension")?,
+                    row.try_get("", "materializer_version")?,
+                ))
+            })
+            .collect()
     }
 
-    pub async fn reconcile_library_admissions(&self, _limit: usize) -> Result<usize> {
-        let held = download_release_link::Entity::find()
-            .select_only()
-            .column(download_release_link::Column::ReleaseId)
-            .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
-            .filter(download_release_link::Column::ReleaseId.is_not_null())
-            .into_tuple::<Option<String>>()
-            .all(&self.connection)
+    pub async fn can_prune_library_blob(&self, hash: &str, version: i32) -> Result<bool> {
+        let transaction = self.begin_write().await?;
+        let row = transaction.query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT 1 FROM library_blob_tombstones tombstone WHERE blob_hash = ? AND materializer_version = ?
+              AND NOT EXISTS (SELECT 1 FROM library_assets asset WHERE asset.blob_hash = tombstone.blob_hash
+                               AND asset.materializer_version = tombstone.materializer_version)",
+            [hash.into(), version.into()],
+        )).await?;
+        transaction.commit().await?;
+        Ok(row.is_some())
+    }
+
+    pub async fn finish_blob_prune(&self, blob_hash: &str, version: i32) -> Result<()> {
+        self.connection
+            .execute_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "DELETE FROM library_blob_tombstones WHERE blob_hash = ? AND materializer_version = ?",
+                [blob_hash.into(), version.into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn library_admission_pass_has_next(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_one_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                "SELECT 1 FROM library_admission_dirty
+              UNION ALL SELECT 1 FROM download_release_links
+              WHERE library_added_at IS NOT NULL
+                AND release_id > (SELECT release_id FROM library_admission_cursor WHERE id = 1)
+              LIMIT 1",
+            ))
+            .await?
+            .is_some())
+    }
+
+    pub async fn reconcile_library_admissions(&self, limit: usize) -> Result<usize> {
+        let transaction = self.begin_write().await?;
+        let dirty = transaction
+            .query_all_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "SELECT release_id FROM library_admission_dirty ORDER BY release_id LIMIT ?",
+                [i64::try_from(limit.clamp(1, 250))?.into()],
+            ))
             .await?
             .into_iter()
-            .flatten()
-            .collect::<HashSet<_>>();
+            .map(|row| row.try_get::<String>("", "release_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = if dirty.is_empty() {
+            let cursor = transaction
+                .query_one_raw(Statement::from_string(
+                    transaction.get_database_backend(),
+                    "SELECT release_id FROM library_admission_cursor WHERE id = 1",
+                ))
+                .await?
+                .map(|row| row.try_get::<String>("", "release_id"))
+                .transpose()?;
+            let query = download_release_link::Entity::find()
+                .select_only()
+                .column(download_release_link::Column::ReleaseId)
+                .distinct()
+                .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
+                .filter(download_release_link::Column::ReleaseId.is_not_null())
+                .order_by_asc(download_release_link::Column::ReleaseId)
+                .limit(limit.clamp(1, 250) as u64);
+            let mut batch = match cursor.as_deref() {
+                Some(cursor) => {
+                    query
+                        .clone()
+                        .filter(download_release_link::Column::ReleaseId.gt(cursor))
+                        .into_tuple::<String>()
+                        .all(&transaction)
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            if batch.is_empty() {
+                batch = query.into_tuple::<String>().all(&transaction).await?;
+            }
+            batch
+        } else {
+            download_release_link::Entity::find()
+                .select_only()
+                .column(download_release_link::Column::ReleaseId)
+                .distinct()
+                .filter(download_release_link::Column::LibraryAddedAt.is_not_null())
+                .filter(download_release_link::Column::ReleaseId.is_in(dirty.iter().cloned()))
+                .into_tuple::<String>()
+                .all(&transaction)
+                .await?
+        };
+        let held = batch.iter().cloned().collect::<HashSet<_>>();
         let credits = canonical_release_credit::Entity::find()
             .filter(canonical_release_credit::Column::Role.eq("primary"))
             .filter(canonical_release_credit::Column::ReleaseId.is_in(held.iter().cloned()))
-            .all(&self.connection)
+            .all(&transaction)
             .await?
             .into_iter()
             .fold(HashMap::<String, Vec<String>>::new(), |mut map, credit| {
@@ -1055,7 +1320,7 @@ impl Database {
             .filter(artist_source::Column::CanonicalArtistId.is_in(artist_ids))
             .filter(artist_source::Column::ArtistId.is_not_null())
             .into_tuple::<(String, String, Option<i64>)>()
-            .all(&self.connection)
+            .all(&transaction)
             .await?
             .into_iter()
             .fold(
@@ -1069,6 +1334,19 @@ impl Database {
                     map
                 },
             );
+        let catalog_keys = sources.values().flatten().collect::<HashSet<_>>();
+        let catalog_identity = serde_json::to_string(
+            &catalog_keys
+                .iter()
+                .map(|(tracker, id)| (tracker, id.to_string()))
+                .collect::<Vec<_>>(),
+        )?;
+        let catalog_prefixes = serde_json::to_string(
+            &catalog_keys
+                .iter()
+                .map(|(tracker, id)| format!("{tracker}:{id}:"))
+                .collect::<Vec<_>>(),
+        )?;
         let snapshots = tracker_snapshot::Entity::find()
             .select_only()
             .columns([
@@ -1076,8 +1354,14 @@ impl Database {
                 tracker_snapshot::Column::ResourceKey,
             ])
             .filter(tracker_snapshot::Column::ResourceKind.eq("artist"))
+            .filter(Expr::cust_with_values(
+                "EXISTS (SELECT 1 FROM json_each(?) wanted
+                    WHERE json_extract(wanted.value, '$[0]') = tracker
+                      AND json_extract(wanted.value, '$[1]') = resource_key)",
+                [catalog_identity],
+            ))
             .into_tuple::<(String, String)>()
-            .all(&self.connection)
+            .all(&transaction)
             .await?
             .into_iter()
             .map(|(tracker, resource_key)| (tracker.to_ascii_lowercase(), resource_key))
@@ -1089,8 +1373,35 @@ impl Database {
                 library_asset_reference::Column::OwnerId,
                 library_asset_reference::Column::SourceUrl,
             ])
+            .filter(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(library_asset_reference::Column::OwnerKind.eq("release"))
+                            .add(
+                                library_asset_reference::Column::OwnerId
+                                    .is_in(held.iter().cloned()),
+                            ),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(library_asset_reference::Column::OwnerKind.eq("artist"))
+                            .add(library_asset_reference::Column::OwnerId.is_in(
+                                credits.values().flatten().cloned().collect::<HashSet<_>>(),
+                            )),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(library_asset_reference::Column::OwnerKind.eq("catalog"))
+                            .add(Expr::cust_with_values(
+                                "EXISTS (SELECT 1 FROM json_each(?) wanted
+                            WHERE substr(owner_id, 1, length(wanted.value)) = wanted.value)",
+                                [catalog_prefixes],
+                            )),
+                    ),
+            )
             .into_tuple::<(String, String, String)>()
-            .all(&self.connection)
+            .all(&transaction)
             .await?;
         let mut release_artworks = HashMap::new();
         let mut artist_artworks = HashMap::new();
@@ -1117,14 +1428,24 @@ impl Database {
                 _ => {}
             }
         }
+        let artwork_urls = release_artworks
+            .values()
+            .chain(artist_artworks.values())
+            .chain(catalog_artworks.values().flatten())
+            .collect::<HashSet<_>>();
+        let artwork_urls = serde_json::to_string(&artwork_urls)?;
         let assets = library_asset::Entity::find()
             .select_only()
             .columns([
                 library_asset::Column::SourceUrl,
                 library_asset::Column::State,
             ])
+            .filter(Expr::cust_with_values(
+                "source_url IN (SELECT value FROM json_each(?))",
+                [artwork_urls],
+            ))
             .into_tuple::<(String, String)>()
-            .all(&self.connection)
+            .all(&transaction)
             .await?
             .into_iter()
             .collect::<HashMap<_, _>>();
@@ -1133,12 +1454,13 @@ impl Database {
             .column(canonical_release::Column::Id)
             .filter(canonical_release::Column::Id.is_in(held.iter().cloned()))
             .into_tuple::<String>()
-            .all(&self.connection)
+            .all(&transaction)
             .await?
             .into_iter()
             .collect::<HashSet<_>>();
         let existing = library_admission::Entity::find()
-            .all(&self.connection)
+            .filter(library_admission::Column::ReleaseId.is_in(held.iter().cloned()))
+            .all(&transaction)
             .await?
             .into_iter()
             .map(|admission| (admission.release_id.clone(), admission))
@@ -1244,17 +1566,43 @@ impl Database {
                 updated_at: Set(now),
             };
             if existing.contains_key(release_id) {
-                active.update(&self.connection).await?;
+                active.update(&transaction).await?;
             } else {
-                active.insert(&self.connection).await?;
+                active.insert(&transaction).await?;
             }
             changed += 1;
         }
-        let mut removal = library_admission::Entity::delete_many();
-        if !held.is_empty() {
-            removal = removal.filter(library_admission::Column::ReleaseId.is_not_in(held));
+        let removed = transaction.execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            r#"
+            DELETE FROM library_admissions WHERE release_id IN (
+                SELECT admission.release_id FROM library_admissions admission
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM download_release_links link
+                    WHERE link.release_id = admission.release_id AND link.library_added_at IS NOT NULL
+                 )
+                 ORDER BY admission.release_id LIMIT ?
+            )
+            "#,
+            [i64::try_from(limit.clamp(1, 250))?.into()],
+        )).await?.rows_affected();
+        if !dirty.is_empty() {
+            transaction.execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "DELETE FROM library_admission_dirty WHERE release_id IN (SELECT value FROM json_each(?))",
+                [serde_json::to_string(&dirty)?.into()],
+            )).await?;
+        } else {
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "INSERT INTO library_admission_cursor (id, release_id) VALUES (1, ?)
+             ON CONFLICT(id) DO UPDATE SET release_id = excluded.release_id",
+                    [batch.last().map(String::as_str).unwrap_or_default().into()],
+                ))
+                .await?;
         }
-        let removed = removal.exec(&self.connection).await?.rows_affected;
+        transaction.commit().await?;
         Ok(changed + usize::try_from(removed).unwrap_or(usize::MAX))
     }
 
@@ -1277,8 +1625,15 @@ impl Database {
     }
 
     pub async fn get_runtime_preferences(&self) -> Result<RuntimePreferences> {
+        self.get_runtime_preferences_on(&self.connection).await
+    }
+
+    async fn get_runtime_preferences_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+    ) -> Result<RuntimePreferences> {
         let model = runtime_preference::Entity::find_by_id("runtime")
-            .one(&self.connection)
+            .one(connection)
             .await?;
         model
             .map(|model| {
@@ -1582,7 +1937,11 @@ impl Database {
                 Expr::value(now.to_rfc3339()),
             )
             .filter(background_job::Column::State.eq("running"))
-            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .filter(
+                Condition::any()
+                    .add(background_job::Column::LeaseOwner.eq(owner))
+                    .add(background_job::Column::LeaseOwner.starts_with(format!("{owner}:"))),
+            )
             .exec(&self.connection)
             .await?
             .rows_affected)
@@ -1594,72 +1953,70 @@ impl Database {
         lane: &str,
         lease_duration: std::time::Duration,
     ) -> Result<Option<StoredBackgroundJob>> {
-        loop {
-            let now = Utc::now();
-            let candidates = background_job::Entity::find()
-                .filter(background_job::Column::State.is_in(["pending", "retrying"]))
-                .filter(background_job::Column::Lane.eq(lane))
-                .filter(
-                    Condition::any()
-                        .add(background_job::Column::NextRunAt.is_null())
-                        .add(background_job::Column::NextRunAt.lte(now.to_rfc3339())),
-                )
-                .order_by_desc(background_job::Column::Priority)
-                .order_by_asc(background_job::Column::CreatedAt)
-                .limit(2_000)
-                .all(&self.connection)
-                .await?;
-            if candidates.is_empty() {
-                return Ok(None);
-            }
-            let running_providers = background_job::Entity::find()
-                .filter(background_job::Column::State.eq("running"))
-                .filter(background_job::Column::ProviderId.is_not_null())
-                .all(&self.connection)
-                .await?
-                .into_iter()
-                .filter_map(|job| job.provider_id)
-                .collect::<std::collections::HashSet<_>>();
-            let provider_states = provider_state::Entity::find()
-                .all(&self.connection)
-                .await?
-                .into_iter()
-                .map(|state| (state.id.clone(), state))
-                .collect::<std::collections::HashMap<_, _>>();
-            let Some(model) = candidates.into_iter().find(|job| {
-                background_provider_is_due(job, &provider_states, &running_providers, now)
-            }) else {
-                return Ok(None);
-            };
-            let stored = stored_background_job(&model)?;
-            let result = background_job::Entity::update_many()
-                .col_expr(background_job::Column::State, Expr::value("running"))
-                .col_expr(
-                    background_job::Column::LeaseOwner,
-                    Expr::value(Some(owner.to_owned())),
-                )
-                .col_expr(
-                    background_job::Column::LeaseUntil,
-                    Expr::value(Some(
-                        (now + chrono::Duration::from_std(lease_duration)?).to_rfc3339(),
-                    )),
-                )
-                .col_expr(
-                    background_job::Column::StartedAt,
-                    Expr::value(Some(now.to_rfc3339())),
-                )
-                .col_expr(
-                    background_job::Column::UpdatedAt,
-                    Expr::value(now.to_rfc3339()),
-                )
-                .filter(background_job::Column::Id.eq(model.id))
-                .filter(background_job::Column::State.is_in(["pending", "retrying"]))
-                .exec(&self.connection)
-                .await?;
-            if result.rows_affected == 1 {
-                return Ok(Some(stored));
-            }
-        }
+        let transaction = self.begin_write().await?;
+        let now = Utc::now();
+        let selected = transaction.query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            r#"
+            SELECT j.id
+              FROM background_jobs j
+              LEFT JOIN provider_states p ON p.id = j.provider_id
+             WHERE j.state IN ('pending', 'retrying')
+               AND j.lane = ?
+               AND (j.next_run_at IS NULL OR j.next_run_at <= ?)
+               AND NOT EXISTS (
+                   SELECT 1 FROM background_jobs running
+                    WHERE running.state = 'running' AND running.provider_id = j.provider_id
+               )
+               AND (
+                   p.id IS NULL OR p.state IN ('blocked', 'paused')
+                   OR (
+                       (p.state != 'cooldown' OR p.retry_at IS NULL OR julianday(p.retry_at) <= julianday(?))
+                       AND (p.last_background_request_at IS NULL
+                            OR (julianday(?) - julianday(p.last_background_request_at)) * 86400000
+                                >= p.background_minimum_interval_ms)
+                   )
+               )
+             ORDER BY j.priority DESC, j.created_at ASC, j.id ASC
+             LIMIT 1
+            "#,
+            [lane.into(), now.to_rfc3339().into(), now.to_rfc3339().into(), now.to_rfc3339().into()],
+        )).await?;
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let id: String = selected.try_get("", "id")?;
+        let model = background_job::Entity::find_by_id(id)
+            .one(&transaction)
+            .await?
+            .context("selected background job disappeared")?;
+        let stored = stored_background_job(&model)?;
+        let result = background_job::Entity::update_many()
+            .col_expr(background_job::Column::State, Expr::value("running"))
+            .col_expr(
+                background_job::Column::LeaseOwner,
+                Expr::value(Some(owner.to_owned())),
+            )
+            .col_expr(
+                background_job::Column::LeaseUntil,
+                Expr::value(Some(
+                    (now + chrono::Duration::from_std(lease_duration)?).to_rfc3339(),
+                )),
+            )
+            .col_expr(
+                background_job::Column::StartedAt,
+                Expr::value(Some(now.to_rfc3339())),
+            )
+            .col_expr(
+                background_job::Column::UpdatedAt,
+                Expr::value(now.to_rfc3339()),
+            )
+            .filter(background_job::Column::Id.eq(model.id))
+            .filter(background_job::Column::State.is_in(["pending", "retrying"]))
+            .exec(&transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok((result.rows_affected == 1).then_some(stored))
     }
 
     pub async fn heartbeat_background_job(
@@ -1698,9 +2055,40 @@ impl Database {
             .filter(background_job::Column::Id.eq(id.to_string()))
             .filter(background_job::Column::State.eq("running"))
             .filter(background_job::Column::LeaseOwner.eq(owner))
+            .filter(background_job::Column::LeaseUntil.gt(now.to_rfc3339()))
             .exec(&self.connection)
             .await?;
         Ok(result.rows_affected == 1)
+    }
+
+    pub(crate) async fn check_current_job_claim(&self) -> Result<()> {
+        if let Ok((id, owner)) = JOB_CLAIM.try_with(Clone::clone) {
+            anyhow::ensure!(
+                self.owns_background_job(id, &owner).await?,
+                "Background job no longer owns its lease"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn owns_background_job(&self, id: Uuid, owner: &str) -> Result<bool> {
+        self.owns_background_job_on(&self.connection, id, owner)
+            .await
+    }
+
+    async fn owns_background_job_on<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+        owner: &str,
+    ) -> Result<bool> {
+        Ok(background_job::Entity::find_by_id(id.to_string())
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseOwner.eq(owner))
+            .filter(background_job::Column::LeaseUntil.gt(Utc::now().to_rfc3339()))
+            .one(db)
+            .await?
+            .is_some())
     }
 
     pub async fn set_background_job_provider(&self, id: Uuid, provider_id: &str) -> Result<()> {
@@ -1721,9 +2109,12 @@ impl Database {
     }
 
     pub async fn complete_background_job(&self, id: Uuid, owner: &str) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let Some(model) = background_job::Entity::find_by_id(id.to_string())
             .filter(background_job::Column::LeaseOwner.eq(owner))
-            .one(&self.connection)
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseUntil.gt(Utc::now().to_rfc3339()))
+            .one(&transaction)
             .await?
         else {
             return Ok(());
@@ -1755,7 +2146,8 @@ impl Database {
         active.last_error_message = Set(None);
         active.finished_at = Set(Some(now.to_rfc3339()));
         active.updated_at = Set(now.to_rfc3339());
-        active.update(&self.connection).await?;
+        active.update(&transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1766,9 +2158,12 @@ impl Database {
         code: &str,
         message: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let Some(model) = background_job::Entity::find_by_id(id.to_string())
             .filter(background_job::Column::LeaseOwner.eq(owner))
-            .one(&self.connection)
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseUntil.gt(Utc::now().to_rfc3339()))
+            .one(&transaction)
             .await?
         else {
             return Ok(());
@@ -1786,7 +2181,8 @@ impl Database {
         active.last_error_message = Set(Some(message.chars().take(500).collect()));
         active.finished_at = Set(Some(now.clone()));
         active.updated_at = Set(now);
-        active.update(&self.connection).await?;
+        active.update(&transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1797,9 +2193,12 @@ impl Database {
         code: &str,
         message: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let Some(model) = background_job::Entity::find_by_id(id.to_string())
             .filter(background_job::Column::LeaseOwner.eq(owner))
-            .one(&self.connection)
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseUntil.gt(Utc::now().to_rfc3339()))
+            .one(&transaction)
             .await?
         else {
             return Ok(());
@@ -1820,7 +2219,8 @@ impl Database {
         active.last_error_message = Set(Some(message.chars().take(500).collect()));
         active.finished_at = Set(None);
         active.updated_at = Set(now);
-        active.update(&self.connection).await?;
+        active.update(&transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1844,9 +2244,12 @@ impl Database {
         code: &str,
         message: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let Some(model) = background_job::Entity::find_by_id(id.to_string())
             .filter(background_job::Column::LeaseOwner.eq(owner))
-            .one(&self.connection)
+            .filter(background_job::Column::State.eq("running"))
+            .filter(background_job::Column::LeaseUntil.gt(Utc::now().to_rfc3339()))
+            .one(&transaction)
             .await?
         else {
             return Ok(());
@@ -1873,7 +2276,8 @@ impl Database {
         active.last_error_message = Set(Some(message.chars().take(500).collect()));
         active.finished_at = Set(terminal.then(|| now.to_rfc3339()));
         active.updated_at = Set(now.to_rfc3339());
-        active.update(&self.connection).await?;
+        active.update(&transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1939,14 +2343,16 @@ impl Database {
         Ok(background_job::Entity::delete_many()
             .filter(background_job::Column::State.is_in(["completed", "cancelled"]))
             .filter(background_job::Column::UpdatedAt.lt(cutoff))
+            .filter(Expr::cust("deduplication_key NOT LIKE 'cleanup-plex:%' AND deduplication_key NOT LIKE 'cleanup-target:%'"))
             .exec(&self.connection)
             .await?
             .rows_affected)
     }
 
     pub async fn cancel_background_job(&self, id: Uuid) -> Result<bool> {
+        let transaction = self.begin_write().await?;
         let Some(model) = background_job::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+            .one(&transaction)
             .await?
         else {
             return Ok(false);
@@ -1954,6 +2360,26 @@ impl Database {
         if matches!(model.state.as_str(), "completed" | "failed" | "cancelled") {
             return Ok(false);
         }
+        let channel_run_id = (model.kind == crate::background::REFRESH_CHANNEL)
+            .then(|| {
+                model
+                    .payload_json
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .map(Uuid::parse_str)
+            })
+            .flatten()
+            .transpose()?;
+        let download_id = (model.kind == crate::background::SUBMIT_DOWNLOAD)
+            .then(|| {
+                model
+                    .payload_json
+                    .get("jobId")
+                    .and_then(Value::as_str)
+                    .map(Uuid::parse_str)
+            })
+            .flatten()
+            .transpose()?;
         let now = Utc::now();
         let mut active = model.into_active_model();
         active.state = Set("cancelled".into());
@@ -1962,7 +2388,40 @@ impl Database {
         active.lease_until = Set(None);
         active.progress_message = Set(None);
         active.updated_at = Set(now.to_rfc3339());
-        active.update(&self.connection).await?;
+        active.update(&transaction).await?;
+        if let Some(run_id) = channel_run_id {
+            self.finish_channel_run_on(
+                &transaction,
+                run_id,
+                ChannelRunStatus::Failed,
+                None,
+                Some("Channel refresh cancelled"),
+            )
+            .await?;
+        }
+        if let Some(id) = download_id
+            && let Some(job) = download_job::Entity::find_by_id(id.to_string())
+                .one(&transaction)
+                .await?
+            && matches!(
+                job.state.as_str(),
+                "queued" | "fetching_metadata" | "submitting"
+            )
+        {
+            let message = if job.state == "submitting" {
+                "Submission cancelled after dispatch may have begun. Review the tracker and client before retrying."
+            } else {
+                "Submission cancelled before the torrent was added to the client."
+            };
+            self.set_job_state_on(
+                &transaction,
+                id,
+                DownloadState::Failed,
+                Some(("submission_cancelled", message)),
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(true)
     }
 
@@ -2173,9 +2632,50 @@ impl Database {
     }
 
     pub async fn put_provider_state(&self, state: &StoredProviderState) -> Result<()> {
+        self.put_provider_state_on(&self.connection, state).await
+    }
+
+    pub async fn provider_request_windows(&self, provider: &str) -> Result<Option<String>> {
+        let row = self
+            .connection
+            .query_one_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT windows_json FROM provider_request_windows WHERE provider_id = ?",
+                [provider.into()],
+            ))
+            .await?;
+        row.map(|row| row.try_get("", "windows_json"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn put_provider_state_and_windows(
+        &self,
+        state: &StoredProviderState,
+        windows: String,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.put_provider_state_on(&transaction, state).await?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "INSERT INTO provider_request_windows (provider_id, windows_json) VALUES (?, ?)
+             ON CONFLICT(provider_id) DO UPDATE SET windows_json = excluded.windows_json",
+                [state.id.clone().into(), windows.into()],
+            ))
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn put_provider_state_on<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        state: &StoredProviderState,
+    ) -> Result<()> {
         let updated_at = Utc::now().to_rfc3339();
         if let Some(model) = provider_state::Entity::find_by_id(&state.id)
-            .one(&self.connection)
+            .one(db)
             .await?
         {
             let mut active = model.into_active_model();
@@ -2198,7 +2698,7 @@ impl Database {
                 Set(i64::try_from(state.background_minimum_interval_ms).unwrap_or(i64::MAX));
             active.max_concurrency = Set(i64::from(state.max_concurrency));
             active.updated_at = Set(updated_at);
-            active.update(&self.connection).await?;
+            active.update(db).await?;
         } else {
             provider_state::ActiveModel {
                 id: Set(state.id.clone()),
@@ -2225,7 +2725,7 @@ impl Database {
                 max_concurrency: Set(i64::from(state.max_concurrency)),
                 updated_at: Set(updated_at),
             }
-            .insert(&self.connection)
+            .insert(db)
             .await?;
         }
         Ok(())
@@ -2269,10 +2769,21 @@ impl Database {
     }
 
     pub async fn put_channel(&self, channel: &ChannelConfig) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.put_channel_on(&transaction, channel).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn put_channel_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        channel: &ChannelConfig,
+    ) -> Result<()> {
         let value = serde_json::to_value(channel)?;
         let kind = channel.kind.as_str();
         if let Some(model) = channel_config::Entity::find_by_id(channel.id.clone())
-            .one(&self.connection)
+            .one(transaction)
             .await?
         {
             let mut active = model.into_active_model();
@@ -2283,7 +2794,7 @@ impl Database {
                 Set(channel.last_successful_at.map(|value| value.to_rfc3339()));
             active.last_error = Set(channel.last_error.clone());
             active.updated_at = Set(channel.updated_at.to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(transaction).await?;
         } else {
             channel_config::ActiveModel {
                 id: Set(channel.id.clone()),
@@ -2294,7 +2805,7 @@ impl Database {
                 last_error: Set(channel.last_error.clone()),
                 updated_at: Set(channel.updated_at.to_rfc3339()),
             }
-            .insert(&self.connection)
+            .insert(transaction)
             .await?;
         }
         Ok(())
@@ -2317,22 +2828,26 @@ impl Database {
             .all(&self.connection)
             .await?
         {
-            let channel_id = model.channel_id.clone();
-            let message = "Service restarted during channel refresh";
-            let mut active = model.into_active_model();
-            active.status = Set("failed".into());
-            active.error = Set(Some(message.into()));
-            active.retry_at = Set(None);
-            let now = Utc::now().to_rfc3339();
-            active.updated_at = Set(now.clone());
-            active.finished_at = Set(Some(now));
-            active.update(&self.connection).await?;
-            if let Some(mut channel) = self.get_channel(&channel_id).await? {
-                channel.last_error = Some(message.into());
-                channel.failure_count = channel.failure_count.saturating_add(1);
-                channel.updated_at = Utc::now();
-                self.put_channel(&channel).await?;
+            let key = format!("channel-refresh:{}", model.id);
+            if self.background_job_by_key(&key).await?.is_some_and(|job| {
+                matches!(
+                    job.state,
+                    BackgroundJobState::Pending
+                        | BackgroundJobState::Running
+                        | BackgroundJobState::Retrying
+                        | BackgroundJobState::Waiting
+                )
+            }) {
+                continue;
             }
+            let id = Uuid::parse_str(&model.id)?;
+            self.finish_channel_run(
+                id,
+                ChannelRunStatus::Failed,
+                model.pack_id.as_deref().map(Uuid::parse_str).transpose()?,
+                Some("Service restarted during channel refresh"),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2388,6 +2903,40 @@ impl Database {
         }
         .insert(&transaction)
         .await?;
+        if let Some(model) = channel_config::Entity::find_by_id(channel_id)
+            .one(&transaction)
+            .await?
+        {
+            let mut config: ChannelConfig = serde_json::from_value(model.config_json)?;
+            config.last_attempt_at = Some(now);
+            config.last_error = None;
+            config.updated_at = now;
+            self.put_channel_on(&transaction, &config).await?;
+        }
+        self.enqueue_background_job_on(
+            &transaction,
+            EnqueueBackgroundJob {
+                deduplication_key: &format!("channel-refresh:{}", run.id),
+                kind: crate::background::REFRESH_CHANNEL,
+                payload: serde_json::json!({ "runId": run.id }),
+                provider_id: None,
+                lane: "channel",
+                priority: 25,
+                max_attempts: 8,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            },
+        )
+        .await?;
+        self.append_resource_change_event_on(
+            &transaction,
+            "channels,operations",
+            "channels,background-jobs",
+            "channel_run_started",
+            None,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(Some(run))
     }
@@ -2407,10 +2956,27 @@ impl Database {
         pack_id: Option<Uuid>,
         error: Option<&str>,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.finish_channel_run_on(&transaction, id, status, pack_id, error)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn finish_channel_run_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        id: Uuid,
+        status: ChannelRunStatus,
+        pack_id: Option<Uuid>,
+        error: Option<&str>,
+    ) -> Result<()> {
         if let Some(model) = channel_run::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+            .filter(channel_run::Column::Status.eq("running"))
+            .one(transaction)
             .await?
         {
+            let channel_id = model.channel_id.clone();
             let mut active = model.into_active_model();
             active.status = Set(channel_run_status(&status).into());
             active.pack_id = Set(pack_id.map(|value| value.to_string()));
@@ -2419,7 +2985,32 @@ impl Database {
             let now = Utc::now().to_rfc3339();
             active.updated_at = Set(now.clone());
             active.finished_at = Set(Some(now));
-            active.update(&self.connection).await?;
+            active.update(transaction).await?;
+            if let Some(model) = channel_config::Entity::find_by_id(channel_id)
+                .one(transaction)
+                .await?
+            {
+                let mut channel: ChannelConfig = serde_json::from_value(model.config_json)?;
+                if status == ChannelRunStatus::Successful {
+                    channel.last_successful_at = Some(Utc::now());
+                }
+                channel.last_error = error.map(|value| value.chars().take(500).collect());
+                channel.failure_count = if error.is_some() {
+                    channel.failure_count.saturating_add(1)
+                } else {
+                    0
+                };
+                channel.updated_at = Utc::now();
+                self.put_channel_on(transaction, &channel).await?;
+            }
+            self.append_resource_change_event_on(
+                transaction,
+                "channels,catalog",
+                "channels",
+                "channel_run_finished",
+                None,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2476,6 +3067,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn create_channel_pack(
         &self,
         channel_id: &str,
@@ -2484,8 +3076,66 @@ impl Database {
         preference_fingerprint: &str,
         items: &[ChannelPackItem],
     ) -> Result<Uuid> {
-        let id = Uuid::new_v4();
         let transaction = self.begin_write().await?;
+        let id = self
+            .create_channel_pack_on(
+                &transaction,
+                channel_id,
+                source_title,
+                partial,
+                preference_fingerprint,
+                items,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn publish_channel_run_pack(
+        &self,
+        run_id: Uuid,
+        source_title: &str,
+        partial: bool,
+        preference_fingerprint: &str,
+        items: &[ChannelPackItem],
+    ) -> Result<(Uuid, ChannelRunStatus)> {
+        let transaction = self.begin_write().await?;
+        let run = channel_run::Entity::find_by_id(run_id.to_string())
+            .filter(channel_run::Column::Status.eq("running"))
+            .one(&transaction)
+            .await?
+            .context("channel run no longer owns its publication")?;
+        let status = if partial {
+            ChannelRunStatus::Partial
+        } else {
+            ChannelRunStatus::Successful
+        };
+        let pack_id = self
+            .create_channel_pack_on(
+                &transaction,
+                &run.channel_id,
+                source_title,
+                partial,
+                preference_fingerprint,
+                items,
+            )
+            .await?;
+        self.finish_channel_run_on(&transaction, run_id, status.clone(), Some(pack_id), None)
+            .await?;
+        transaction.commit().await?;
+        Ok((pack_id, status))
+    }
+
+    async fn create_channel_pack_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        channel_id: &str,
+        source_title: &str,
+        partial: bool,
+        preference_fingerprint: &str,
+        items: &[ChannelPackItem],
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
         channel_pack::ActiveModel {
             id: Set(id.to_string()),
             channel_id: Set(channel_id.into()),
@@ -2497,7 +3147,7 @@ impl Database {
             created_at: Set(Utc::now().to_rfc3339()),
             decided_at: Set(None),
         }
-        .insert(&transaction)
+        .insert(transaction)
         .await?;
         for item in items {
             channel_pack_item::ActiveModel {
@@ -2505,10 +3155,9 @@ impl Database {
                 ordinal: Set(item.ordinal as i32),
                 item_json: Set(serde_json::to_value(item)?),
             }
-            .insert(&transaction)
+            .insert(transaction)
             .await?;
         }
-        transaction.commit().await?;
         Ok(id)
     }
 
@@ -2651,69 +3300,6 @@ impl Database {
         Ok(handled_directly)
     }
 
-    pub async fn replace_channel_plan(
-        &self,
-        id: Uuid,
-        fingerprint: &str,
-        items: &[ChannelPackItem],
-    ) -> Result<i32> {
-        let transaction = self.begin_write().await?;
-        let model = channel_pack::Entity::find_by_id(id.to_string())
-            .one(&transaction)
-            .await?
-            .context("channel pack disappeared")?;
-        let version = model.plan_version + 1;
-        let mut active = model.into_active_model();
-        active.plan_version = Set(version);
-        active.preference_fingerprint = Set(fingerprint.into());
-        active.update(&transaction).await?;
-        channel_pack_item::Entity::delete_many()
-            .filter(channel_pack_item::Column::PackId.eq(id.to_string()))
-            .exec(&transaction)
-            .await?;
-        for item in items {
-            channel_pack_item::ActiveModel {
-                pack_id: Set(id.to_string()),
-                ordinal: Set(item.ordinal as i32),
-                item_json: Set(serde_json::to_value(item)?),
-            }
-            .insert(&transaction)
-            .await?;
-        }
-        transaction.commit().await?;
-        Ok(version)
-    }
-
-    pub async fn update_channel_pack_item(
-        &self,
-        pack_id: Uuid,
-        item: &ChannelPackItem,
-    ) -> Result<()> {
-        if let Some(model) =
-            channel_pack_item::Entity::find_by_id((pack_id.to_string(), item.ordinal as i32))
-                .one(&self.connection)
-                .await?
-        {
-            let mut active = model.into_active_model();
-            active.item_json = Set(serde_json::to_value(item)?);
-            active.update(&self.connection).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn decide_channel_pack(&self, id: Uuid, decision: ChannelPackDecision) -> Result<()> {
-        if let Some(model) = channel_pack::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
-            .await?
-        {
-            let mut active = model.into_active_model();
-            active.decision = Set(channel_pack_decision(&decision).into());
-            active.decided_at = Set(Some(Utc::now().to_rfc3339()));
-            active.update(&self.connection).await?;
-        }
-        Ok(())
-    }
-
     pub async fn external_release_link(
         &self,
         provider: &str,
@@ -2766,13 +3352,44 @@ impl Database {
         score: Option<f64>,
         evidence_json: Value,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.put_external_release_link_on(
+            &transaction,
+            provider,
+            source_key,
+            release_id,
+            decision,
+            identity_fingerprint,
+            score,
+            evidence_json,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_external_release_link_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        provider: &str,
+        source_key: &str,
+        release_id: Uuid,
+        decision: &str,
+        identity_fingerprint: &str,
+        score: Option<f64>,
+        evidence_json: Value,
+    ) -> Result<()> {
         let provider = provider.to_ascii_lowercase();
         let now = Utc::now().to_rfc3339();
         if let Some(model) =
             external_release_link::Entity::find_by_id((provider.clone(), source_key.to_owned()))
-                .one(&self.connection)
+                .one(transaction)
                 .await?
         {
+            if model.decision == "manual" && decision != "manual" {
+                return Ok(());
+            }
             let mut active = model.into_active_model();
             active.release_id = Set(release_id.to_string());
             active.decision = Set(decision.to_owned());
@@ -2781,7 +3398,7 @@ impl Database {
             active.score = Set(score);
             active.evidence_json = Set(evidence_json);
             active.updated_at = Set(now);
-            active.update(&self.connection).await?;
+            active.update(transaction).await?;
         } else {
             external_release_link::ActiveModel {
                 provider: Set(provider),
@@ -2795,7 +3412,7 @@ impl Database {
                 created_at: Set(now.clone()),
                 updated_at: Set(now),
             }
-            .insert(&self.connection)
+            .insert(transaction)
             .await?;
         }
         Ok(())
@@ -2980,114 +3597,258 @@ impl Database {
         release_downloads_from_links(links)
     }
 
-    /// Ensure every observed torrent has a durable logical import record. Existing completed,
-    /// linked torrents are retained as baseline history and are never cleanup candidates.
+    /// Repair older observations in bounded transactions. Current writes reconcile their
+    /// import directly, in the same transaction as the observation.
     pub async fn sync_import_tasks(&self) -> Result<()> {
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let mut query = download_release_link::Entity::find()
+                .order_by_asc(download_release_link::Column::Client)
+                .order_by_asc(download_release_link::Column::InfoHash)
+                .limit(DOWNLOAD_WRITE_BATCH_SIZE as u64);
+            if let Some((client, hash)) = &after {
+                query = query.filter(
+                    Condition::any()
+                        .add(download_release_link::Column::Client.gt(client))
+                        .add(
+                            Condition::all()
+                                .add(download_release_link::Column::Client.eq(client))
+                                .add(download_release_link::Column::InfoHash.gt(hash)),
+                        ),
+                );
+            }
+            let transaction = self.begin_write().await?;
+            let links = query.all(&transaction).await?;
+            let Some(last) = links.last() else {
+                return Ok(());
+            };
+            after = Some((last.client.clone(), last.info_hash.clone()));
+            for link in links {
+                self.sync_import_link_on(&transaction, link).await?;
+            }
+            transaction.commit().await?;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub async fn sync_import_link(&self, client: &str, hash: &str) -> Result<()> {
         let transaction = self.begin_write().await?;
-        let supersessions = import_supersession::Entity::find()
-            .all(&transaction)
-            .await?;
-        let explicit = supersessions
-            .iter()
-            .map(|value| value.import_task_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let superseded_downloads = supersessions
-            .iter()
-            .map(|value| {
-                (
-                    value.source_client.clone(),
-                    value.source_info_hash.to_ascii_lowercase(),
-                )
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let links = download_release_link::Entity::find()
-            .order_by_asc(download_release_link::Column::FirstSeenAt)
-            .all(&transaction)
-            .await?;
-        let mut existing_by_download = import_task::Entity::find()
-            .filter(import_task::Column::Client.is_not_null())
-            .filter(import_task::Column::InfoHash.is_not_null())
-            .all(&transaction)
-            .await?
-            .into_iter()
-            .filter_map(|task| Some(((task.client.clone()?, task.info_hash.clone()?), task)))
-            .collect::<HashMap<_, _>>();
-        for link in links {
-            let existing =
-                existing_by_download.remove(&(link.client.clone(), link.info_hash.clone()));
-            if existing
-                .as_ref()
-                .is_some_and(|task| explicit.contains(&task.id))
-                || (existing.is_some()
-                    && superseded_downloads
-                        .contains(&(link.client.clone(), link.info_hash.to_ascii_lowercase())))
-            {
-                continue;
-            }
-            let live = link
-                .observed_json
-                .clone()
-                .map(serde_json::from_value::<LiveDownloadStatus>)
-                .transpose()?;
-            let (state, reason) = import_state_for_link(&link, live.as_ref());
-            let now = Utc::now().to_rfc3339();
-            if let Some(model) = existing {
-                let mut active = model.into_active_model();
-                active.release_id = Set(link.release_id.clone());
-                active.tracker = Set(link.tracker.clone());
-                active.torrent_id = Set(link.torrent_id);
-                active.display_name = Set(link
-                    .torrent_name
-                    .clone()
-                    .unwrap_or_else(|| link.info_hash.clone()));
-                active.state = Set(import_task_state_name(&state).into());
-                active.reason = Set(reason);
-                active.error_message = Set(link.error_message.clone());
-                active.updated_at = Set(now);
-                active.completed_at = Set(matches!(state, ImportTaskState::Complete).then(|| {
-                    link.completed_at
-                        .clone()
-                        .unwrap_or_else(|| Utc::now().to_rfc3339())
-                }));
-                active.update(&transaction).await?;
-            } else {
-                let baseline = matches!(state, ImportTaskState::Complete)
-                    && link.release_id.is_some()
-                    && link.completed_at.is_some();
-                import_task::ActiveModel {
-                    id: Set(Uuid::new_v4().to_string()),
-                    client: Set(Some(link.client)),
-                    info_hash: Set(Some(link.info_hash.clone())),
-                    download_job_id: Set(None),
-                    release_id: Set(link.release_id),
-                    tracker: Set(link.tracker),
-                    torrent_id: Set(link.torrent_id),
-                    display_name: Set(link.torrent_name.unwrap_or(link.info_hash)),
-                    state: Set(import_task_state_name(&state).into()),
-                    reason: Set(reason),
-                    error_message: Set(link.error_message),
-                    baseline: Set(baseline),
-                    created_at: Set(link.first_seen_at),
-                    updated_at: Set(now),
-                    completed_at: Set(matches!(state, ImportTaskState::Complete)
-                        .then(|| link.completed_at.unwrap_or_else(|| Utc::now().to_rfc3339()))),
-                }
-                .insert(&transaction)
-                .await?;
-            }
+        if let Some(link) = download_release_link::Entity::find_by_id((
+            client.to_owned(),
+            hash.to_ascii_lowercase(),
+        ))
+        .one(&transaction)
+        .await?
+        {
+            self.sync_import_link_on(&transaction, link).await?;
         }
         transaction.commit().await?;
         Ok(())
     }
 
+    pub async fn sync_client_instances(&self, instances: &HashMap<String, String>) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        transaction
+            .execute_unprepared("DELETE FROM configured_client_instances")
+            .await?;
+        for (name, instance) in instances {
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "INSERT INTO configured_client_instances(client, instance) VALUES (?, ?)",
+                    [name.as_str().into(), instance.as_str().into()],
+                ))
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn ensure_physical_import_target_on<C: ConnectionTrait>(
+        &self,
+        transaction: &C,
+        client: &str,
+        hash: &str,
+    ) -> Result<()> {
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "INSERT INTO physical_import_targets(client, info_hash) VALUES (?, ?)
+             ON CONFLICT(client, info_hash) DO NOTHING",
+                [client.into(), hash.to_ascii_lowercase().into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn import_client_matches(
+        &self,
+        id: Uuid,
+        client: &str,
+        hash: &str,
+        source: bool,
+        configured: Option<&str>,
+    ) -> Result<bool> {
+        let sql = if source {
+            "SELECT client_instance AS identity FROM import_supersessions
+              WHERE import_task_id = ? AND source_client = ? AND source_info_hash = ?"
+        } else {
+            "SELECT target_instance AS identity FROM import_tasks
+              WHERE id = ? AND client = ? AND info_hash = ?"
+        };
+        let row = self
+            .connection
+            .query_one_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                sql,
+                [
+                    id.to_string().into(),
+                    client.into(),
+                    hash.to_ascii_lowercase().into(),
+                ],
+            ))
+            .await?;
+        let Some(row) = row else { return Ok(false) };
+        Ok(row.try_get::<Option<String>>("", "identity")?.as_deref() == configured)
+    }
+
+    async fn sync_import_link_on<C: ConnectionTrait>(
+        &self,
+        transaction: &C,
+        link: download_release_link::Model,
+    ) -> Result<()> {
+        self.ensure_physical_import_target_on(transaction, &link.client, &link.info_hash)
+            .await?;
+        let existing = import_task::Entity::find()
+            .filter(import_task::Column::Client.eq(&link.client))
+            .filter(import_task::Column::InfoHash.eq(&link.info_hash))
+            .order_by_desc(import_task::Column::DownloadJobId)
+            .one(transaction)
+            .await?;
+        if let Some(task) = &existing {
+            if task.state == "dismissed"
+                || task.download_job_id.is_some()
+                || import_supersession::Entity::find()
+                    .filter(
+                        Condition::any()
+                            .add(import_supersession::Column::ImportTaskId.eq(&task.id))
+                            .add(
+                                Condition::all()
+                                    .add(import_supersession::Column::SourceClient.eq(&link.client))
+                                    .add(
+                                        import_supersession::Column::SourceInfoHash
+                                            .eq(&link.info_hash),
+                                    ),
+                            ),
+                    )
+                    .one(transaction)
+                    .await?
+                    .is_some()
+            {
+                return Ok(());
+            }
+        }
+        let live = link
+            .observed_json
+            .clone()
+            .map(serde_json::from_value::<LiveDownloadStatus>)
+            .transpose()?;
+        let (state, reason) = import_state_for_link(&link, live.as_ref());
+        let state_name = import_task_state_name(&state);
+        let now = Utc::now().to_rfc3339();
+        let completed = (state == ImportTaskState::Complete).then(|| {
+            link.completed_at
+                .clone()
+                .or_else(|| existing.as_ref().and_then(|task| task.completed_at.clone()))
+                .unwrap_or_else(|| now.clone())
+        });
+        let name = link.torrent_name.unwrap_or_else(|| link.info_hash.clone());
+        if let Some(model) = existing {
+            if model.release_id == link.release_id
+                && model.tracker == link.tracker
+                && model.torrent_id == link.torrent_id
+                && model.display_name == name
+                && model.state == state_name
+                && model.reason == reason
+                && model.error_message == link.error_message
+                && model.completed_at == completed
+            {
+                return Ok(());
+            }
+            let mut active = model.into_active_model();
+            active.release_id = Set(link.release_id);
+            active.tracker = Set(link.tracker);
+            active.torrent_id = Set(link.torrent_id);
+            active.display_name = Set(name);
+            active.state = Set(state_name.into());
+            active.reason = Set(reason);
+            active.error_message = Set(link.error_message);
+            active.updated_at = Set(now);
+            active.completed_at = Set(completed);
+            active.update(transaction).await?;
+        } else {
+            let baseline = state == ImportTaskState::Complete
+                && link.release_id.is_some()
+                && link.completed_at.is_some();
+            import_task::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                client: Set(Some(link.client)),
+                info_hash: Set(Some(link.info_hash)),
+                download_job_id: Set(None),
+                release_id: Set(link.release_id),
+                tracker: Set(link.tracker),
+                torrent_id: Set(link.torrent_id),
+                display_name: Set(name),
+                state: Set(state_name.into()),
+                reason: Set(reason),
+                error_message: Set(link.error_message),
+                baseline: Set(baseline),
+                created_at: Set(link.first_seen_at),
+                updated_at: Set(now),
+                completed_at: Set(completed),
+            }
+            .insert(transaction)
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub async fn create_replacement_import(
         &self,
         request: CreateReplacementImport<'_>,
     ) -> Result<Uuid> {
-        let existing = if let Some(job_id) = request.download_job_id {
+        let transaction = self.begin_write().await?;
+        let id = self
+            .create_replacement_import_on(&transaction, request)
+            .await?;
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    async fn create_replacement_import_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        request: CreateReplacementImport<'_>,
+    ) -> Result<Uuid> {
+        if let Some(key) = request.request_key
+            && let Some(row) = transaction
+                .query_one_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "SELECT import_id FROM replacement_import_receipts WHERE request_key = ?",
+                    [key.into()],
+                ))
+                .await?
+        {
+            return Ok(Uuid::parse_str(&row.try_get::<String>("", "import_id")?)?);
+        }
+        let existing = if let Some(job_id) = request
+            .download_job_id
+            .filter(|_| request.request_key.is_none())
+        {
             import_task::Entity::find()
                 .filter(import_task::Column::DownloadJobId.eq(job_id.to_string()))
-                .one(&self.connection)
+                .one(transaction)
                 .await?
         } else if let (Some(client), Some(info_hash)) =
             (request.target_client, request.target_info_hash)
@@ -3095,7 +3856,9 @@ impl Database {
             import_task::Entity::find()
                 .filter(import_task::Column::Client.eq(client))
                 .filter(import_task::Column::InfoHash.eq(info_hash.to_ascii_lowercase()))
-                .one(&self.connection)
+                .filter(import_task::Column::DownloadJobId.is_null())
+                .filter(Expr::cust("NOT EXISTS (SELECT 1 FROM import_supersessions WHERE import_task_id = import_tasks.id)"))
+                .one(transaction)
                 .await?
         } else {
             None
@@ -3124,7 +3887,7 @@ impl Database {
             active.baseline = Set(false);
             active.updated_at = Set(now.clone());
             active.completed_at = Set(None);
-            active.update(&self.connection).await?;
+            active.update(transaction).await?;
             id
         } else {
             let id = Uuid::new_v4();
@@ -3147,26 +3910,41 @@ impl Database {
                 updated_at: Set(now.clone()),
                 completed_at: Set(None),
             }
-            .insert(&self.connection)
+            .insert(transaction)
             .await?;
             id
         };
+        if let (Some(client), Some(hash)) = (request.target_client, request.target_info_hash) {
+            self.ensure_physical_import_target_on(transaction, client, hash)
+                .await?;
+            transaction.execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "UPDATE import_tasks SET target_instance =
+                   (SELECT instance FROM configured_client_instances WHERE client = ?) WHERE id = ?",
+                [client.into(), id.to_string().into()],
+            )).await?;
+        }
+        if let Some(key) = request.request_key {
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "INSERT INTO replacement_import_receipts(request_key, import_id) VALUES (?, ?)",
+                    [key.into(), id.to_string().into()],
+                ))
+                .await?;
+        }
         for source in request.sources {
             let key = (
                 id.to_string(),
                 source.client.clone(),
                 source.info_hash.to_ascii_lowercase(),
             );
-            if let Some(model) = import_supersession::Entity::find_by_id(key.clone())
-                .one(&self.connection)
+            if import_supersession::Entity::find_by_id(key.clone())
+                .one(transaction)
                 .await?
+                .is_some()
             {
-                let mut active = model.into_active_model();
-                active.cleanup_mode = Set(request.cleanup_mode.as_str().into());
-                active.cleanup_state = Set("pending".into());
-                active.reason = Set(None);
-                active.updated_at = Set(now.clone());
-                active.update(&self.connection).await?;
+                continue;
             } else {
                 import_supersession::ActiveModel {
                     import_task_id: Set(key.0),
@@ -3177,11 +3955,27 @@ impl Database {
                     cleanup_mode: Set(request.cleanup_mode.as_str().into()),
                     cleanup_state: Set("pending".into()),
                     reason: Set(None),
+                    scan_section: Set(None),
+                    scan_root: Set(None),
                     updated_at: Set(now.clone()),
                 }
-                .insert(&self.connection)
+                .insert(transaction)
                 .await?;
             }
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "UPDATE import_supersessions SET client_instance =
+                    (SELECT instance FROM configured_client_instances WHERE client = ?)
+                 WHERE import_task_id = ? AND source_client = ? AND source_info_hash = ?",
+                    [
+                        source.client.clone().into(),
+                        id.to_string().into(),
+                        source.client.clone().into(),
+                        source.info_hash.to_ascii_lowercase().into(),
+                    ],
+                ))
+                .await?;
             import_task::Entity::update_many()
                 .col_expr(import_task::Column::State, Expr::value("processing"))
                 .col_expr(
@@ -3192,7 +3986,8 @@ impl Database {
                 .filter(import_task::Column::Client.eq(&source.client))
                 .filter(import_task::Column::InfoHash.eq(source.info_hash.to_ascii_lowercase()))
                 .filter(import_task::Column::Id.ne(id.to_string()))
-                .exec(&self.connection)
+                .filter(Expr::cust("NOT EXISTS (SELECT 1 FROM import_supersessions WHERE import_task_id = import_tasks.id)"))
+                .exec(transaction)
                 .await?;
         }
         Ok(id)
@@ -3204,9 +3999,23 @@ impl Database {
         state: ImportTaskState,
         reason: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.set_superseded_source_states_on(&transaction, import_id, state, reason)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn set_superseded_source_states_on<C: ConnectionTrait>(
+        &self,
+        transaction: &C,
+        import_id: Uuid,
+        state: ImportTaskState,
+        reason: &str,
+    ) -> Result<()> {
         let sources = import_supersession::Entity::find()
             .filter(import_supersession::Column::ImportTaskId.eq(import_id.to_string()))
-            .all(&self.connection)
+            .all(transaction)
             .await?;
         let now = Utc::now().to_rfc3339();
         for source in sources {
@@ -3227,24 +4036,71 @@ impl Database {
                 .filter(import_task::Column::Client.eq(source.source_client))
                 .filter(import_task::Column::InfoHash.eq(source.source_info_hash))
                 .filter(import_task::Column::Id.ne(import_id.to_string()))
-                .exec(&self.connection)
+                .filter(Expr::cust("NOT EXISTS (SELECT 1 FROM import_supersessions WHERE import_task_id = import_tasks.id)"))
+                .exec(transaction)
                 .await?;
         }
         Ok(())
     }
 
-    pub async fn bind_import_target(&self, id: Uuid, client: &str, info_hash: &str) -> Result<()> {
-        if let Some(model) = import_task::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+    pub async fn bind_import_target(
+        &self,
+        id: Uuid,
+        client: &str,
+        info_hash: &str,
+    ) -> Result<bool> {
+        let transaction = self.begin_write().await?;
+        let hash = info_hash.to_ascii_lowercase();
+        let Some(model) = import_task::Entity::find_by_id(id.to_string())
+            .one(&transaction)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if model.client.as_deref() == Some(client) && model.info_hash.as_deref() == Some(&hash) {
+            return Ok(true);
+        }
+        self.ensure_physical_import_target_on(&transaction, client, &hash)
+            .await?;
+        if let Some(observed) = import_task::Entity::find()
+            .filter(import_task::Column::Client.eq(client))
+            .filter(import_task::Column::InfoHash.eq(&hash))
+            .filter(import_task::Column::DownloadJobId.is_null())
+            .filter(Expr::cust("NOT EXISTS (SELECT 1 FROM import_supersessions WHERE import_task_id = import_tasks.id)"))
+            .one(&transaction)
             .await?
         {
-            let mut active = model.into_active_model();
-            active.client = Set(Some(client.into()));
-            active.info_hash = Set(Some(info_hash.to_ascii_lowercase()));
-            active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            transaction.execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "INSERT INTO import_observation_aliases(observation_id, import_id) VALUES (?, ?)
+                 ON CONFLICT(observation_id) DO NOTHING",
+                [observed.id.clone().into(), id.to_string().into()],
+            )).await?;
+            let mut historical = observed.into_active_model();
+            historical.client = Set(None);
+            historical.info_hash = Set(None);
+            historical.state = Set("dismissed".into());
+            historical.reason = Set(Some(format!(
+                "Observation adopted by replacement import {id}"
+            )));
+            historical.update(&transaction).await?;
         }
-        Ok(())
+        let expected_job = model.download_job_id.clone();
+        let mut active = model.into_active_model();
+        active.client = Set(Some(client.into()));
+        active.info_hash = Set(Some(hash));
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&transaction).await?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "UPDATE import_tasks SET target_instance =
+                (SELECT client_instance FROM download_destinations WHERE job_id = ?) WHERE id = ?",
+                [expected_job.into(), id.to_string().into()],
+            ))
+            .await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     pub async fn set_import_state(
@@ -3254,8 +4110,23 @@ impl Database {
         reason: Option<&str>,
         error: Option<&str>,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.set_import_state_on(&transaction, id, state, reason, error)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn set_import_state_on<C: ConnectionTrait>(
+        &self,
+        transaction: &C,
+        id: Uuid,
+        state: ImportTaskState,
+        reason: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
         if let Some(model) = import_task::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+            .one(transaction)
             .await?
         {
             let mut active = model.into_active_model();
@@ -3265,7 +4136,7 @@ impl Database {
             active.updated_at = Set(Utc::now().to_rfc3339());
             active.completed_at =
                 Set(matches!(state, ImportTaskState::Complete).then(|| Utc::now().to_rfc3339()));
-            active.update(&self.connection).await?;
+            active.update(transaction).await?;
         }
         Ok(())
     }
@@ -3278,20 +4149,156 @@ impl Database {
         state: &str,
         reason: Option<&str>,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         if let Some(model) = import_supersession::Entity::find_by_id((
             import_id.to_string(),
             client.to_owned(),
             info_hash.to_ascii_lowercase(),
         ))
-        .one(&self.connection)
+        .one(&transaction)
         .await?
         {
             let mut active = model.into_active_model();
             active.cleanup_state = Set(state.into());
             active.reason = Set(reason.map(str::to_owned));
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(&transaction).await?;
         }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_cleanup_intent(
+        &self,
+        id: Uuid,
+        client: &str,
+        hash: &str,
+        target: &PlexScanTarget,
+    ) -> Result<bool> {
+        let transaction = self.begin_write().await?;
+        let hash = hash.to_ascii_lowercase();
+        if import_supersession::Entity::find()
+            .filter(import_supersession::Column::SourceClient.eq(client))
+            .filter(import_supersession::Column::SourceInfoHash.eq(&hash))
+            .filter(import_supersession::Column::ImportTaskId.ne(id.to_string()))
+            .filter(import_supersession::Column::CleanupState.eq("removing"))
+            .one(&transaction)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let row =
+            import_supersession::Entity::find_by_id((id.to_string(), client.to_owned(), hash))
+                .one(&transaction)
+                .await?
+                .context("cleanup obligation disappeared")?;
+        let mut active = row.into_active_model();
+        active.cleanup_state = Set("removing".into());
+        active.scan_section = Set(Some(i64::from(target.section_id)));
+        active.scan_root = Set(Some(target.root.clone()));
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&transaction).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn settle_cleanup_removal(
+        &self,
+        id: Uuid,
+        client: &str,
+        hash: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        let hash = hash.to_ascii_lowercase();
+        let row = import_supersession::Entity::find_by_id((
+            id.to_string(),
+            client.to_owned(),
+            hash.clone(),
+        ))
+        .one(&transaction)
+        .await?
+        .context("cleanup obligation disappeared")?;
+        if row.cleanup_state == "removed" {
+            return Ok(());
+        }
+        if let (Some(section), Some(root)) = (row.scan_section, &row.scan_root) {
+            self.enqueue_background_job_on(
+                &transaction,
+                EnqueueBackgroundJob {
+                    deduplication_key: &format!("cleanup-plex:{id}:{client}:{hash}"),
+                    kind: crate::background::NOTIFY_PLEX,
+                    payload: serde_json::json!({ "sectionId": section, "root": root }),
+                    provider_id: Some("plex".into()),
+                    lane: "event",
+                    priority: 30,
+                    max_attempts: 10,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
+            .await?;
+        }
+        let mut active = row.into_active_model();
+        active.cleanup_state = Set("removed".into());
+        active.reason = Set(Some(reason.into()));
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&transaction).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_scan_status(&self, id: Uuid) -> Result<CleanupScanStatus> {
+        let sources = import_supersession::Entity::find()
+            .filter(import_supersession::Column::ImportTaskId.eq(id.to_string()))
+            .filter(import_supersession::Column::CleanupState.eq("removed"))
+            .filter(import_supersession::Column::ScanRoot.is_not_null())
+            .all(&self.connection)
+            .await?;
+        let mut status = CleanupScanStatus::Complete;
+        for source in sources {
+            let key = format!(
+                "cleanup-plex:{id}:{}:{}",
+                source.source_client, source.source_info_hash
+            );
+            let job = background_job::Entity::find()
+                .filter(background_job::Column::DeduplicationKey.eq(key))
+                .one(&self.connection)
+                .await?;
+            match job.as_ref().map(|job| job.state.as_str()) {
+                Some("completed") => {}
+                Some("failed" | "cancelled") => return Ok(CleanupScanStatus::Failed),
+                Some(_) => status = CleanupScanStatus::Pending,
+                None => return Ok(CleanupScanStatus::Failed),
+            }
+        }
+        Ok(status)
+    }
+
+    pub async fn finish_import_and_sources(
+        &self,
+        id: Uuid,
+        state: ImportTaskState,
+        reason: &str,
+        source_state: ImportTaskState,
+        source_reason: &str,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.set_import_state_on(&transaction, id, state, Some(reason), None)
+            .await?;
+        self.set_superseded_source_states_on(&transaction, id, source_state, source_reason)
+            .await?;
+        self.append_resource_change_event_on(
+            &transaction,
+            "activity,operations",
+            "imports,background-jobs",
+            "import_transition",
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -4256,193 +5263,6 @@ impl Database {
         Ok(())
     }
 
-    pub async fn create_job(
-        &self,
-        tracker: &str,
-        torrent_id: i64,
-        profile: &str,
-        use_token: bool,
-        idempotency_key: Option<&str>,
-    ) -> Result<(DownloadJob, bool)> {
-        let transaction = self.begin_write().await?;
-        if let Some(idempotency_key) = idempotency_key
-            && let Some(model) = download_job::Entity::find()
-                .filter(download_job::Column::IdempotencyKey.eq(idempotency_key))
-                .one(&transaction)
-                .await?
-        {
-            let existing = job_from_model(model)?;
-            if matches!(
-                existing.state,
-                DownloadState::Queued | DownloadState::FetchingMetadata | DownloadState::Submitting
-            ) {
-                self.ensure_download_submission_on(&transaction, &existing, false)
-                    .await?;
-            }
-            transaction.commit().await?;
-            return Ok((existing, false));
-        }
-        if let Some(model) = download_job::Entity::find()
-            .filter(download_job::Column::Tracker.eq(tracker))
-            .filter(download_job::Column::TorrentId.eq(torrent_id))
-            .filter(download_job::Column::Profile.eq(profile))
-            .one(&transaction)
-            .await?
-        {
-            let existing = job_from_model(model.clone())?;
-            if existing.state == DownloadState::Failed {
-                let now = Utc::now();
-                let mut active = model.into_active_model();
-                active.idempotency_key = Set(idempotency_key.map(str::to_owned));
-                active.use_token = Set(use_token);
-                active.group_id = Set(None);
-                active.info_hash = Set(None);
-                active.name = Set(None);
-                active.state = Set("queued".into());
-                active.progress = Set(0.0);
-                active.download_speed = Set(0);
-                active.upload_speed = Set(0);
-                active.eta = Set(None);
-                active.error_code = Set(None);
-                active.error_message = Set(None);
-                active.updated_at = Set(now.to_rfc3339());
-                active.update(&transaction).await?;
-                self.add_event_on(&transaction, existing.id, &DownloadState::Queued, None)
-                    .await?;
-                let job = DownloadJob {
-                    use_token,
-                    group_id: None,
-                    info_hash: None,
-                    name: None,
-                    state: DownloadState::Queued,
-                    progress: 0.0,
-                    download_speed: 0,
-                    upload_speed: 0,
-                    eta: None,
-                    error_code: None,
-                    error_message: None,
-                    updated_at: now,
-                    ..existing
-                };
-                self.ensure_download_submission_on(&transaction, &job, true)
-                    .await?;
-                transaction.commit().await?;
-                return Ok((job, true));
-            }
-            if matches!(
-                existing.state,
-                DownloadState::Queued | DownloadState::FetchingMetadata | DownloadState::Submitting
-            ) {
-                self.ensure_download_submission_on(&transaction, &existing, false)
-                    .await?;
-            }
-            transaction.commit().await?;
-            return Ok((existing, false));
-        }
-        let now = Utc::now();
-        let job = DownloadJob {
-            id: Uuid::new_v4(),
-            tracker: tracker.into(),
-            torrent_id,
-            group_id: None,
-            profile: profile.into(),
-            use_token,
-            info_hash: None,
-            name: None,
-            state: DownloadState::Queued,
-            progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
-            eta: None,
-            error_code: None,
-            error_message: None,
-            created_at: now,
-            updated_at: now,
-        };
-        download_job::ActiveModel {
-            id: Set(job.id.to_string()),
-            idempotency_key: Set(idempotency_key.map(str::to_owned)),
-            tracker: Set(tracker.into()),
-            torrent_id: Set(torrent_id),
-            group_id: Set(None),
-            profile: Set(profile.into()),
-            use_token: Set(use_token),
-            info_hash: Set(None),
-            name: Set(None),
-            state: Set(job.state.as_str().into()),
-            progress: Set(0.0),
-            download_speed: Set(0),
-            upload_speed: Set(0),
-            eta: Set(None),
-            error_code: Set(None),
-            error_message: Set(None),
-            created_at: Set(now.to_rfc3339()),
-            updated_at: Set(now.to_rfc3339()),
-        }
-        .insert(&transaction)
-        .await?;
-        self.add_event_on(&transaction, job.id, &job.state, None)
-            .await?;
-        self.ensure_download_submission_on(&transaction, &job, true)
-            .await?;
-        transaction.commit().await?;
-        Ok((job, true))
-    }
-
-    async fn ensure_download_submission_on<C: ConnectionTrait>(
-        &self,
-        connection: &C,
-        job: &DownloadJob,
-        rearm: bool,
-    ) -> Result<Uuid> {
-        let key = format!("submit-download:{}:v1", job.id);
-        if let Some(model) = background_job::Entity::find()
-            .filter(background_job::Column::DeduplicationKey.eq(&key))
-            .one(connection)
-            .await?
-        {
-            let id = Uuid::parse_str(&model.id)?;
-            let should_rearm =
-                rearm || matches!(model.state.as_str(), "completed" | "failed" | "cancelled");
-            let mut active = model.into_active_model();
-            active.provider_id = Set(Some(format!("tracker:{}", job.tracker)));
-            active.lane = Set("download".into());
-            active.priority = Set(100);
-            active.max_attempts = Set(20);
-            active.updated_at = Set(Utc::now().to_rfc3339());
-            if should_rearm {
-                active.state = Set("pending".into());
-                active.attempts = Set(0);
-                active.deferrals = Set(0);
-                active.next_run_at = Set(None);
-                active.lease_owner = Set(None);
-                active.lease_until = Set(None);
-                active.last_error_code = Set(None);
-                active.last_error_message = Set(None);
-                active.finished_at = Set(None);
-                active.cancelled_at = Set(None);
-            }
-            active.update(connection).await?;
-            return Ok(id);
-        }
-        self.enqueue_background_job_on(
-            connection,
-            EnqueueBackgroundJob {
-                deduplication_key: &key,
-                kind: "submit_download",
-                payload: serde_json::json!({ "jobId": job.id }),
-                provider_id: Some(format!("tracker:{}", job.tracker)),
-                lane: "download",
-                priority: 100,
-                max_attempts: 20,
-                next_run_at: None,
-                parent_id: None,
-                recurring_interval_seconds: None,
-            },
-        )
-        .await
-    }
-
     pub async fn ensure_incomplete_download_submissions(&self) -> Result<u64> {
         let transaction = self.begin_write().await?;
         let models = download_job::Entity::find()
@@ -4470,8 +5290,9 @@ impl Database {
         info_hash: &str,
         name: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         if let Some(model) = download_job::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+            .one(&transaction)
             .await?
         {
             let mut active = model.into_active_model();
@@ -4479,19 +5300,54 @@ impl Database {
             active.info_hash = Set(Some(info_hash.into()));
             active.name = Set(Some(name.into()));
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(&transaction).await?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn set_job_state(
         &self,
         id: Uuid,
         state: DownloadState,
         error: Option<(&str, &str)>,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        self.set_job_state_on(&transaction, id, state, error)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_submission_state(
+        &self,
+        claim: (Uuid, &str),
+        id: Uuid,
+        state: DownloadState,
+        error: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        anyhow::ensure!(
+            self.owns_background_job_on(&transaction, claim.0, claim.1)
+                .await?,
+            "Submission claim has expired"
+        );
+        self.set_job_state_on(&transaction, id, state, error)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn set_job_state_on(
+        &self,
+        db: &DatabaseTransaction,
+        id: Uuid,
+        state: DownloadState,
+        error: Option<(&str, &str)>,
+    ) -> Result<()> {
         if let Some(model) = download_job::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+            .one(db)
             .await?
         {
             let mut active = model.into_active_model();
@@ -4499,15 +5355,61 @@ impl Database {
             active.error_code = Set(error.map(|(code, _)| code.to_owned()));
             active.error_message = Set(error.map(|(_, message)| message.to_owned()));
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(db).await?;
         }
-        self.add_event(id, &state, error.map(|(_, message)| message))
+        self.add_event_on(db, id, &state, error.map(|(_, message)| message))
             .await?;
         Ok(())
     }
 
-    pub async fn update_progress(
+    pub async fn confirm_submission(
         &self,
+        claim: (Uuid, &str),
+        id: Uuid,
+        live: &LiveDownloadStatus,
+    ) -> Result<()> {
+        let transaction = self.begin_write().await?;
+        anyhow::ensure!(
+            self.owns_background_job_on(&transaction, claim.0, claim.1)
+                .await?,
+            "Submission claim has expired"
+        );
+        let model = download_job::Entity::find_by_id(id.to_string())
+            .one(&transaction)
+            .await?
+            .context("Confirmed download job disappeared")?;
+        let state = if live.progress >= 1.0 {
+            DownloadState::Complete
+        } else {
+            DownloadState::Active
+        };
+        let mut active = model.into_active_model();
+        active.state = Set(state.as_str().into());
+        active.progress = Set(live.progress);
+        active.download_speed = Set(live.download_speed);
+        active.upload_speed = Set(live.upload_speed);
+        active.eta = Set(live.eta);
+        active.error_code = Set(None);
+        active.error_message = Set(None);
+        active.updated_at = Set(Utc::now().to_rfc3339());
+        active.update(&transaction).await?;
+        self.add_event_on(&transaction, id, &state, None).await?;
+        self.append_resource_change_event_on(
+            &transaction,
+            "activity,operations",
+            "download-jobs",
+            "download_confirmed",
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_progress_on<C: ConnectionTrait>(
+        &self,
+        db: &C,
         id: Uuid,
         state: DownloadState,
         progress: f64,
@@ -4516,7 +5418,7 @@ impl Database {
         eta: Option<i64>,
     ) -> Result<()> {
         if let Some(model) = download_job::Entity::find_by_id(id.to_string())
-            .one(&self.connection)
+            .one(db)
             .await?
         {
             let mut active = model.into_active_model();
@@ -4526,9 +5428,44 @@ impl Database {
             active.upload_speed = Set(upload_speed);
             active.eta = Set(eta);
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            active.update(db).await?;
         }
         Ok(())
+    }
+
+    async fn jobs_for_client_observation_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        client: &str,
+        profiles: &[String],
+        hashes: &[String],
+        full_update: bool,
+    ) -> Result<Vec<DownloadJob>> {
+        let destination = Expr::cust_with_values(
+            "EXISTS (SELECT 1 FROM download_destinations d WHERE d.job_id = download_jobs.id AND d.client = ?)",
+            [client],
+        );
+        let legacy = Condition::all().add(download_job::Column::Profile.is_in(profiles.iter().cloned()))
+            .add(Expr::cust("NOT EXISTS (SELECT 1 FROM download_destinations d WHERE d.job_id = download_jobs.id)"));
+        let query = download_job::Entity::find()
+            .filter(Condition::any().add(destination).add(legacy))
+            .filter(download_job::Column::InfoHash.is_not_null())
+            .filter(download_job::Column::State.is_in(["active", "complete", "unknown"]));
+        let mut rows = Vec::new();
+        if full_update {
+            rows = query.all(transaction).await?;
+        } else {
+            for batch in hashes.chunks(500) {
+                rows.extend(
+                    query
+                        .clone()
+                        .filter(download_job::Column::InfoHash.is_in(batch.iter().cloned()))
+                        .all(transaction)
+                        .await?,
+                );
+            }
+        }
+        rows.into_iter().map(job_from_model).collect()
     }
 
     pub async fn list_jobs(&self) -> Result<Vec<DownloadJob>> {
@@ -7065,7 +8002,8 @@ impl Database {
         let should_resolve;
         let reactivate_resolution;
         let newly_completed;
-        if let Some(model) =
+        let import_changed;
+        let link = if let Some(model) =
             download_release_link::Entity::find_by_id((live.client.clone(), hash.clone()))
                 .one(transaction)
                 .await?
@@ -7090,6 +8028,10 @@ impl Database {
                 .added_at
                 .map(|value| value.to_rfc3339())
                 .or_else(|| model.client_added_at.clone());
+            import_changed = newly_completed
+                || !model.present
+                || tracker_changed
+                || torrent_name.is_some_and(|name| model.torrent_name.as_deref() != Some(name));
             let mut active = model.into_active_model();
             active.announce_host = Set(announce_host.map(str::to_owned));
             if let Some(torrent_name) = torrent_name {
@@ -7114,8 +8056,9 @@ impl Database {
             if !has_completed_at && completed_at.is_some() {
                 active.completed_at = Set(completed_at);
             }
-            active.update(transaction).await?;
+            active.update(transaction).await?
         } else {
+            import_changed = true;
             reactivate_resolution = false;
             newly_completed = completed_at.is_some();
             should_resolve = tracker.is_some();
@@ -7145,7 +8088,10 @@ impl Database {
                 client_added_at: Set(live.added_at.map(|value| value.to_rfc3339())),
             }
             .insert(transaction)
-            .await?;
+            .await?
+        };
+        if import_changed {
+            self.sync_import_link_on(transaction, link).await?;
         }
         if should_resolve && let Some(tracker) = tracker {
             let key = format!("resolve-hash:{}:{hash}:v3", tracker.to_ascii_lowercase());
@@ -7481,73 +8427,81 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn complete_client_scan(
         &self,
         client: &str,
         scan_started_at: DateTime<Utc>,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let stale = download_release_link::Entity::find()
-            .filter(download_release_link::Column::Client.eq(client))
-            .filter(download_release_link::Column::LastSeenAt.lt(scan_started_at.to_rfc3339()))
-            .all(&self.connection)
-            .await?;
-        let batch_count = stale.len().div_ceil(DOWNLOAD_WRITE_BATCH_SIZE);
-        for (batch_index, batch) in stale.chunks(DOWNLOAD_WRITE_BATCH_SIZE).enumerate() {
-            let transaction = self.begin_write().await?;
-            for model in batch.iter().cloned() {
-                if model.library_added_at.is_some() {
-                    let has_missing_since = model.missing_since.is_some();
-                    let mut active = model.into_active_model();
-                    active.present = Set(false);
-                    if !has_missing_since {
-                        active.missing_since = Set(Some(now.clone()));
-                    }
-                    active.update(&transaction).await?;
-                } else {
-                    model.delete(&transaction).await?;
-                }
-            }
-            transaction.commit().await?;
-            if batch_index + 1 < batch_count {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        // Publish scan completion only after every stale link has been reconciled. If a batch
-        // fails, the next full snapshot can safely repeat the idempotent link updates.
         let transaction = self.begin_write().await?;
-        if let Some(model) = download_client_scan::Entity::find_by_id(client)
-            .one(&transaction)
-            .await?
-        {
-            let mut active = model.into_active_model();
-            active.last_successful_at = Set(now);
-            active.update(&transaction).await?;
-        } else {
-            download_client_scan::ActiveModel {
-                client: Set(client.into()),
-                last_successful_at: Set(now),
-            }
-            .insert(&transaction)
+        self.complete_client_scan_on(&transaction, client, scan_started_at, None)
             .await?;
-        }
         transaction.commit().await?;
         Ok(())
     }
 
+    async fn complete_client_scan_on(
+        &self,
+        transaction: &DatabaseTransaction,
+        client: &str,
+        scan_started_at: DateTime<Utc>,
+        generation: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        loop {
+            let mut stale = download_release_link::Entity::find()
+                .filter(download_release_link::Column::Client.eq(client))
+                .filter(download_release_link::Column::Present.eq(true))
+                .filter(download_release_link::Column::LastSeenAt.lt(scan_started_at.to_rfc3339()))
+                .order_by_asc(download_release_link::Column::InfoHash)
+                .limit(250);
+            if let Some(generation) = generation {
+                stale = stale.filter(Expr::cust_with_values(
+                    "NOT EXISTS (SELECT 1 FROM client_inventory_members member
+                       WHERE member.client = download_release_links.client
+                         AND member.generation = ?
+                         AND member.info_hash = download_release_links.info_hash)",
+                    [generation],
+                ));
+            }
+            let stale = stale.all(transaction).await?;
+            if stale.is_empty() {
+                break;
+            }
+            for model in stale {
+                self.mark_download_link_missing_on(transaction, model, &now)
+                    .await?;
+            }
+        }
+        download_client_scan::Entity::insert(download_client_scan::ActiveModel {
+            client: Set(client.into()),
+            last_successful_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(download_client_scan::Column::Client)
+                .update_column(download_client_scan::Column::LastSuccessfulAt)
+                .to_owned(),
+        )
+        .exec(transaction)
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_link_resolving(&self, client: &str, info_hash: &str) -> Result<()> {
+        let transaction = self.begin_write().await?;
         if let Some(model) =
             download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
-                .one(&self.connection)
+                .one(&transaction)
                 .await?
             && model.resolution_state != "linked"
         {
             let mut active = model.into_active_model();
             active.resolution_state = Set("resolving".into());
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            let link = active.update(&transaction).await?;
+            self.sync_import_link_on(&transaction, link).await?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -7564,9 +8518,10 @@ impl Database {
                 .await?
                 .map(|id| id.to_string()),
         };
+        let transaction = self.begin_write().await?;
         if let Some(model) =
             download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
-                .one(&self.connection)
+                .one(&transaction)
                 .await?
         {
             let mut active = model.into_active_model();
@@ -7579,8 +8534,10 @@ impl Database {
             active.error_code = Set(None);
             active.error_message = Set(None);
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            let link = active.update(&transaction).await?;
+            self.sync_import_link_on(&transaction, link).await?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -7592,9 +8549,10 @@ impl Database {
         error_code: &str,
         message: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         let model =
             download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
-                .one(&self.connection)
+                .one(&transaction)
                 .await?
                 .context("download release link disappeared while recording failure")?;
         let delay =
@@ -7607,7 +8565,9 @@ impl Database {
         active.error_code = Set(Some(error_code.into()));
         active.error_message = Set(Some(message.chars().take(500).collect()));
         active.updated_at = Set(Utc::now().to_rfc3339());
-        active.update(&self.connection).await?;
+        let link = active.update(&transaction).await?;
+        self.sync_import_link_on(&transaction, link).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -7617,9 +8577,10 @@ impl Database {
         info_hash: &str,
         message: &str,
     ) -> Result<()> {
+        let transaction = self.begin_write().await?;
         if let Some(model) =
             download_release_link::Entity::find_by_id((client.to_owned(), info_hash.to_owned()))
-                .one(&self.connection)
+                .one(&transaction)
                 .await?
             && model.resolution_state != "linked"
         {
@@ -7629,8 +8590,10 @@ impl Database {
             active.error_code = Set(Some("provider_wait".into()));
             active.error_message = Set(Some(message.chars().take(500).collect()));
             active.updated_at = Set(Utc::now().to_rfc3339());
-            active.update(&self.connection).await?;
+            let link = active.update(&transaction).await?;
+            self.sync_import_link_on(&transaction, link).await?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -7789,10 +8752,9 @@ impl Database {
             .collect()
     }
 
-    pub async fn projected_library_releases_filtered(
-        &self,
+    fn library_release_query(
         filter: &LibraryProjectionFilter,
-    ) -> Result<Vec<LibraryRelease>> {
+    ) -> sea_orm::Select<library_release_projection::Entity> {
         let mut query = library_release_projection::Entity::find();
         for term in &filter.search_terms {
             let term = term.trim().to_lowercase();
@@ -7843,6 +8805,13 @@ impl Database {
             );
         }
         query
+    }
+
+    pub async fn projected_library_releases_filtered(
+        &self,
+        filter: &LibraryProjectionFilter,
+    ) -> Result<Vec<LibraryRelease>> {
+        Self::library_release_query(filter)
             .order_by_desc(library_release_projection::Column::SortYear)
             .order_by_asc(library_release_projection::Column::NormalizedTitle)
             .all(&self.connection)
@@ -7852,25 +8821,144 @@ impl Database {
             .collect()
     }
 
-    pub async fn projected_library_singles(&self) -> Result<Vec<LibraryRelease>> {
-        library_release_projection::Entity::find()
-            .filter(
-                Condition::any()
-                    .add(library_release_projection::Column::ReleaseType.eq("single"))
-                    .add(library_release_projection::Column::ReleaseType.eq("Single")),
-            )
+    pub async fn projected_library_release_page(
+        &self,
+        filter: &LibraryProjectionFilter,
+        title: Option<&str>,
+        artist_key: Option<&str>,
+        sort: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<LibraryRelease>, usize)> {
+        let mut query = Self::library_release_query(filter);
+        if let Some(title) = title {
+            query = query.filter(Expr::cust_with_values(
+                "instr(normalized_title, ?) > 0",
+                [title],
+            ));
+        }
+        if let Some(artist_key) = artist_key {
+            query = query.filter(Expr::cust_with_values(
+                "EXISTS (SELECT 1 FROM library_artist_release_projections membership
+                   WHERE membership.artist_key = ?
+                     AND membership.release_id = library_release_projections.release_id)",
+                [artist_key],
+            ));
+        }
+        let total = query.clone().count(&self.connection).await? as usize;
+        query = match sort {
+            "title" => query.order_by_asc(library_release_projection::Column::NormalizedTitle),
+            "added_desc" => query.order_by_desc(Expr::cust(
+                "julianday(json_extract(document_json, '$.addedAt'))",
+            )),
+            _ => query
+                .order_by_desc(Expr::cust("coalesce(sort_year, 0)"))
+                .order_by_asc(library_release_projection::Column::NormalizedTitle),
+        };
+        let items = query
+            .order_by_asc(library_release_projection::Column::ReleaseId)
+            .limit(limit as u64)
+            .offset(offset as u64)
             .all(&self.connection)
             .await?
             .into_iter()
             .map(|row| Ok(serde_json::from_value(row.document_json)?))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((items, total))
     }
 
-    pub async fn projected_unresolved_credit_count(&self) -> Result<u64> {
-        Ok(library_release_projection::Entity::find()
-            .filter(library_release_projection::Column::UnresolvedCredits.eq(true))
-            .count(&self.connection)
-            .await?)
+    pub async fn library_index_status(&self) -> Result<crate::model::LibraryIndexStatus> {
+        if self.connection.has_snapshot() {
+            return self.library_index_status_cached().await;
+        }
+        self.read_snapshot(self.library_index_status_cached())
+            .await?
+            .1
+    }
+
+    async fn library_index_status_cached(&self) -> Result<crate::model::LibraryIndexStatus> {
+        let row = self.connection.query_one_raw(Statement::from_string(
+            self.connection.get_database_backend(),
+            "SELECT version, coalesce((SELECT revision FROM library_projection_state WHERE id = 1), 0) AS catalog
+               FROM library_status_revision WHERE id = 1",
+        )).await?.context("missing library status revision")?;
+        let revision = (
+            row.try_get::<i64>("", "catalog")?,
+            row.try_get::<i64>("", "version")?,
+        );
+        let mut cache = self.library_status.lock().await;
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.revision == revision) {
+            return Ok(cached.value.clone());
+        }
+        let value = self.compute_library_index_status().await?;
+        if cache
+            .as_ref()
+            .is_none_or(|cached| cached.revision <= revision)
+        {
+            *cache = Some(CachedLibraryStatus {
+                revision,
+                value: value.clone(),
+            });
+        }
+        Ok(value)
+    }
+
+    async fn compute_library_index_status(&self) -> Result<crate::model::LibraryIndexStatus> {
+        let row = self.connection.query_one_raw(Statement::from_string(
+            self.connection.get_database_backend(),
+            r#"
+            WITH singles AS (
+                SELECT library.covered_single AS covered, coverage.state AS state
+                  FROM library_release_projections library
+                  LEFT JOIN single_album_coverages coverage
+                    ON coverage.tracker = json_extract(library.document_json, '$.release.tracker')
+                   AND coverage.single_group_id = json_extract(library.document_json, '$.release.groupId')
+                 WHERE lower(library.release_type) = 'single'
+            )
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE covered OR state = 'ready') AS checked,
+                   count(*) FILTER (WHERE covered) AS hidden,
+                   count(*) FILTER (WHERE NOT covered AND state = 'resolving') AS resolving,
+                   count(*) FILTER (WHERE NOT covered AND state = 'failed') AS failed,
+                   count(*) FILTER (WHERE NOT covered AND coalesce(state, '') NOT IN ('ready', 'resolving', 'failed')) AS pending,
+                   (SELECT count(*) FROM library_release_projections WHERE unresolved_credits) AS unresolved,
+                   (SELECT min(last_successful_at) FROM download_client_scans) AS last_scan,
+                   (SELECT count(*) FROM release_track_indexes WHERE state = 'indexed') AS tracks_indexed,
+                   (SELECT count(*) FROM release_track_indexes WHERE state = 'pending') AS tracks_pending,
+                   (SELECT count(*) FROM release_track_indexes WHERE state = 'resolving') AS tracks_resolving,
+                   (SELECT count(*) FROM release_track_indexes WHERE state = 'failed') AS tracks_failed
+              FROM singles
+            "#,
+        )).await?.context("missing library status aggregate")?;
+        let count =
+            |field| -> Result<usize> { Ok(usize::try_from(row.try_get::<i64>("", field)?)?) };
+        let tracklists_indexed = count("tracks_indexed")?;
+        let tracklists_pending = count("tracks_pending")?;
+        let tracklists_resolving = count("tracks_resolving")?;
+        let tracklists_failed = count("tracks_failed")?;
+        Ok(crate::model::LibraryIndexStatus {
+            unresolved_credits: count("unresolved")?,
+            last_successful_scan_at: row
+                .try_get::<Option<String>>("", "last_scan")?
+                .map(|value| parse_timestamp(&value))
+                .transpose()?,
+            deduplication: crate::model::DeduplicationIndexStatus {
+                total: count("total")?,
+                checked: count("checked")?,
+                hidden: count("hidden")?,
+                resolving: count("resolving")?,
+                failed: count("failed")?,
+                pending: count("pending")?,
+                tracklists_indexed,
+                tracklists_pending,
+                tracklists_resolving,
+                tracklists_failed,
+                tracklists_total: tracklists_indexed
+                    + tracklists_pending
+                    + tracklists_resolving
+                    + tracklists_failed,
+            },
+        })
     }
 
     pub async fn projected_library_releases_for_ids(
@@ -7897,14 +8985,119 @@ impl Database {
         Ok(releases)
     }
 
-    pub async fn projected_library_artists(&self) -> Result<Vec<LibraryArtistSummary>> {
-        library_artist_projection::Entity::find()
-            .order_by_asc(library_artist_projection::Column::NormalizedName)
-            .all(&self.connection)
+    pub async fn projected_library_artist_page(
+        &self,
+        filter: &LibraryProjectionFilter,
+        needle: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<LibraryArtistSummary>, usize)> {
+        // Match/count in SQLite and deserialize only the selected artist documents.
+        // The projected identity and spelling stay stable across release filters.
+        let filters = |value: Option<&str>| {
+            value
+                .filter(|value| !value.is_empty() && *value != "all")
+                .map(str::to_lowercase)
+                .unwrap_or_default()
+        };
+        let mut query = library_artist_projection::Entity::find();
+        if let Some(needle) = needle {
+            query = query.filter(Expr::cust_with_values(
+                "instr(CASE WHEN lower(substr(trim(json_extract(document_json, '$.name')), 1, 4)) = 'the '
+                            THEN 'the ' || normalized_name ELSE normalized_name END, ?) > 0",
+                [needle],
+            ));
+        }
+        let tracker = filters(filter.tracker.as_deref());
+        let format = filters(filter.format.as_deref());
+        let availability = filters(filter.availability.as_deref());
+        let connection = &self.connection;
+        if tracker.is_empty() && format.is_empty() && availability.is_empty() {
+            let total = query.clone().count(connection).await? as usize;
+            let artists = query
+                .order_by_asc(library_artist_projection::Column::NormalizedName)
+                .order_by_asc(library_artist_projection::Column::ArtistKey)
+                .limit(limit as u64)
+                .offset(offset as u64)
+                .all(connection)
+                .await?
+                .into_iter()
+                .map(|row| Ok(serde_json::from_value(row.document_json)?))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok((artists, total));
+        }
+
+        const FILTERED_ARTISTS: &str = r#"
+            WITH query_args AS (SELECT ? AS tracker, ? AS format, ? AS availability, ? AS needle),
+            matching AS (
+                SELECT membership.artist_key, r.release_id, r.availability, r.document_json
+                  FROM library_artist_release_projections membership
+                  JOIN library_release_projections r USING (release_id)
+                  CROSS JOIN query_args q
+                 WHERE (q.tracker = '' OR instr(r.tracker_keys, '|' || q.tracker || '|') > 0)
+                   AND (q.format = '' OR instr(r.format_keys, '|' || q.format || '|') > 0)
+                   AND (q.availability = '' OR r.availability = q.availability)
+                   AND (q.needle = '' OR instr(r.search_text, q.needle) > 0)
+            ), eligible AS (
+                SELECT match.artist_key, count(*) AS copies,
+                       count(*) FILTER (WHERE match.availability <> 'present') AS missing
+                  FROM matching match
+                 GROUP BY match.artist_key
+                HAVING max(EXISTS (
+                    SELECT 1 FROM json_each(match.document_json, '$.release.artists') AS credit
+                     WHERE json_extract(credit.value, '$.role') = 'primary'
+                       AND coalesce(json_extract(credit.value, '$.canonicalId'),
+                           lower(json_extract(credit.value, '$.tracker')) || ':' ||
+                           json_extract(credit.value, '$.key')) = match.artist_key
+                ))
+            ), named AS (
+                SELECT artist.artist_key, artist.normalized_name, artist.document_json, eligible.copies, eligible.missing
+                  FROM eligible JOIN library_artist_projections artist USING (artist_key)
+                  CROSS JOIN query_args q
+                 WHERE instr(CASE WHEN lower(substr(trim(json_extract(artist.document_json, '$.name')), 1, 4)) = 'the '
+                            THEN 'the ' || artist.normalized_name ELSE artist.normalized_name END, q.needle) > 0
+            )
+        "#;
+        let args = [
+            tracker.into(),
+            format.into(),
+            availability.into(),
+            needle.unwrap_or_default().into(),
+        ];
+        let total = connection
+            .query_one_raw(Statement::from_sql_and_values(
+                connection.get_database_backend(),
+                format!("{FILTERED_ARTISTS} SELECT count(*) AS count FROM named"),
+                args.clone(),
+            ))
             .await?
+            .context("missing filtered artist count")?
+            .try_get::<i64>("", "count")? as usize;
+        let rows = connection.query_all_raw(Statement::from_sql_and_values(
+            connection.get_database_backend(),
+            format!(r#"{FILTERED_ARTISTS}
+                SELECT named.document_json, named.copies, named.missing,
+                    (SELECT json_group_array(artwork) FROM (
+                        SELECT DISTINCT json_extract(match.document_json, '$.release.artwork') AS artwork
+                          FROM matching match WHERE match.artist_key = named.artist_key
+                           AND json_extract(match.document_json, '$.release.artwork') IS NOT NULL
+                         ORDER BY artwork LIMIT 4
+                    )) AS artworks
+                  FROM named ORDER BY named.normalized_name, named.artist_key LIMIT ? OFFSET ?"#),
+            args.into_iter().chain([(limit as i64).into(), (offset as i64).into()]),
+        )).await?;
+        let artists = rows
             .into_iter()
-            .map(|row| Ok(serde_json::from_value(row.document_json)?))
-            .collect()
+            .map(|row| {
+                let mut artist: LibraryArtistSummary =
+                    serde_json::from_str(&row.try_get::<String>("", "document_json")?)?;
+                artist.release_count = row.try_get::<i64>("", "copies")? as usize;
+                artist.missing_count = row.try_get::<i64>("", "missing")? as usize;
+                artist.artworks = serde_json::from_str(&row.try_get::<String>("", "artworks")?)?;
+                Ok(artist)
+            })
+            .collect::<Result<_>>()?;
+        Ok((artists, total))
     }
 
     pub async fn projected_library_artist(
@@ -7916,22 +9109,6 @@ impl Database {
             .await?
             .map(|row| serde_json::from_value(row.document_json).map_err(Into::into))
             .transpose()
-    }
-
-    pub async fn projected_library_release_ids_for_artist(
-        &self,
-        artist_key: &str,
-    ) -> Result<Vec<Uuid>> {
-        library_artist_release_projection::Entity::find()
-            .select_only()
-            .column(library_artist_release_projection::Column::ReleaseId)
-            .filter(library_artist_release_projection::Column::ArtistKey.eq(artist_key))
-            .into_tuple::<String>()
-            .all(&self.connection)
-            .await?
-            .into_iter()
-            .map(|id| Uuid::parse_str(&id).map_err(Into::into))
-            .collect()
     }
 
     pub async fn projected_artist_keys_for_releases(
@@ -8071,15 +9248,45 @@ impl Database {
         Ok(stored_relations != projected_relations)
     }
 
+    pub async fn library_projection_input_revision(&self) -> Result<i64> {
+        Self::library_projection_input_revision_on(&self.connection).await
+    }
+
+    async fn library_projection_input_revision_on(
+        connection: &impl ConnectionTrait,
+    ) -> Result<i64> {
+        let row = connection
+            .query_one_raw(Statement::from_string(
+                connection.get_database_backend(),
+                "SELECT input_revision FROM library_projection_state WHERE id = 1",
+            ))
+            .await?;
+        Ok(row
+            .map(|row| row.try_get("", "input_revision"))
+            .transpose()?
+            .unwrap_or(0))
+    }
+
     pub async fn store_library_projection(
         &self,
         full: bool,
+        expected_inputs: Option<i64>,
         dirty: &[LibraryProjectionDirtyRecord],
         releases: &[LibraryRelease],
         artists: &[LibraryArtistSummary],
         relations: &[(String, Uuid)],
         affected_artist_keys: &HashSet<String>,
     ) -> Result<bool> {
+        let (base_revision, _) = self.library_projection_state().await?;
+        let now = Utc::now().to_rfc3339();
+        let generation = if full {
+            Some(
+                self.stage_library_projection(releases, artists, relations, &now)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let requested_ids = dirty
             .iter()
             .filter(|row| row.release_id != "*")
@@ -8096,6 +9303,17 @@ impl Database {
                 )
                 .await?;
         let transaction = self.begin_write().await?;
+        let current = library_projection_state::Entity::find_by_id(1)
+            .one(&transaction)
+            .await?;
+        if current.as_ref().map_or(0, |state| state.revision) != base_revision {
+            return Ok(false);
+        }
+        if let Some(expected) = expected_inputs
+            && Self::library_projection_input_revision_on(&transaction).await? != expected
+        {
+            return Ok(false);
+        }
         if !projection_changed {
             for row in dirty {
                 library_projection_dirty::Entity::delete_many()
@@ -8144,154 +9362,86 @@ impl Database {
             }
         }
 
-        let now = Utc::now().to_rfc3339();
-        for chunk in releases.chunks(200) {
-            let mut rows = Vec::new();
-            for release in chunk {
-                if let Some(release_id) = release.release.id {
-                    rows.push(library_release_projection::ActiveModel {
-                        release_id: Set(release_id.to_string()),
-                        normalized_title: Set(release.release.title.trim().to_lowercase()),
-                        search_text: Set(projection_search_text(release)),
-                        tracker_keys: Set(projection_facet(
-                            std::iter::once(release.release.tracker.as_str())
-                                .chain(
-                                    release
-                                        .release
-                                        .sources
-                                        .iter()
-                                        .map(|source| source.tracker.as_str()),
-                                )
-                                .chain(
-                                    release
-                                        .variants
-                                        .iter()
-                                        .map(|variant| variant.tracker.as_str()),
-                                ),
-                        )),
-                        format_keys: Set(projection_facet(
-                            release
-                                .variants
-                                .iter()
-                                .filter_map(|variant| variant.format.as_deref()),
-                        )),
-                        encoding_keys: Set(projection_facet(
-                            release
-                                .variants
-                                .iter()
-                                .filter_map(|variant| variant.encoding.as_deref()),
-                        )),
-                        media_keys: Set(projection_facet(
-                            release
-                                .variants
-                                .iter()
-                                .filter_map(|variant| variant.media.as_deref()),
-                        )),
-                        sort_year: Set(release.release.year),
-                        release_type: Set(release
-                            .release
-                            .release_type
-                            .as_deref()
-                            .map(str::to_lowercase)),
-                        availability: Set(match release.availability {
-                            LibraryAvailability::Present => "present",
-                            LibraryAvailability::Partial => "partial",
-                            LibraryAvailability::Missing => "missing",
-                        }
-                        .to_owned()),
-                        covered_single: Set(release.release.album_coverage.is_some()),
-                        unresolved_credits: Set(release
-                            .release
-                            .artists
-                            .iter()
-                            .all(|artist| artist.source == ArtistCreditSource::DisplayFallback)),
-                        document_json: Set(serde_json::to_value(release)?),
-                        updated_at: Set(now.clone()),
-                    });
+        if let Some(generation) = &generation {
+            Self::activate_library_projection_stage(&transaction, generation).await?;
+        } else {
+            for chunk in releases.chunks(200) {
+                let rows = chunk
+                    .iter()
+                    .filter_map(|release| release.release.id.map(|id| (release, id)))
+                    .map(|(release, id)| Self::library_release_row(release, id, &now))
+                    .collect::<Result<Vec<_>>>()?;
+                if !rows.is_empty() {
+                    library_release_projection::Entity::insert_many(rows)
+                        .on_conflict(
+                            OnConflict::column(library_release_projection::Column::ReleaseId)
+                                .update_columns([
+                                    library_release_projection::Column::NormalizedTitle,
+                                    library_release_projection::Column::SearchText,
+                                    library_release_projection::Column::TrackerKeys,
+                                    library_release_projection::Column::FormatKeys,
+                                    library_release_projection::Column::EncodingKeys,
+                                    library_release_projection::Column::MediaKeys,
+                                    library_release_projection::Column::SortYear,
+                                    library_release_projection::Column::ReleaseType,
+                                    library_release_projection::Column::Availability,
+                                    library_release_projection::Column::CoveredSingle,
+                                    library_release_projection::Column::UnresolvedCredits,
+                                    library_release_projection::Column::DocumentJson,
+                                    library_release_projection::Column::UpdatedAt,
+                                ])
+                                .to_owned(),
+                        )
+                        .exec(&transaction)
+                        .await?;
                 }
             }
-            if !rows.is_empty() {
-                library_release_projection::Entity::insert_many(rows)
-                    .on_conflict(
-                        OnConflict::column(library_release_projection::Column::ReleaseId)
-                            .update_columns([
-                                library_release_projection::Column::NormalizedTitle,
-                                library_release_projection::Column::SearchText,
-                                library_release_projection::Column::TrackerKeys,
-                                library_release_projection::Column::FormatKeys,
-                                library_release_projection::Column::EncodingKeys,
-                                library_release_projection::Column::MediaKeys,
-                                library_release_projection::Column::SortYear,
-                                library_release_projection::Column::ReleaseType,
-                                library_release_projection::Column::Availability,
-                                library_release_projection::Column::CoveredSingle,
-                                library_release_projection::Column::UnresolvedCredits,
-                                library_release_projection::Column::DocumentJson,
-                                library_release_projection::Column::UpdatedAt,
-                            ])
-                            .to_owned(),
-                    )
-                    .exec(&transaction)
-                    .await?;
+            for chunk in artists.chunks(200) {
+                let rows = chunk
+                    .iter()
+                    .map(|artist| Self::library_artist_row(artist, &now))
+                    .collect::<Result<Vec<_>>>()?;
+                if !rows.is_empty() {
+                    library_artist_projection::Entity::insert_many(rows)
+                        .on_conflict(
+                            OnConflict::column(library_artist_projection::Column::ArtistKey)
+                                .update_columns([
+                                    library_artist_projection::Column::CanonicalId,
+                                    library_artist_projection::Column::NormalizedName,
+                                    library_artist_projection::Column::DocumentJson,
+                                    library_artist_projection::Column::UpdatedAt,
+                                ])
+                                .to_owned(),
+                        )
+                        .exec(&transaction)
+                        .await?;
+                }
             }
-        }
-        for chunk in artists.chunks(200) {
-            let rows = chunk
-                .iter()
-                .map(|artist| {
-                    let artist_key = artist.id.map(|id| id.to_string()).unwrap_or_else(|| {
-                        format!("{}:{}", artist.tracker.to_ascii_lowercase(), artist.key)
-                    });
-                    Ok(library_artist_projection::ActiveModel {
-                        artist_key: Set(artist_key),
-                        canonical_id: Set(artist.id.map(|id| id.to_string())),
-                        normalized_name: Set(artist_sort_name_for_projection(&artist.name)),
-                        document_json: Set(serde_json::to_value(artist)?),
-                        updated_at: Set(now.clone()),
+            for chunk in relations.chunks(300) {
+                let rows = chunk
+                    .iter()
+                    .map(|(artist_key, release_id)| {
+                        library_artist_release_projection::ActiveModel {
+                            artist_key: Set(artist_key.clone()),
+                            release_id: Set(release_id.to_string()),
+                        }
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if !rows.is_empty() {
-                library_artist_projection::Entity::insert_many(rows)
-                    .on_conflict(
-                        OnConflict::column(library_artist_projection::Column::ArtistKey)
-                            .update_columns([
-                                library_artist_projection::Column::CanonicalId,
-                                library_artist_projection::Column::NormalizedName,
-                                library_artist_projection::Column::DocumentJson,
-                                library_artist_projection::Column::UpdatedAt,
+                    .collect::<Vec<_>>();
+                if !rows.is_empty() {
+                    library_artist_release_projection::Entity::insert_many(rows)
+                        .on_conflict(
+                            OnConflict::columns([
+                                library_artist_release_projection::Column::ArtistKey,
+                                library_artist_release_projection::Column::ReleaseId,
                             ])
+                            .do_nothing()
                             .to_owned(),
-                    )
-                    .exec(&transaction)
-                    .await?;
+                        )
+                        .exec(&transaction)
+                        .await?;
+                }
             }
         }
-        for chunk in relations.chunks(300) {
-            let rows = chunk
-                .iter()
-                .map(
-                    |(artist_key, release_id)| library_artist_release_projection::ActiveModel {
-                        artist_key: Set(artist_key.clone()),
-                        release_id: Set(release_id.to_string()),
-                    },
-                )
-                .collect::<Vec<_>>();
-            if !rows.is_empty() {
-                library_artist_release_projection::Entity::insert_many(rows)
-                    .on_conflict(
-                        OnConflict::columns([
-                            library_artist_release_projection::Column::ArtistKey,
-                            library_artist_release_projection::Column::ReleaseId,
-                        ])
-                        .do_nothing()
-                        .to_owned(),
-                    )
-                    .exec(&transaction)
-                    .await?;
-            }
-        }
-
         for row in dirty {
             library_projection_dirty::Entity::delete_many()
                 .filter(library_projection_dirty::Column::ReleaseId.eq(row.release_id.clone()))
@@ -8299,10 +9449,7 @@ impl Database {
                 .exec(&transaction)
                 .await?;
         }
-        let state = library_projection_state::Entity::find_by_id(1)
-            .one(&transaction)
-            .await?;
-        let revision = state.as_ref().map_or(1, |state| state.revision + 1);
+        let revision = base_revision + 1;
         library_projection_state::ActiveModel {
             id: Set(1),
             revision: Set(revision),
@@ -8312,7 +9459,29 @@ impl Database {
         }
         .save(&transaction)
         .await?;
+        if let Some(generation) = &generation {
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "UPDATE library_projection_state SET generation = ? WHERE id = 1",
+                    [generation.as_str().into()],
+                ))
+                .await?;
+        }
+        self.append_resource_change_event_on(
+            &transaction,
+            "catalog",
+            "library",
+            "library_projection_updated",
+            None,
+        )
+        .await?;
         transaction.commit().await?;
+        if let Some(generation) = generation
+            && let Err(error) = self.prune_library_projection_stage(Some(&generation)).await
+        {
+            tracing::warn!(%error, "could not prune the published Library projection stage");
+        }
         Ok(true)
     }
 
@@ -8467,19 +9636,6 @@ impl Database {
         })
     }
 
-    pub async fn last_successful_download_scan(&self) -> Result<Option<DateTime<Utc>>> {
-        download_client_scan::Entity::find()
-            .order_by_asc(download_client_scan::Column::LastSuccessfulAt)
-            .one(&self.connection)
-            .await?
-            .map(|model| parse_timestamp(&model.last_successful_at))
-            .transpose()
-    }
-
-    async fn add_event(&self, id: Uuid, state: &DownloadState, detail: Option<&str>) -> Result<()> {
-        self.add_event_on(&self.connection, id, state, detail).await
-    }
-
     async fn add_event_on<C: ConnectionTrait>(
         &self,
         connection: &C,
@@ -8588,45 +9744,6 @@ fn stored_background_job(model: &background_job::Model) -> Result<StoredBackgrou
         attempts: u32::try_from(model.attempts).unwrap_or(u32::MAX),
         max_attempts: u32::try_from(model.max_attempts).unwrap_or(u32::MAX),
     })
-}
-
-fn background_provider_is_due(
-    job: &background_job::Model,
-    states: &std::collections::HashMap<String, provider_state::Model>,
-    running: &std::collections::HashSet<String>,
-    now: DateTime<Utc>,
-) -> bool {
-    let Some(provider_id) = job.provider_id.as_deref() else {
-        return true;
-    };
-    if running.contains(provider_id) {
-        return false;
-    }
-    let Some(state) = states.get(provider_id) else {
-        return true;
-    };
-    if state.state == "cooldown"
-        && state
-            .retry_at
-            .as_deref()
-            .and_then(|value| parse_timestamp(value).ok())
-            .is_some_and(|retry_at| retry_at > now)
-    {
-        return false;
-    }
-    if matches!(state.state.as_str(), "blocked" | "paused") {
-        return true;
-    }
-    state
-        .last_background_request_at
-        .as_deref()
-        .and_then(|value| parse_timestamp(value).ok())
-        .map(|last| {
-            let interval =
-                chrono::Duration::milliseconds(state.background_minimum_interval_ms.max(0));
-            last + interval <= now
-        })
-        .unwrap_or(true)
 }
 
 fn background_job_status(model: background_job::Model) -> Result<BackgroundJobStatus> {
@@ -9056,7 +10173,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database as SeaDatabase,
-        EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+        EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, Statement,
     };
     use sea_orm_migration::MigratorTrait;
     use tempfile::tempdir;
@@ -9621,6 +10738,7 @@ mod tests {
         };
         let id = db
             .create_replacement_import(CreateReplacementImport {
+                request_key: None,
                 download_job_id: None,
                 target_client: Some("music"),
                 target_info_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -9647,6 +10765,121 @@ mod tests {
         assert_eq!(
             task.supersessions[0].source_info_hash,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_authorizations_share_a_physical_import_target() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("shared-target.sqlite"))
+            .await
+            .unwrap();
+        let mut tasks = Vec::new();
+        for (key, source_hash) in [("one", "aaaa"), ("two", "bbbb")] {
+            let source = TrumpedDownloadRef {
+                client: "music".into(),
+                info_hash: source_hash.into(),
+                name: "Old".into(),
+                tracker: "ops".into(),
+            };
+            let id = db
+                .create_replacement_import(CreateReplacementImport {
+                    request_key: Some(key),
+                    download_job_id: None,
+                    target_client: Some("music"),
+                    target_info_hash: Some("cccc"),
+                    release_id: None,
+                    tracker: "ops",
+                    torrent_id: 42,
+                    display_name: "Replacement",
+                    target_complete: true,
+                    sources: &[source],
+                    cleanup_mode: ImportCleanupMode::RemoveTorrent,
+                })
+                .await
+                .unwrap();
+            tasks.push(id);
+        }
+        assert_ne!(tasks[0], tasks[1]);
+        let (_, first) = db.import_task_models(tasks[0]).await.unwrap().unwrap();
+        let (_, second) = db.import_task_models(tasks[1]).await.unwrap().unwrap();
+        assert_eq!(first[0].source_info_hash, "aaaa");
+        assert_eq!(second[0].source_info_hash, "bbbb");
+    }
+
+    #[tokio::test]
+    async fn removal_recovery_keeps_a_single_source_plex_obligation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cleanup.sqlite");
+        let db = Database::open(&path).await.unwrap();
+        let source = TrumpedDownloadRef {
+            client: "music".into(),
+            info_hash: "aabbcc".into(),
+            name: "Old".into(),
+            tracker: "ops".into(),
+        };
+        let id = db
+            .create_replacement_import(CreateReplacementImport {
+                request_key: None,
+                download_job_id: None,
+                target_client: Some("music"),
+                target_info_hash: Some("ddeeff"),
+                release_id: None,
+                tracker: "ops",
+                torrent_id: 42,
+                display_name: "Replacement",
+                target_complete: true,
+                sources: &[source],
+                cleanup_mode: ImportCleanupMode::RemoveTorrent,
+            })
+            .await
+            .unwrap();
+        let scan = PlexScanTarget {
+            section_id: 4,
+            root: "/music/old".into(),
+        };
+        assert!(
+            db.record_cleanup_intent(id, "music", "aabbcc", &scan)
+                .await
+                .unwrap()
+        );
+        drop(db);
+
+        let recovered = Database::open(&path).await.unwrap();
+        for _ in 0..2 {
+            recovered
+                .settle_cleanup_removal(id, "music", "aabbcc", "Observed absent on restart")
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            recovered.cleanup_scan_status(id).await.unwrap(),
+            super::CleanupScanStatus::Pending
+        ));
+        let work = recovered
+            .claim_background_job("worker", "event", std::time::Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(work.kind, crate::background::NOTIFY_PLEX);
+        assert_eq!(
+            work.payload,
+            serde_json::json!({"sectionId": 4, "root": "/music/old"})
+        );
+        recovered
+            .complete_background_job(work.id, "worker")
+            .await
+            .unwrap();
+        assert!(matches!(
+            recovered.cleanup_scan_status(id).await.unwrap(),
+            super::CleanupScanStatus::Complete
+        ));
+        assert!(
+            recovered
+                .claim_background_job("worker", "event", std::time::Duration::from_secs(10))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -9921,22 +11154,28 @@ mod tests {
         db.put_provider_state(&provider)
             .await
             .expect("provider state");
-        for key in ["provider:first", "provider:second"] {
-            db.enqueue_background_job(EnqueueBackgroundJob {
-                deduplication_key: key,
-                kind: "provider_job",
-                payload: serde_json::json!({}),
-                provider_id: Some("tracker:ops".into()),
-                lane: "sync",
-                priority: 100,
-                max_attempts: 3,
-                next_run_at: None,
-                parent_id: None,
-                recurring_interval_seconds: None,
-            })
+        let transaction = db.begin_write().await.unwrap();
+        for index in 0..2_001 {
+            let key = format!("provider:{index:04}");
+            db.enqueue_background_job_on(
+                &transaction,
+                EnqueueBackgroundJob {
+                    deduplication_key: &key,
+                    kind: "provider_job",
+                    payload: serde_json::json!({}),
+                    provider_id: Some("tracker:ops".into()),
+                    lane: "sync",
+                    priority: 100,
+                    max_attempts: 3,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                },
+            )
             .await
             .expect("provider job");
         }
+        transaction.commit().await.unwrap();
         let local_id = db
             .enqueue_background_job(EnqueueBackgroundJob {
                 deduplication_key: "local:first",
@@ -10373,37 +11612,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn persists_channel_configuration_and_immutable_pack_items() {
-        let directory = tempdir().expect("temporary directory");
-        let db = Database::open(&directory.path().join("wotbox.sqlite"))
-            .await
-            .expect("database");
-        db.ensure_default_channels().await.expect("seed channels");
-        let channels = db.list_channels().await.expect("channels");
-        assert_eq!(channels.len(), 4);
-        let library_albums = channels
-            .iter()
-            .find(|channel| channel.id == "library_albums")
-            .expect("library albums");
-        assert!(!library_albums.enabled);
-        crate::channel::validate_channel_refresh(library_albums, false)
-            .expect("manual refresh without external credentials");
-        assert!(
-            !channels
-                .iter()
-                .find(|channel| channel.id == "country_chart")
-                .expect("chart")
-                .enabled
-        );
-        assert!(
-            channels
-                .iter()
-                .find(|channel| channel.id == "trumped_downloads")
-                .expect("trumped downloads")
-                .enabled
-        );
-        let item = ChannelPackItem {
+    fn sample_pack_item() -> ChannelPackItem {
+        ChannelPackItem {
             ordinal: 1,
             source: RecommendationSource {
                 id: "apple:42".into(),
@@ -10435,7 +11645,40 @@ mod tests {
             fulfillment: None,
             disposition: Default::default(),
             selectable: false,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_channel_configuration_and_immutable_pack_items() {
+        let directory = tempdir().expect("temporary directory");
+        let db = Database::open(&directory.path().join("wotbox.sqlite"))
+            .await
+            .expect("database");
+        db.ensure_default_channels().await.expect("seed channels");
+        let channels = db.list_channels().await.expect("channels");
+        assert_eq!(channels.len(), 4);
+        let library_albums = channels
+            .iter()
+            .find(|channel| channel.id == "library_albums")
+            .expect("library albums");
+        assert!(!library_albums.enabled);
+        crate::channel::validate_channel_refresh(library_albums, false)
+            .expect("manual refresh without external credentials");
+        assert!(
+            !channels
+                .iter()
+                .find(|channel| channel.id == "country_chart")
+                .expect("chart")
+                .enabled
+        );
+        assert!(
+            channels
+                .iter()
+                .find(|channel| channel.id == "trumped_downloads")
+                .expect("trumped downloads")
+                .enabled
+        );
+        let item = sample_pack_item();
         let id = db
             .create_channel_pack("country_chart", "AU Top 100", false, "fingerprint", &[item])
             .await
@@ -10458,6 +11701,381 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pack_decision_rolls_back_and_replays_the_winning_work() {
+        use super::PackDecisionResult;
+        use crate::model::{
+            ChannelPackDecision, DownloadProfile, PlannedDownload, RuntimePreferences,
+        };
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("decisions.sqlite"))
+            .await
+            .unwrap();
+        db.ensure_default_channels().await.unwrap();
+        let mut item = sample_pack_item();
+        item.selectable = true;
+        item.plan = Some(PlannedDownload {
+            tracker: "ops".into(),
+            torrent_id: 42,
+            profile: "music".into(),
+            use_token: false,
+            token_cost: 0,
+            size: None,
+            format: None,
+            encoding: None,
+            media: None,
+        });
+        let id = db
+            .create_channel_pack(
+                "country_chart",
+                "Test pack",
+                false,
+                "current",
+                &[item.clone()],
+            )
+            .await
+            .unwrap();
+        let pack = db.get_channel_pack(id, "current").await.unwrap().unwrap();
+        let profiles = std::collections::HashMap::from([(
+            "music".to_owned(),
+            DownloadProfile {
+                name: "music".into(),
+                client: "client".into(),
+                save_path: "/music".into(),
+                tag: String::new(),
+                start_paused: false,
+            },
+        )]);
+        let preferences = RuntimePreferences::default();
+        let accept = serde_json::json!({"decision": "accepted", "version": pack.plan_version});
+        let reject = serde_json::json!({"decision": "rejected", "version": pack.plan_version});
+        let revision = db.pack_input_revision().await.unwrap();
+        let free_bytes = std::collections::HashMap::new();
+        let mut invalid = pack.clone();
+        item.ordinal += 1;
+        invalid.items.push(item);
+        assert!(
+            db.commit_channel_pack_decision(
+                invalid,
+                accept.clone(),
+                None,
+                Some(revision),
+                "current",
+                ChannelPackDecision::Accepted,
+                &preferences,
+                &profiles,
+                &free_bytes,
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.list_jobs().await.unwrap().is_empty());
+        assert!(db.pack_receipt(id, &accept).await.unwrap().is_none());
+
+        let (accepted, rejected) = tokio::join!(
+            db.commit_channel_pack_decision(
+                pack.clone(),
+                accept.clone(),
+                None,
+                Some(revision),
+                "current",
+                ChannelPackDecision::Accepted,
+                &preferences,
+                &profiles,
+                &free_bytes,
+            ),
+            db.commit_channel_pack_decision(
+                pack,
+                reject.clone(),
+                None,
+                None,
+                "current",
+                ChannelPackDecision::Rejected,
+                &preferences,
+                &profiles,
+                &free_bytes,
+            ),
+        );
+        let jobs = db.list_jobs().await.unwrap();
+        match (accepted.unwrap(), rejected.unwrap()) {
+            (PackDecisionResult::Committed(result), PackDecisionResult::Conflict) => {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(result.jobs[0].id, jobs[0].id);
+                assert!(matches!(db.pack_receipt(id, &accept).await.unwrap(),
+                    Some(PackDecisionResult::Committed(replay)) if replay.jobs[0].id == jobs[0].id));
+                assert_eq!(
+                    db.download_destination(jobs[0].id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .save_path,
+                    "/music"
+                );
+            }
+            (PackDecisionResult::Conflict, PackDecisionResult::Committed(_)) => {
+                assert!(jobs.is_empty())
+            }
+            _ => panic!("one decision must win"),
+        }
+        assert_eq!(db.change_events_after(0, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn independent_packs_share_destination_capacity_and_failed_decisions_roll_back() {
+        use super::PackDecisionResult;
+        use crate::model::{
+            ChannelPackDecision, DownloadProfile, PlannedDownload, RuntimePreferences,
+        };
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("reservations.sqlite"))
+            .await
+            .unwrap();
+        db.ensure_default_channels().await.unwrap();
+        let profiles = std::collections::HashMap::from([(
+            "music".to_owned(),
+            DownloadProfile {
+                name: "music".into(),
+                client: "client".into(),
+                save_path: "/music".into(),
+                tag: String::new(),
+                start_paused: false,
+            },
+        )]);
+        let free = std::collections::HashMap::from([("client".into(), 100)]);
+        let preferences = RuntimePreferences::default();
+        for torrent_id in [42, 43] {
+            let mut item = sample_pack_item();
+            item.selectable = true;
+            item.plan = Some(PlannedDownload {
+                tracker: "ops".into(),
+                torrent_id,
+                profile: "music".into(),
+                use_token: false,
+                token_cost: 0,
+                size: Some(60),
+                format: None,
+                encoding: None,
+                media: None,
+            });
+            let id = db
+                .create_channel_pack("country_chart", "Test pack", false, "current", &[item])
+                .await
+                .unwrap();
+            let pack = db.get_channel_pack(id, "current").await.unwrap().unwrap();
+            let request = serde_json::json!({"decision": "accepted", "version": pack.plan_version});
+            let revision = db.pack_input_revision().await.unwrap();
+            let result = db
+                .commit_channel_pack_decision(
+                    pack,
+                    request.clone(),
+                    None,
+                    Some(revision),
+                    "current",
+                    ChannelPackDecision::Accepted,
+                    &preferences,
+                    &profiles,
+                    &free,
+                )
+                .await
+                .unwrap();
+            if torrent_id == 42 {
+                assert!(matches!(result, PackDecisionResult::Committed(_)));
+            } else {
+                assert!(
+                    matches!(result, PackDecisionResult::CapacityChanged(client) if client == "client")
+                );
+                assert!(db.pack_receipt(id, &request).await.unwrap().is_none());
+                assert_eq!(
+                    db.get_channel_pack(id, "current")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .decision,
+                    ChannelPackDecision::Open
+                );
+            }
+        }
+        assert_eq!(db.list_jobs().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upgrades_queued_work_and_protects_legacy_partial_decisions_on_restart() {
+        use crate::{
+            api::AppState,
+            config::Config,
+            model::{ChannelPackDecision, RuntimePreferences},
+        };
+
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("upgrade.sqlite");
+        let raw = SeaDatabase::connect(format!("sqlite://{}?mode=rwc", file.display()))
+            .await
+            .unwrap();
+        Migrator::up(&raw, Some(23)).await.unwrap();
+        let legacy = Database {
+            connection: super::SnapshotConnection::new(raw),
+            library_status: Default::default(),
+        };
+        legacy.ensure_default_channels().await.unwrap();
+        let pack_id = legacy
+            .create_channel_pack(
+                "country_chart",
+                "Legacy",
+                false,
+                "current",
+                &[sample_pack_item()],
+            )
+            .await
+            .unwrap();
+        let key = format!("channel-pack:{pack_id}:item:1:plan:1");
+        let job = legacy
+            .create_job("ops", 55, "old-profile", true, Some(&key))
+            .await
+            .unwrap()
+            .0;
+        legacy
+            .set_job_state(job.id, crate::model::DownloadState::Submitting, None)
+            .await
+            .unwrap();
+        let leased = legacy
+            .claim_background_job("expired-worker", "download", std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        let stages = dir.path().join("download-staging");
+        std::fs::create_dir(&stages).unwrap();
+        let staged_path = stages.join(format!("{}.torrent", job.id));
+        crate::submission::write_staged_download(&staged_path, b"d4:infod4:name4:testee").unwrap();
+        // Interrupt a late migration and verify both the earlier schema changes
+        // and their migration records roll back, so reopening can retry.
+        legacy
+            .connection
+            .execute_unprepared("CREATE TABLE library_status_revision (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        assert!(Database::open(&file).await.is_err());
+        let state = legacy
+            .connection
+            .query_one_raw(Statement::from_string(
+                legacy.connection.get_database_backend(),
+                "SELECT (SELECT count(*) FROM seaql_migrations) AS migrations,
+                        (SELECT count(*) FROM sqlite_master
+                         WHERE name = 'pack_capacity_reservations') AS reservations_schema",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.try_get::<i64>("", "migrations").unwrap(), 23);
+        assert_eq!(state.try_get::<i64>("", "reservations_schema").unwrap(), 0);
+        legacy
+            .connection
+            .execute_unprepared("DROP TABLE library_status_revision")
+            .await
+            .unwrap();
+        drop(legacy);
+
+        let config = Config {
+            database_path: file,
+            ..Config::default()
+        };
+        for _ in 0..2 {
+            let state = AppState::new(&config).await.unwrap();
+            assert!(staged_path.exists());
+            let job = state.db.get_job(job.id).await.unwrap().unwrap();
+            assert_eq!(job.state, crate::model::DownloadState::Submitting);
+            let pack = state
+                .db
+                .get_channel_pack(pack_id, "current")
+                .await
+                .unwrap()
+                .unwrap();
+            let result = state
+                .db
+                .commit_channel_pack_decision(
+                    pack,
+                    serde_json::json!({"decision":"accepted","version":1}),
+                    None,
+                    None,
+                    "current",
+                    ChannelPackDecision::Accepted,
+                    &RuntimePreferences::default(),
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(result, super::PackDecisionResult::Conflict));
+            assert_eq!(state.db.list_jobs().await.unwrap().len(), 1);
+            state.db.recover_expired_background_jobs().await.unwrap();
+            assert!(
+                !state
+                    .db
+                    .owns_background_job(leased.id, "expired-worker")
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_holds_its_cursor_across_a_concurrent_commit() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("snapshot.sqlite"))
+            .await
+            .unwrap();
+        let first = db.append_change_event("activity", "initial").await.unwrap();
+        let (cursor, (records, later)) = db
+            .read_snapshot(async {
+                let writer = db.clone();
+                let later = tokio::spawn(async move {
+                    writer
+                        .append_change_event("activity", "later")
+                        .await
+                        .unwrap()
+                })
+                .await
+                .unwrap();
+                (db.change_events_after(0, 10).await.unwrap(), later)
+            })
+            .await
+            .unwrap();
+        assert_eq!(cursor, first);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, first);
+        db.prune_change_events(Utc::now() + Duration::minutes(1))
+            .await
+            .unwrap();
+        assert_eq!(db.latest_change_cursor().await.unwrap(), later);
+    }
+
+    #[tokio::test]
+    async fn reused_download_request_key_requires_the_same_request() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("requests.sqlite"))
+            .await
+            .unwrap();
+        let job = db
+            .create_job("ops", 42, "music", false, Some("one"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            db.create_job("ops", 42, "music", false, Some("two"))
+                .await
+                .unwrap()
+                .0
+                .id,
+            job.id
+        );
+        let error = db
+            .create_job("ops", 43, "music", false, Some("two"))
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::DownloadRequestConflict>());
+        assert_eq!(db.list_jobs().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn recovers_interrupted_channel_runs_with_visible_retry_state() {
         let directory = tempdir().expect("temporary directory");
         let db = Database::open(&directory.path().join("wotbox.sqlite"))
@@ -10469,6 +12087,25 @@ mod tests {
             .await
             .expect("create run")
             .expect("new run");
+
+        assert!(
+            db.background_job_by_key(&format!("channel-refresh:{}", run.id))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.recover_channel_runs().await.unwrap();
+        assert_eq!(
+            db.get_channel_run(run.id).await.unwrap().unwrap().status,
+            ChannelRunStatus::Running
+        );
+        background_job::Entity::delete_many()
+            .filter(
+                background_job::Column::DeduplicationKey.eq(format!("channel-refresh:{}", run.id)),
+            )
+            .exec(&db.connection)
+            .await
+            .unwrap();
 
         db.recover_channel_runs().await.expect("recover runs");
 
@@ -11636,12 +13273,61 @@ mod tests {
                 sources: Vec::new(),
             },
         };
+        let credit = &release.release.artists[0];
+        let artist_key = format!("ops:{}", credit.key);
+        let artist = crate::model::LibraryArtistSummary {
+            id: None,
+            key: credit.key.clone(),
+            tracker: credit.tracker.clone(),
+            artist_id: None,
+            credit_source: credit.source.clone(),
+            sources: Vec::new(),
+            name: credit.name.clone(),
+            release_count: 1,
+            missing_count: 0,
+            artworks: Vec::new(),
+        };
+        let filter = super::LibraryProjectionFilter {
+            tracker: Some("ops".into()),
+            ..Default::default()
+        };
         assert!(
-            db.store_library_projection(true, &[], &[release.clone()], &[], &[], &HashSet::new(),)
-                .await
-                .expect("initial projection")
+            db.store_library_projection(
+                true,
+                None,
+                &[],
+                &[release.clone()],
+                &[artist],
+                &[(artist_key.clone(), release_id)],
+                &HashSet::new(),
+            )
+            .await
+            .expect("initial projection")
         );
         assert_eq!(db.library_projection_state().await.expect("state").0, 1);
+
+        let (artists, total) = db
+            .projected_library_artist_page(&filter, Some("artist"), 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(artists[0].release_count, 1);
+        let (releases, total) = db
+            .projected_library_release_page(
+                &filter,
+                Some("stable"),
+                Some(&artist_key),
+                "title",
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(releases[0].release.id, Some(release_id));
+
+        db.connection.execute_unprepared("DELETE FROM library_artist_projections; DELETE FROM library_artist_release_projections;")
+            .await.unwrap();
 
         library_projection_dirty::ActiveModel {
             release_id: Set(release_id.to_string()),
@@ -11659,6 +13345,7 @@ mod tests {
         assert!(
             !db.store_library_projection(
                 false,
+                None,
                 &dirty,
                 &[release.clone()],
                 &[],
@@ -11687,7 +13374,7 @@ mod tests {
         release.release_copies[0].present = false;
         let dirty = db.library_projection_dirty(10).await.expect("dirty rows");
         assert!(
-            db.store_library_projection(false, &dirty, &[release], &[], &[], &HashSet::new(),)
+            db.store_library_projection(false, None, &dirty, &[release], &[], &[], &HashSet::new(),)
                 .await
                 .expect("semantic refresh")
         );

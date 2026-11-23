@@ -60,8 +60,9 @@
 
   const artist = createQuery({
     queryKey: ["library-artist", initialId],
-    queryFn: () => api<LibraryArtistPage>(
-      `/api/v1/library/artists/${encodeURIComponent(initialId)}?limit=5000`
+    queryFn: ({ signal }) => api<LibraryArtistPage>(
+      `/api/v1/library/artists/${encodeURIComponent(initialId)}?limit=5000`,
+      { signal }
     ),
     staleTime: 30_000
   });

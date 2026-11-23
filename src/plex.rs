@@ -92,6 +92,17 @@ impl PlexIntegration {
         providers: &ProviderGovernor,
         target: &PlexScanTarget,
     ) -> Result<()> {
+        self.scan_with_class(client, providers, target, RequestClass::Background)
+            .await
+    }
+
+    pub async fn scan_with_class(
+        &self,
+        client: &reqwest::Client,
+        providers: &ProviderGovernor,
+        target: &PlexScanTarget,
+        class: RequestClass,
+    ) -> Result<()> {
         if !self.allows(target) {
             bail!("Plex scan target is not configured");
         }
@@ -100,7 +111,7 @@ impl PlexIntegration {
             self.base_url, target.section_id
         );
         providers
-            .execute("plex", RequestClass::Background, || async {
+            .execute("plex", class, || async {
                 let response = client
                     .get(&endpoint)
                     .header("X-Plex-Token", self.token.as_ref())

@@ -1,3 +1,5 @@
+import { parseSnapshotRevision, tagSnapshot } from "./snapshot";
+
 export type Provenance = {
   tracker: string;
   fetchedAt?: string;
@@ -949,6 +951,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       Boolean(body?.error?.retryable)
     );
   }
+  const revision = parseSnapshotRevision(response.headers.get("x-wotbox-snapshot"));
+  if (revision) tagSnapshot(body, revision);
   return body as T;
 }
 

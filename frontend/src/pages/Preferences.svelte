@@ -571,22 +571,21 @@
       <select bind:value={importCleanup}>
         <option value="keep">Keep the old torrent and files</option>
         <option value="remove_torrent">Remove the old torrent; keep its files</option>
-        <option value="delete_files">Remove the old torrent and delete its files</option>
+        <option value="delete_files" disabled>Automatic file deletion requires coordinated storage</option>
       </select>
       <small>This preference applies only to newly accepted replacement imports.</small>
     </label>
     <div class="notice-banner compact">
       <span>
-        <strong>Cleanup is fail-closed.</strong> Wotbox requires a complete replacement, an explicit
-        same-tracker unregistered response, Plex-managed paths, and proof that no active torrent
-        shares either path. If any check is uncertain, both copies are kept and the task moves to
-        Needs review.
+        Torrent removal requires a complete replacement, an explicit same-tracker unregistered
+        response, and Plex-managed paths. Wotbox keeps the files and requests a Plex refresh
+        for the old location.
       </span>
     </div>
     {#if importCleanup === "delete_files"}
       <div class="error-panel compact">
-        File deletion is enabled for future accepted replacements. Existing imports and baseline
-        library entries are never retroactively converted into deletion tasks.
+        The stored file deletion preference requires coordinated storage. Choose a cleanup
+        policy for future replacements.
       </div>
     {/if}
   </section>

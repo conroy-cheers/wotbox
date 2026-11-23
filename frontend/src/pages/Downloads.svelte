@@ -9,7 +9,7 @@
   import TrackerLinks from "../lib/TrackerLinks.svelte";
   import { releaseTypeColor } from "../lib/releasePresentation";
   import { positiveInteger, releaseViewPath, replaceView } from "../lib/routing";
-  import { currentDownload, liveDownloads } from "../lib/liveState";
+  import { liveDownloads, transferDownloads } from "../lib/liveState";
 
   const initial = new URLSearchParams(location.search);
   let view = $state<"imports" | "transfers">(initial.get("view") === "transfers" ? "transfers" : "imports");
@@ -18,12 +18,13 @@
   let urlSyncReady = false;
   const queryOptions = derived(limit, ($limit) => ({
     queryKey: ["downloads", $limit] as const,
-    queryFn: () => api<DownloadsPage>(`/api/v1/downloads?limit=${$limit}`)
+    queryFn: ({ signal }: { signal: AbortSignal }) => api<DownloadsPage>(`/api/v1/downloads?limit=${$limit}`, { signal })
   }));
   const downloads = createQuery(queryOptions);
+  const transfers = $derived(transferDownloads($downloads.data?.items ?? [], $liveDownloads));
   const imports = createQuery({
     queryKey: ["imports"],
-    queryFn: () => api<ImportsPage>("/api/v1/imports?limit=500")
+    queryFn: ({ signal }) => api<ImportsPage>("/api/v1/imports?limit=500", { signal })
   });
   const importAction = createMutation({
     mutationFn: ({ id, action }: { id: string; action: "retry" | "dismiss" }) =>
@@ -56,7 +57,8 @@
       "downloads",
       { client: item.download.client, infoHash: item.download.infoHash },
       false,
-      showClientDetails
+      showClientDetails,
+      item.variant?.tracker
     );
   }
 
@@ -172,8 +174,7 @@
     </div>
   {/if}
   <div class="download-grid">
-    {#each $downloads.data.items as item}
-      {@const download = currentDownload(item.download, $liveDownloads)}
+    {#each transfers as { item, download }}
       <article class="download-card release-type-coded" style={`--release-type-color: ${releaseTypeColor(item.release.releaseType)}`}>
         <div class="download-card-heading">
           <div class="release-mark large">{item.release.title.slice(0, 1).toUpperCase()}</div>

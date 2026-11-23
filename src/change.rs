@@ -3,13 +3,14 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
 
 use crate::{
     api::{AppState, refresh_library_projection, spawn_channel_scheduler},
     db::{Database, DownloadObservation},
-    model::DownloadState,
+    provider::ProviderRequestError,
+    qbittorrent::{DownloadClient, DownloadClientDelta},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -96,13 +97,19 @@ impl ChangeSet {
 pub struct ChangeHub {
     db: Database,
     cursor: watch::Sender<i64>,
+    epoch: Arc<str>,
 }
 
 impl ChangeHub {
     pub async fn new(db: Database) -> Result<Self> {
         let cursor = db.latest_change_cursor().await?;
         let (sender, _) = watch::channel(cursor);
-        Ok(Self { db, cursor: sender })
+        let epoch = db.change_epoch().await?.into();
+        Ok(Self {
+            db,
+            cursor: sender,
+            epoch,
+        })
     }
 
     pub async fn publish(&self, change: ChangeSet) -> Result<i64> {
@@ -118,6 +125,25 @@ impl ChangeHub {
         self.cursor.send_replace(cursor);
         tracing::debug!(cursor, scopes = %change.encode_scopes(), reason = %change.reason(), "published change event");
         Ok(cursor)
+    }
+
+    pub fn wake(&self) {
+        self.cursor.send_modify(|_| {});
+    }
+
+    pub fn encode_cursor(&self, cursor: i64) -> String {
+        format!("{}:{cursor}", self.epoch)
+    }
+
+    pub fn decode_cursor(&self, cursor: &str) -> Option<i64> {
+        let (epoch, sequence) = cursor.split_once(':')?;
+        if epoch != self.epoch.as_ref() {
+            return None;
+        }
+        sequence
+            .parse::<i64>()
+            .ok()
+            .filter(|sequence| *sequence >= 0)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<i64> {
@@ -145,13 +171,20 @@ impl ApplicationRuntime {
 
 pub fn spawn_application_observers(state: Arc<AppState>) -> ApplicationRuntime {
     let (stop, receiver) = watch::channel(false);
-    let handles = vec![
-        tokio::spawn(download_client_observer(state.clone(), receiver.clone())),
+    let mut handles = vec![
         tokio::spawn(provider_observer(state.clone(), receiver.clone())),
         tokio::spawn(library_projection_observer(state.clone(), receiver.clone())),
-        tokio::spawn(change_retention(state.clone(), receiver)),
-        spawn_channel_scheduler(state),
+        tokio::spawn(change_retention(state.clone(), receiver.clone())),
+        spawn_channel_scheduler(state.clone(), receiver.clone()),
     ];
+    for (name, client) in &state.download_clients {
+        handles.push(tokio::spawn(download_client_observer(
+            state.clone(),
+            name.clone(),
+            client.clone(),
+            receiver.clone(),
+        )));
+    }
     ApplicationRuntime { stop, handles }
 }
 
@@ -205,175 +238,114 @@ fn provider_change_fingerprint(mut statuses: Vec<crate::model::ProviderStatus>) 
     serde_json::to_string(&statuses).unwrap_or_default()
 }
 
-async fn download_client_observer(state: Arc<AppState>, mut stop: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut ticks = 0_u64;
+async fn download_client_observer(
+    state: Arc<AppState>,
+    name: String,
+    client: Arc<dyn DownloadClient>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut full_scan = tokio::time::Instant::now();
+    let mut delay = Duration::ZERO;
     let mut failures = 0_u32;
+    let mut pending = None;
     loop {
         tokio::select! {
             _ = stop.changed() => break,
-            _ = interval.tick() => {}
+            _ = tokio::time::sleep(delay) => {}
         }
-        ticks = ticks.wrapping_add(1);
-        let reset = ticks == 1 || ticks.is_multiple_of(300);
-        let mut changed = false;
-        let mut inventory_changed = false;
-        let mut live_updates = Vec::new();
-        let mut live_removals = Vec::new();
-        for (name, client) in &state.download_clients {
-            let scan_started_at = Utc::now();
-            match client.sync_downloads(reset).await {
+        delay = Duration::from_secs(1);
+        if pending.is_none() {
+            let started_at = Utc::now();
+            let reset = tokio::time::Instant::now() >= full_scan;
+            let response = tokio::select! {
+                _ = stop.changed() => break,
+                response = client.sync_downloads(reset) => response,
+            };
+            match response {
                 Ok(delta) => {
                     failures = 0;
-                    if delta.downloads.is_empty() && delta.removed.is_empty() && !delta.full_update
+                    if !delta.full_update && delta.downloads.is_empty() && delta.removed.is_empty()
                     {
+                        client.acknowledge_downloads().await;
                         continue;
                     }
-                    let observations = delta
-                        .downloads
-                        .iter()
-                        .map(|download| DownloadObservation {
-                            torrent_name: Some(download.name.clone()),
-                            live: download.live.clone(),
-                            announce_host: download.announce_host.clone(),
-                            tracker: download
-                                .announce_host
-                                .as_ref()
-                                .and_then(|host| state.announce_hosts.get(host))
-                                .cloned(),
-                            plex_target: state
-                                .plex
-                                .as_ref()
-                                .and_then(|plex| plex.target_for_path(&download.live.save_path)),
-                        })
-                        .collect::<Vec<_>>();
-                    if let Err(error) = state.db.observe_downloads(&observations).await {
-                        tracing::warn!(client = %name, %error, "could not persist qBittorrent delta");
-                        continue;
-                    }
-                    if let Err(error) = state.db.mark_downloads_removed(name, &delta.removed).await
-                    {
-                        tracing::warn!(client = %name, %error, "could not persist removed torrents");
-                        continue;
-                    }
-                    if delta.full_update
-                        && let Err(error) =
-                            state.db.complete_client_scan(name, scan_started_at).await
-                    {
-                        tracing::warn!(client = %name, %error, "could not complete qBittorrent snapshot");
-                    }
-                    reconcile_download_jobs(&state, name, &delta.downloads, &delta.removed).await;
-                    live_updates
-                        .extend(delta.downloads.iter().map(|download| download.live.clone()));
-                    live_removals.extend(
-                        delta
-                            .removed
-                            .iter()
-                            .map(|info_hash| json!({ "client": name, "infoHash": info_hash })),
-                    );
-                    let _ = state.db.sync_import_tasks().await;
-                    state.background_jobs.wake();
-                    changed = true;
-                    inventory_changed |= delta.inventory_changed;
+                    pending = Some((started_at, delta));
                 }
                 Err(error) => {
-                    failures = failures.saturating_add(1);
-                    tracing::warn!(client = %name, failures, %error, "qBittorrent observer failed");
-                    if failures == 1 {
-                        state
-                            .publish(
-                                ChangeSet::new(
-                                    "download_client_unavailable",
-                                    [ChangeScope::Providers, ChangeScope::Activity],
-                                )
-                                .with_resources(["providers", "downloads"]),
-                            )
-                            .await;
+                    if let Some(ProviderRequestError::Deferred { retry_at, .. }) =
+                        error.downcast_ref::<ProviderRequestError>()
+                    {
+                        delay = (*retry_at - Utc::now())
+                            .to_std()
+                            .unwrap_or_default()
+                            .max(delay);
+                        continue;
                     }
+                    failures = failures.saturating_add(1);
+                    delay = Duration::from_secs(2_u64.pow(failures.min(4)));
+                    tracing::warn!(client = %name, failures, %error, "download client observation failed");
+                    continue;
                 }
             }
         }
-        if changed {
-            let mut scopes = vec![ChangeScope::Activity, ChangeScope::Operations];
-            let mut resources = vec!["downloads"];
-            if inventory_changed {
-                scopes.push(ChangeScope::Channels);
-                resources.push("download-inventory");
+        let Some((started_at, delta)) = &pending else {
+            continue;
+        };
+        match apply_download_delta(&state, &name, *started_at, delta).await {
+            Ok(()) => {
+                client.acknowledge_downloads().await;
+                if delta.full_update {
+                    full_scan = tokio::time::Instant::now() + Duration::from_secs(300);
+                }
+                pending = None;
             }
-            state
-                .publish(
-                    ChangeSet::new("download_client_sync", scopes)
-                        .with_resources(resources)
-                        .with_payload(json!({
-                            "downloads": live_updates,
-                            "removed": live_removals,
-                        })),
-                )
-                .await;
-        }
-        if failures > 0 {
-            tokio::time::sleep(Duration::from_secs(2_u64.pow(failures.min(4)))).await;
+            Err(error) => {
+                // Keep the decoded batch until all local writes have succeeded. Do
+                // not request a later RID while this client's work is still pending.
+                tracing::warn!(client = %name, %error, "retrying download client delta");
+                delay = Duration::from_secs(2);
+            }
         }
     }
 }
 
-async fn reconcile_download_jobs(
+async fn apply_download_delta(
     state: &AppState,
-    client_name: &str,
-    downloads: &[crate::model::ObservedDownload],
-    removed: &[String],
-) {
-    let Ok(jobs) = state.db.list_jobs().await else {
-        return;
-    };
-    for job in jobs.into_iter().filter(|job| {
-        job.info_hash.is_some()
-            && state
-                .profiles
-                .get(&job.profile)
-                .is_some_and(|profile| profile.client == client_name)
-    }) {
-        let Some(hash) = job.info_hash.as_deref() else {
-            continue;
-        };
-        if let Some(download) = downloads
-            .iter()
-            .find(|download| download.live.info_hash.eq_ignore_ascii_case(hash))
-        {
-            let next = if download.live.progress >= 1.0 {
-                DownloadState::Complete
-            } else {
-                DownloadState::Active
-            };
-            let _ = state
-                .db
-                .update_progress(
-                    job.id,
-                    next,
-                    download.live.progress,
-                    download.live.download_speed,
-                    download.live.upload_speed,
-                    download.live.eta,
-                )
-                .await;
-        } else if removed
-            .iter()
-            .any(|removed| removed.eq_ignore_ascii_case(hash))
-        {
-            let _ = state
-                .db
-                .set_job_state(
-                    job.id,
-                    DownloadState::Unknown,
-                    Some((
-                        "torrent_missing",
-                        "Torrent is no longer present in qBittorrent",
-                    )),
-                )
-                .await;
-        }
-    }
+    name: &str,
+    started_at: chrono::DateTime<Utc>,
+    delta: &DownloadClientDelta,
+) -> Result<()> {
+    let observations = delta
+        .downloads
+        .iter()
+        .map(|download| DownloadObservation {
+            torrent_name: Some(download.name.clone()),
+            live: download.live.clone(),
+            announce_host: download.announce_host.clone(),
+            tracker: download
+                .announce_host
+                .as_ref()
+                .and_then(|host| state.announce_hosts.get(host))
+                .cloned(),
+            plex_target: state
+                .plex
+                .as_ref()
+                .and_then(|plex| plex.target_for_path(&download.live.save_path)),
+        })
+        .collect::<Vec<_>>();
+    let profiles = state
+        .profiles
+        .iter()
+        .filter(|(_, profile)| profile.client == name)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    state
+        .db
+        .publish_client_observation(name, started_at, delta, &observations, &profiles)
+        .await?;
+    state.background_jobs.wake();
+    state.changes.wake();
+    Ok(())
 }
 
 async fn change_retention(state: Arc<AppState>, mut stop: watch::Receiver<bool>) {
@@ -383,6 +355,12 @@ async fn change_retention(state: Arc<AppState>, mut stop: watch::Receiver<bool>)
         tokio::select! {
             _ = stop.changed() => break,
             _ = interval.tick() => {
+                if let Err(error) = state.db.prune_library_projection_stage(None).await {
+                    tracing::warn!(%error, "could not prune abandoned Library projection stages");
+                }
+                if let Err(error) = state.db.prune_inactive_inventory().await {
+                    tracing::warn!(%error, "could not prune inactive client inventory");
+                }
                 match state.db.prune_change_events(Utc::now() - chrono::Duration::hours(24)).await {
                     Ok(pruned) if pruned > 0 => tracing::debug!(pruned, "pruned change events"),
                     Ok(_) => {},
@@ -398,7 +376,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::provider_change_fingerprint;
-    use crate::model::{ProviderCircuitState, ProviderQueueCounts, ProviderStatus};
+    use crate::model::{DownloadState, ProviderCircuitState, ProviderQueueCounts, ProviderStatus};
 
     fn provider() -> ProviderStatus {
         ProviderStatus {
@@ -425,6 +403,76 @@ mod tests {
             can_pause: true,
             can_resume: false,
         }
+    }
+
+    #[tokio::test]
+    async fn successful_full_snapshot_reconciles_only_confirmed_missing_jobs() {
+        use crate::config::{Config, DownloadProfileConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            database_path: dir.path().join("snapshot.sqlite"),
+            ..Config::default()
+        };
+        config.download_profiles.insert(
+            "music".into(),
+            DownloadProfileConfig {
+                client: "music".into(),
+                save_path: "/music".into(),
+                tag: String::new(),
+                start_paused: false,
+            },
+        );
+        let state = super::AppState::new(&config).await.unwrap();
+        let profile = &state.profiles["music"];
+        let active = state
+            .db
+            .accept_download("ops", 1, profile, false, None)
+            .await
+            .unwrap();
+        let queued = state
+            .db
+            .accept_download("ops", 2, profile, false, None)
+            .await
+            .unwrap();
+        for job in [&active, &queued] {
+            state
+                .db
+                .update_job_metadata(job.id, Some(20), "aabbcc", "album")
+                .await
+                .unwrap();
+        }
+        state
+            .db
+            .set_job_state(active.id, DownloadState::Active, None)
+            .await
+            .unwrap();
+        let empty_snapshot = super::DownloadClientDelta {
+            full_update: true,
+            inventory_changed: false,
+            downloads: Vec::new(),
+            removed: Vec::new(),
+        };
+        super::apply_download_delta(&state, "music", chrono::Utc::now(), &empty_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.get_job(active.id).await.unwrap().unwrap().state,
+            DownloadState::Unknown
+        );
+        assert_eq!(
+            state.db.get_job(queued.id).await.unwrap().unwrap().state,
+            DownloadState::Queued
+        );
+        assert!(
+            state
+                .db
+                .library_index_status()
+                .await
+                .unwrap()
+                .last_successful_scan_at
+                .is_some()
+        );
     }
 
     #[test]

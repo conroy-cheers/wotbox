@@ -36,6 +36,8 @@
     defaultOptions: {
       queries: {
         staleTime: 20_000,
+        // JSON objects are tagged with the revision of the response that supplied them.
+        structuralSharing: false,
         retry: 1,
         refetchOnWindowFocus: false
       }

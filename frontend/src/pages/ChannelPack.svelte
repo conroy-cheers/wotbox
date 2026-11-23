@@ -34,7 +34,7 @@
 
   const pack = createQuery({
     queryKey: ["channel-pack", initialId],
-    queryFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}`)
+    queryFn: ({ signal }) => api<ChannelPack>(`/api/v1/channel-packs/${initialId}`, { signal })
   });
   const replan = createMutation({
     mutationFn: () => api<ChannelPack>(`/api/v1/channel-packs/${initialId}/replan`, { method: "POST" })
@@ -289,6 +289,7 @@
               title={item.release.title}
               source="channels"
               requestedTorrentId={item.replacement?.torrentId ?? item.plan?.torrentId}
+              requestedTracker={item.replacement?.tracker ?? item.plan?.tracker}
               fulfillment={item.fulfillment}
               onadd={item.replacement ? undefined : (variant) => choose(item, variant)}
             />

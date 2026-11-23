@@ -17,7 +17,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    api::{AppState, cleanup_download_stage, enrich_library_artist_credits, process_download},
+    api::{AppState, enrich_library_artist_credits},
     change::{ChangeScope, ChangeSet},
     db::{EnqueueBackgroundJob, StoredBackgroundJob},
     dedupe::{compute_raw_coverage, track_index_from_group},
@@ -29,6 +29,7 @@ use crate::{
     release_matcher::{
         DownloadMatchResult, MATCHER_VERSION, match_download_release, parse_download_release_name,
     },
+    submission::{TokenDispatchUncertain, process_download},
     tracker::SearchRequest,
 };
 
@@ -45,9 +46,14 @@ pub const PROCESS_IMPORT: &str = "process_import";
 pub const REFRESH_ARTIST_CATALOG: &str = "refresh_artist_catalog";
 pub const MATCH_DOWNLOAD_RELEASES: &str = "match_download_releases";
 pub const RECONCILE_LIBRARY_STORE: &str = "reconcile_library_store";
+const RECONCILE_LIBRARY_ADMISSIONS: &str = "reconcile_library_admissions";
 pub const MATERIALIZE_LIBRARY_ASSET: &str = "materialize_library_asset";
 
-const WORKER_LANES: [&str; 8] = [
+pub const REFRESH_CHANNEL: &str = "refresh_channel";
+const REFRESH_TRACKER_RELEASE: &str = "refresh_tracker_release";
+
+const WORKER_LANES: [&str; 9] = [
+    "channel",
     "event",
     "sync",
     "sync",
@@ -182,6 +188,31 @@ pub async fn enqueue(state: &AppState, request: EnqueueBackgroundJob<'_>) -> Res
     let id = state.db.enqueue_background_job(request).await?;
     state.background_jobs.wake();
     Ok(id)
+}
+
+pub async fn enqueue_release_refresh(state: &AppState, tracker: &str, group_id: i64) -> Result<()> {
+    let key = format!("release-refresh:{tracker}:{group_id}");
+    if state.db.retry_background_job_by_key(&key).await? {
+        state.background_jobs.wake();
+    } else {
+        enqueue(
+            state,
+            EnqueueBackgroundJob {
+                deduplication_key: &key,
+                kind: REFRESH_TRACKER_RELEASE,
+                payload: json!({ "tracker": tracker, "groupId": group_id }),
+                provider_id: Some(format!("tracker:{tracker}")),
+                lane: "sync",
+                priority: 25,
+                max_attempts: 8,
+                next_run_at: None,
+                parent_id: None,
+                recurring_interval_seconds: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub async fn enqueue_hash_resolution(
@@ -429,6 +460,22 @@ async fn bootstrap_jobs(state: &Arc<AppState>) -> Result<()> {
     enqueue(
         state,
         EnqueueBackgroundJob {
+            deduplication_key: "reconcile-library-admissions:v1",
+            kind: RECONCILE_LIBRARY_ADMISSIONS,
+            payload: json!({}),
+            provider_id: None,
+            lane: "maintenance",
+            priority: -11,
+            max_attempts: 20,
+            next_run_at: None,
+            parent_id: None,
+            recurring_interval_seconds: Some(300),
+        },
+    )
+    .await?;
+    enqueue(
+        state,
+        EnqueueBackgroundJob {
             deduplication_key: "enrich-library-artists:v1",
             kind: ENRICH_LIBRARY_ARTISTS,
             payload: json!({}),
@@ -494,6 +541,7 @@ async fn worker_loop(
         if *stop.borrow() {
             return;
         }
+        let claim_owner = format!("{owner}:{}", Uuid::new_v4());
         let job = {
             let _claim = claim_lock.lock().await;
             if let Err(error) = state.db.recover_expired_background_jobs().await {
@@ -501,7 +549,7 @@ async fn worker_loop(
             }
             match state
                 .db
-                .claim_background_job(&owner, &lane, LEASE_DURATION)
+                .claim_background_job(&claim_owner, &lane, LEASE_DURATION)
                 .await
             {
                 Ok(job) => job,
@@ -523,7 +571,7 @@ async fn worker_loop(
             }
             continue;
         };
-        run_claimed_job(&state, &owner, job, &mut stop).await;
+        run_claimed_job(&state, &claim_owner, job, &mut stop).await;
     }
 }
 
@@ -553,21 +601,40 @@ async fn run_claimed_job(
     }
     let operation_state = state.clone();
     let operation_job = job.clone();
+    let operation_owner = owner.to_owned();
     let mut operation = AbortOnDrop {
-        handle: tokio::spawn(async move { execute_job(&operation_state, &operation_job).await }),
+        handle: tokio::spawn(async move {
+            let lease = WorkLease {
+                id: operation_job.id,
+                owner: &operation_owner,
+            };
+            crate::db::run_with_job_claim(
+                operation_job.id,
+                operation_owner.clone(),
+                execute_job(&operation_state, &operation_job, lease),
+            )
+            .await
+        }),
     };
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await;
     let mut stopping = false;
+    let mut lease_deadline = Instant::now() + LEASE_DURATION;
     let outcome = loop {
         tokio::select! {
             outcome = &mut operation.handle => {
                 break outcome.unwrap_or_else(|error| Err(anyhow!("job operation task failed: {error}")));
             }
+            _ = tokio::time::sleep_until(lease_deadline) => {
+                operation.handle.abort();
+                let _ = (&mut operation.handle).await;
+                return;
+            }
             _ = heartbeat.tick() => {
+                let heartbeat_started = Instant::now();
                 match tokio::time::timeout(
-                    HEARTBEAT_TIMEOUT,
+                    HEARTBEAT_TIMEOUT.min(lease_deadline.saturating_duration_since(heartbeat_started)),
                     state.db.heartbeat_background_job(
                         job.id,
                         owner,
@@ -577,7 +644,7 @@ async fn run_claimed_job(
                         Some("Working"),
                     ),
                 ).await {
-                    Ok(Ok(true)) => {}
+                    Ok(Ok(true)) => lease_deadline = heartbeat_started + LEASE_DURATION,
                     Ok(Ok(false)) => {
                         operation.handle.abort();
                         let _ = (&mut operation.handle).await;
@@ -595,6 +662,14 @@ async fn run_claimed_job(
             }
         }
     };
+    if !state
+        .db
+        .owns_background_job(job.id, owner)
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => classify_error(state, &job, error).await,
@@ -616,7 +691,8 @@ async fn run_claimed_job(
     {
         if let Err(error) = state
             .db
-            .set_job_state(
+            .set_submission_state(
+                (job.id, owner),
                 payload.job_id,
                 crate::model::DownloadState::Failed,
                 Some((code, message)),
@@ -625,7 +701,6 @@ async fn run_claimed_job(
         {
             tracing::error!(job_id = %payload.job_id, %error, "could not persist terminal download failure");
         }
-        cleanup_download_stage(state, payload.job_id).await;
     }
     let result = match outcome {
         JobOutcome::Complete => state.db.complete_background_job(job.id, owner).await,
@@ -688,7 +763,8 @@ async fn run_claimed_job(
                 | RECONCILE_CANONICAL_RELEASES
                 | REPAIR_CANONICAL_IDENTITIES
                 | ENRICH_LIBRARY_ARTISTS
-                | REFRESH_ARTIST_CATALOG => resources.push("catalog"),
+                | REFRESH_ARTIST_CATALOG
+                | REFRESH_TRACKER_RELEASE => resources.push("catalog"),
                 NOTIFY_PLEX => resources.push("plex"),
                 RECONCILE_LIBRARY_STORE => {}
                 _ => {}
@@ -699,8 +775,38 @@ async fn run_claimed_job(
     }
 }
 
-async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result<JobOutcome> {
+#[derive(Clone, Copy)]
+pub(crate) struct WorkLease<'a> {
+    id: Uuid,
+    owner: &'a str,
+}
+
+impl<'a> WorkLease<'a> {
+    pub(crate) fn key(self) -> (Uuid, &'a str) {
+        (self.id, self.owner)
+    }
+
+    pub(crate) async fn check(self, db: &crate::db::Database) -> Result<()> {
+        anyhow::ensure!(
+            db.owns_background_job(self.id, self.owner).await?,
+            "Background job no longer owns its lease"
+        );
+        Ok(())
+    }
+}
+
+async fn execute_job(
+    state: &Arc<AppState>,
+    job: &StoredBackgroundJob,
+    lease: WorkLease<'_>,
+) -> Result<JobOutcome> {
     match job.kind.as_str() {
+        REFRESH_TRACKER_RELEASE => {
+            let payload: TrackerGroupPayload = serde_json::from_value(job.payload.clone())?;
+            crate::api::refresh_group(state.clone(), payload.tracker, payload.group_id).await?;
+            Ok(JobOutcome::Complete)
+        }
+        REFRESH_CHANNEL => run_channel_refresh(state, &job.payload).await,
         RESOLVE_DOWNLOAD_HASH => resolve_download_hash(state, &job.payload).await,
         INDEX_TRACKLIST => index_tracklist(state, job.id, &job.payload).await,
         COMPUTE_SINGLE_COVERAGE => compute_single_coverage(state, &job.payload).await,
@@ -712,14 +818,48 @@ async fn execute_job(state: &Arc<AppState>, job: &StoredBackgroundJob) -> Result
             Ok(JobOutcome::Complete)
         }
         NOTIFY_PLEX => notify_plex(state, &job.payload).await,
-        SUBMIT_DOWNLOAD => submit_download(state, &job.payload).await,
-        PROCESS_IMPORT => process_import(state, &job.payload).await,
+        SUBMIT_DOWNLOAD => submit_download(state, &job.payload, lease).await,
+        PROCESS_IMPORT => process_import(state, &job.payload, lease).await,
         REFRESH_ARTIST_CATALOG => refresh_artist_catalog(state, &job.payload).await,
         MATCH_DOWNLOAD_RELEASES => match_download_releases(state).await,
         RECONCILE_LIBRARY_STORE => reconcile_library_store(state).await,
+        RECONCILE_LIBRARY_ADMISSIONS => reconcile_library_admissions(state).await,
         MATERIALIZE_LIBRARY_ASSET => materialize_library_asset(state, job).await,
         kind => Err(anyhow!("unknown background job kind {kind}")),
     }
+}
+
+async fn run_channel_refresh(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+    let id = payload
+        .get("runId")
+        .and_then(Value::as_str)
+        .context("missing channel run ID")?;
+    let id = Uuid::parse_str(id)?;
+    let Some(run) = state.db.get_channel_run(id).await? else {
+        return Ok(JobOutcome::Complete);
+    };
+    if run.status != crate::model::ChannelRunStatus::Running {
+        return Ok(JobOutcome::Complete);
+    }
+    let config = state.db.get_channel(&run.channel_id).await?;
+    let outcome = match config {
+        Some(config) => crate::channel::refresh_channel(state.clone(), config, run.id).await,
+        None => Err(anyhow!("Channel configuration disappeared")),
+    };
+    if let Err(error) = outcome {
+        let message = error.to_string();
+        state
+            .db
+            .finish_channel_run(
+                id,
+                crate::model::ChannelRunStatus::Failed,
+                None,
+                Some(&message),
+            )
+            .await?;
+    }
+    state.changes.wake();
+    Ok(JobOutcome::Complete)
 }
 
 fn announce_tracker_hint(host: Option<&str>) -> Option<&'static str> {
@@ -756,7 +896,10 @@ async fn match_download_releases(state: &Arc<AppState>) -> Result<JobOutcome> {
                 "Automatic matching could not identify a release title in the torrent name",
             )
             .await?;
-        state.db.sync_import_tasks().await?;
+        state
+            .db
+            .sync_import_link(&link.client, &link.info_hash)
+            .await?;
         return Ok(more_download_matches());
     }
 
@@ -846,7 +989,10 @@ async fn match_download_releases(state: &Arc<AppState>) -> Result<JobOutcome> {
                 .await?;
         }
     }
-    state.db.sync_import_tasks().await?;
+    state
+        .db
+        .sync_import_link(&link.client, &link.info_hash)
+        .await?;
     Ok(more_download_matches())
 }
 
@@ -891,23 +1037,42 @@ async fn reconcile_library_store(state: &Arc<AppState>) -> Result<JobOutcome> {
     for source_url in state.db.library_artwork_sources(500).await? {
         state.db.ensure_library_asset(&source_url).await?;
     }
-    let changed = state.db.reconcile_library_admissions(100).await?;
-    if changed > 0 {
-        tracing::debug!(
-            changed,
-            "library admissions changed; projection refresh queued"
-        );
-    }
     let unreferenced = state
         .db
         .prune_unreferenced_library_assets(Utc::now() - ChronoDuration::days(30), 100)
         .await?;
-    for (blob_hash, extension) in unreferenced {
-        if let Err(error) = state.asset_store.remove_blob(&blob_hash, &extension).await {
+    for (blob_hash, extension, version) in unreferenced {
+        let pruning = state.asset_store.lock_blob(&blob_hash, version).await;
+        if !state.db.can_prune_library_blob(&blob_hash, version).await? {
+            continue;
+        }
+        if let Err(error) = state
+            .asset_store
+            .remove_blob(&pruning, &blob_hash, &extension, version)
+            .await
+        {
             tracing::warn!(%blob_hash, %error, "could not remove unreferenced Library asset blob");
+        } else {
+            state.db.finish_blob_prune(&blob_hash, version).await?;
         }
     }
     state.background_jobs.wake();
+    Ok(JobOutcome::Complete)
+}
+
+async fn reconcile_library_admissions(state: &AppState) -> Result<JobOutcome> {
+    let changed = state.db.reconcile_library_admissions(100).await?;
+    if changed > 0 {
+        tracing::debug!(changed, "library admissions changed");
+    }
+    if state.db.library_admission_pass_has_next().await? {
+        return Ok(JobOutcome::Retry {
+            delay: Duration::from_secs(1),
+            increment_attempt: false,
+            code: "admission_batch_remaining",
+            message: "More releases remain in the current admission pass".into(),
+        });
+    }
     Ok(JobOutcome::Complete)
 }
 
@@ -924,7 +1089,7 @@ async fn materialize_library_asset(
 ) -> Result<JobOutcome> {
     let payload: LibraryAssetPayload = serde_json::from_value(job.payload.clone())?;
     let outcome = match state.asset_store.materialize(&payload.source_url).await {
-        Ok(asset) => {
+        Ok((asset, _publication)) => {
             anyhow::ensure!(
                 asset.source_hash == payload.source_hash,
                 "Library asset source identity changed during materialization"
@@ -1021,7 +1186,11 @@ struct DownloadSubmissionPayload {
     job_id: Uuid,
 }
 
-async fn submit_download(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+async fn submit_download(
+    state: &Arc<AppState>,
+    payload: &Value,
+    lease: WorkLease<'_>,
+) -> Result<JobOutcome> {
     let payload: DownloadSubmissionPayload = serde_json::from_value(payload.clone())?;
     let Some(job) = state.db.get_job(payload.job_id).await? else {
         return Ok(JobOutcome::Fail {
@@ -1038,7 +1207,7 @@ async fn submit_download(state: &Arc<AppState>, payload: &Value) -> Result<JobOu
     ) {
         return Ok(JobOutcome::Complete);
     }
-    process_download(state.clone(), job).await?;
+    process_download(state, job, lease).await?;
     Ok(JobOutcome::Complete)
 }
 
@@ -1048,7 +1217,11 @@ struct ImportProcessingPayload {
     import_id: Uuid,
 }
 
-async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOutcome> {
+async fn process_import(
+    state: &Arc<AppState>,
+    payload: &Value,
+    lease: WorkLease<'_>,
+) -> Result<JobOutcome> {
     let payload: ImportProcessingPayload = serde_json::from_value(payload.clone())?;
     let Some((task, supersessions)) = state.db.import_task_models(payload.import_id).await? else {
         return Ok(JobOutcome::Fail {
@@ -1058,6 +1231,14 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
     };
     if matches!(task.state.as_str(), "complete" | "dismissed") {
         return Ok(JobOutcome::Complete);
+    }
+
+    if !supersessions.is_empty()
+        && supersessions
+            .iter()
+            .all(|source| matches!(source.cleanup_state.as_str(), "removed" | "retained"))
+    {
+        return finish_import_cleanup(state, payload.import_id).await;
     }
 
     let mut target_client = task.client.clone();
@@ -1096,9 +1277,16 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
             });
         }
         target_client = state
-            .profiles
-            .get(&job.profile)
-            .map(|profile| profile.client.clone());
+            .db
+            .download_destination(job.id)
+            .await?
+            .map(|profile| profile.client)
+            .or_else(|| {
+                state
+                    .profiles
+                    .get(&job.profile)
+                    .map(|profile| profile.client.clone())
+            });
         target_hash = job.info_hash;
     }
     let (Some(target_client), Some(target_hash)) = (target_client, target_hash) else {
@@ -1118,10 +1306,18 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
             message: "Waiting for the replacement torrent to be submitted".into(),
         });
     };
-    state
+    if !state
         .db
         .bind_import_target(payload.import_id, &target_client, &target_hash)
-        .await?;
+        .await?
+    {
+        return block_import(
+            state,
+            payload.import_id,
+            "Another replacement import owns this client torrent; review the source obligations",
+        )
+        .await;
+    }
     let Some(target_qbit) = state.download_clients.get(&target_client) else {
         return block_import(
             state,
@@ -1130,8 +1326,26 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
         )
         .await;
     };
+    if !state
+        .db
+        .import_client_matches(
+            payload.import_id,
+            &target_client,
+            &target_hash,
+            false,
+            target_qbit.instance_id().as_deref(),
+        )
+        .await?
+    {
+        return block_import(
+            state,
+            payload.import_id,
+            "The replacement's accepted download client could not be verified",
+        )
+        .await;
+    }
     let Some(target) = target_qbit
-        .download_with_class(&target_hash, RequestClass::Background)
+        .download_with_class(&target_hash, RequestClass::Scheduled)
         .await?
     else {
         return Ok(JobOutcome::Retry {
@@ -1221,6 +1435,48 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
         .await;
     };
 
+    let target_scan_key = format!(
+        "cleanup-target:{}:{}",
+        payload.import_id,
+        target_scan.key_for_bucket(0)
+    );
+    match state
+        .db
+        .background_job_by_key(&target_scan_key)
+        .await?
+        .map(|job| job.state)
+    {
+        Some(crate::model::BackgroundJobState::Completed) => {}
+        Some(
+            crate::model::BackgroundJobState::Failed | crate::model::BackgroundJobState::Cancelled,
+        ) => {
+            return block_import(state, payload.import_id,
+                "The replacement Plex refresh failed. Retry the refresh in Background work, then retry this import.",
+            ).await;
+        }
+        outcome => {
+            if outcome.is_none() {
+                enqueue(state, EnqueueBackgroundJob {
+                    deduplication_key: &target_scan_key,
+                    kind: NOTIFY_PLEX,
+                    payload: json!({ "sectionId": target_scan.section_id, "root": target_scan.root }),
+                    provider_id: Some("plex".into()),
+                    lane: "event",
+                    priority: 30,
+                    max_attempts: 10,
+                    next_run_at: None,
+                    parent_id: None,
+                    recurring_interval_seconds: None,
+                }).await?;
+            }
+            return Ok(JobOutcome::Retry {
+                delay: Duration::from_secs(3),
+                increment_attempt: false,
+                code: "replacement_scan_pending",
+                message: "Waiting for Plex to acknowledge the replacement refresh".into(),
+            });
+        }
+    }
     state
         .db
         .set_import_state(
@@ -1235,10 +1491,9 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
         client: Arc<dyn crate::qbittorrent::DownloadClient>,
         client_name: String,
         info_hash: String,
-        delete_files: bool,
         scan_target: PlexScanTarget,
     }
-    let mut cleanup = Vec::new();
+    let mut cleanup = None;
     for source in supersessions {
         if source.cleanup_state == "removed" || source.cleanup_state == "retained" {
             continue;
@@ -1256,6 +1511,11 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
                 .await;
             }
         };
+        if cleanup_mode == ImportCleanupMode::DeleteFiles {
+            return block_import(state, payload.import_id,
+                "Automatic file deletion requires coordinated storage ownership. Choose torrent-only removal or retain this source.",
+            ).await;
+        }
         if cleanup_mode == ImportCleanupMode::Keep {
             state
                 .db
@@ -1289,24 +1549,42 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
             )
             .await;
         };
+        if !state
+            .db
+            .import_client_matches(
+                payload.import_id,
+                &source.source_client,
+                &source.source_info_hash,
+                true,
+                client.instance_id().as_deref(),
+            )
+            .await?
+        {
+            return block_import(
+                state,
+                payload.import_id,
+                "The source's accepted download client could not be verified",
+            )
+            .await;
+        }
         let Some(old) = client
-            .download_with_class(&source.source_info_hash, RequestClass::Background)
+            .download_with_class(&source.source_info_hash, RequestClass::Scheduled)
             .await?
         else {
             state
                 .db
-                .set_supersession_state(
+                .settle_cleanup_removal(
                     payload.import_id,
                     &source.source_client,
                     &source.source_info_hash,
-                    "removed",
-                    Some("The old torrent was already absent from qBittorrent"),
+                    "The old torrent was already absent from qBittorrent",
                 )
                 .await?;
+            state.background_jobs.wake();
             continue;
         };
         let statuses = client
-            .tracker_statuses_with_class(&source.source_info_hash, RequestClass::Background)
+            .tracker_statuses_with_class(&source.source_info_hash, RequestClass::Scheduled)
             .await?;
         if !statuses.iter().any(|status| {
             status
@@ -1350,76 +1628,86 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
             )
             .await;
         }
-        for (other_client_name, other_client) in &state.download_clients {
-            let active = other_client
-                .downloads_with_class(100_000, 0, RequestClass::Background)
-                .await?;
-            if active.iter().any(|other| {
-                !(other_client_name == &source.source_client
-                    && other
-                        .live
-                        .info_hash
-                        .eq_ignore_ascii_case(&source.source_info_hash))
-                    && other
-                        .live
-                        .content_path
-                        .as_deref()
-                        .is_some_and(|path| paths_overlap(path, old_path))
-            }) {
-                return block_import(
-                    state,
-                    payload.import_id,
-                    "Cleanup is blocked because another active torrent shares the old content path",
-                )
-                .await;
-            }
+        if source.source_client == target_client
+            && source.source_info_hash.eq_ignore_ascii_case(&target_hash)
+        {
+            return block_import(
+                state,
+                payload.import_id,
+                "The source and replacement resolve to the same client torrent",
+            )
+            .await;
         }
-        cleanup.push(CleanupPlan {
+        cleanup = Some(CleanupPlan {
             client,
             client_name: source.source_client,
             info_hash: source.source_info_hash,
-            delete_files: cleanup_mode == ImportCleanupMode::DeleteFiles,
             scan_target: old_scan,
         });
+        break;
     }
 
-    // The replacement must be visible to Plex before any old payload can be removed.
-    plex.scan(&state.source_client, &state.providers, &target_scan)
-        .await?;
-    for plan in cleanup {
-        plan.client
-            .delete_torrent(&plan.info_hash, plan.delete_files)
-            .await?;
-        state
+    if let Some(plan) = cleanup {
+        lease.check(&state.db).await?;
+        if !state
             .db
-            .set_supersession_state(
+            .record_cleanup_intent(
                 payload.import_id,
                 &plan.client_name,
                 &plan.info_hash,
-                "removed",
-                Some(if plan.delete_files {
-                    "Removed the trumped torrent and its payload after guarded verification"
-                } else {
-                    "Removed the trumped torrent and retained its payload"
-                }),
+                &plan.scan_target,
+            )
+            .await?
+        {
+            return block_import(
+                state,
+                payload.import_id,
+                "Another import is reconciling removal of this source torrent",
+            )
+            .await;
+        }
+        lease.check(&state.db).await?;
+        plan.client.delete_torrent(&plan.info_hash, false).await?;
+        lease.check(&state.db).await?;
+        state
+            .db
+            .settle_cleanup_removal(
+                payload.import_id,
+                &plan.client_name,
+                &plan.info_hash,
+                "Removed the trumped torrent and retained its payload",
             )
             .await?;
-        plex.scan(&state.source_client, &state.providers, &plan.scan_target)
-            .await?;
+        state.background_jobs.wake();
+        return Ok(JobOutcome::Retry {
+            delay: Duration::from_secs(1),
+            increment_attempt: false,
+            code: "cleanup_step_complete",
+            message: "Source removal recorded. Continuing replacement cleanup".into(),
+        });
+    }
+    finish_import_cleanup(state, payload.import_id).await
+}
+
+async fn finish_import_cleanup(state: &AppState, import_id: Uuid) -> Result<JobOutcome> {
+    match state.db.cleanup_scan_status(import_id).await? {
+        crate::db::CleanupScanStatus::Pending => return Ok(JobOutcome::Retry {
+            delay: Duration::from_secs(15),
+            increment_attempt: false,
+            code: "cleanup_scan_pending",
+            message: "Waiting for Plex to acknowledge the source refresh".into(),
+        }),
+        crate::db::CleanupScanStatus::Failed => return block_import(state, import_id,
+            "A source Plex refresh failed. Retry the refresh in Background work, then retry this import.",
+        ).await,
+        crate::db::CleanupScanStatus::Complete => {}
     }
     state
         .db
-        .set_import_state(
-            payload.import_id,
+        .finish_import_and_sources(
+            import_id,
             ImportTaskState::Complete,
-            Some("Replacement import and supersession cleanup completed"),
-            None,
-        )
-        .await?;
-    state
-        .db
-        .set_superseded_source_states(
-            payload.import_id,
+            "Replacement import and supersession cleanup completed",
             ImportTaskState::Complete,
             "Supersession workflow completed",
         )
@@ -1430,11 +1718,13 @@ async fn process_import(state: &Arc<AppState>, payload: &Value) -> Result<JobOut
 async fn block_import(state: &AppState, import_id: Uuid, reason: &str) -> Result<JobOutcome> {
     state
         .db
-        .set_import_state(import_id, ImportTaskState::Blocked, Some(reason), None)
-        .await?;
-    state
-        .db
-        .set_superseded_source_states(import_id, ImportTaskState::NeedsReview, reason)
+        .finish_import_and_sources(
+            import_id,
+            ImportTaskState::Blocked,
+            reason,
+            ImportTaskState::NeedsReview,
+            reason,
+        )
         .await?;
     Ok(JobOutcome::Complete)
 }
@@ -1908,6 +2198,18 @@ async fn classify_error(
     job: &StoredBackgroundJob,
     error: anyhow::Error,
 ) -> JobOutcome {
+    if error.is::<crate::submission::DownloadDestinationChanged>() {
+        return JobOutcome::Fail {
+            code: "download_destination_changed",
+            message: error.to_string(),
+        };
+    }
+    if error.downcast_ref::<TokenDispatchUncertain>().is_some() {
+        return JobOutcome::Fail {
+            code: "token_dispatch_uncertain",
+            message: error.to_string(),
+        };
+    }
     let provider_error = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ProviderRequestError>());

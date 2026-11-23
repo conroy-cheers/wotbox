@@ -48,7 +48,7 @@
   });
   const jobStatusOptions = derived(monitoredJobId, (id) => ({
     queryKey: ["download-job", id] as const,
-    queryFn: () => api<DownloadJob>(`/api/v1/download-jobs/${id}`),
+    queryFn: ({ signal }: { signal: AbortSignal }) => api<DownloadJob>(`/api/v1/download-jobs/${id}`, { signal }),
     enabled: Boolean(id)
   }));
   const jobStatus = createQuery(jobStatusOptions);

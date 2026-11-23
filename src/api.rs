@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::Write,
     path::{Path as StdPath, PathBuf},
     sync::Arc,
     time::Duration,
@@ -35,7 +34,7 @@ use crate::{
     change::{ChangeHub, ChangeScope, ChangeSet},
     channel,
     config::{Config, DownloadClientKind, TrackerKind, read_secret},
-    db::{Cached, CreateReplacementImport, Database, LibraryProjectionFilter},
+    db::{Cached, Database, DownloadRequestConflict, LibraryProjectionFilter, PackDecisionResult},
     dedupe::track_index_from_group,
     model::{
         Account, ApiEnvelope, ArtistCatalogPage, ArtistCatalogRelease, ArtistCatalogRole,
@@ -55,9 +54,10 @@ use crate::{
     plex::PlexIntegration,
     provider::{ProviderDefinition, ProviderGovernor, ProviderRequestError, RequestClass},
     qbittorrent::{DownloadClient, QbittorrentClient},
+    submission::cleanup_orphaned_download_stages,
     tracker::{
         GazelleTrackerClient, SearchRequest, TrackerClient, fallback_artist_credit,
-        search_cache_key, torrent_info_hash,
+        search_cache_key,
     },
 };
 
@@ -79,7 +79,7 @@ pub struct AppState {
     pub background_jobs: BackgroundJobNotifier,
     pub changes: ChangeHub,
     pub asset_store: AssetStore,
-    download_staging_dir: PathBuf,
+    pub(crate) download_staging_dir: PathBuf,
     _instance_lock: Arc<File>,
 }
 
@@ -172,6 +172,15 @@ impl AppState {
             };
             download_clients.insert(name.clone(), client);
         }
+        let client_instances = download_clients
+            .iter()
+            .filter_map(|(name, client)| {
+                client
+                    .instance_id()
+                    .map(|instance| (name.clone(), instance))
+            })
+            .collect();
+        db.sync_client_instances(&client_instances).await?;
         let profiles = config
             .download_profiles
             .iter()
@@ -334,12 +343,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/download-profiles", get(download_profiles))
         .route("/api/v1/library/artists", get(library_artists))
+        .route("/api/v1/library/status", get(library_status))
         .route("/api/v1/library/artists/{id}", get(library_artist))
         .route(
             "/api/v1/library/artists/{id}/refresh",
             axum::routing::post(refresh_library_artist),
         )
         .route("/api/v1/assets/{source_hash}/{variant}", get(library_asset))
+        .route(
+            "/api/v1/asset-blobs/{hash}/{version}/{variant}",
+            get(library_asset_blob),
+        )
         .route("/api/v1/downloads", get(downloads).post(create_download))
         .route("/api/v1/imports", get(imports))
         .route(
@@ -392,6 +406,27 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn snapshot_api_path(path: &str) -> bool {
+    let Some((_, target)) = path.split_once("/api/v1/") else {
+        return false;
+    };
+    matches!(
+        target,
+        "downloads" | "imports" | "library/status" | "library/artists"
+    ) || [
+        "download-jobs/",
+        "library/artists/",
+        "releases/",
+        "channel-packs/",
+    ]
+    .iter()
+    .any(|prefix| {
+        target
+            .strip_prefix(prefix)
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    })
+}
+
 async fn publish_http_mutation(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -399,9 +434,36 @@ async fn publish_http_mutation(
 ) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let response = next.run(request).await;
+    let asks_refresh = request.uri().query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "refresh" && value == "true")
+    });
+    let versioned_read =
+        method == axum::http::Method::GET && !asks_refresh && snapshot_api_path(&path);
+    let (mut response, snapshot_cursor) = if versioned_read {
+        match state.db.read_snapshot(next.run(request)).await {
+            Ok((cursor, response)) => (response, Some(state.changes.encode_cursor(cursor))),
+            Err(error) => return AppError::from(error).into_response(),
+        }
+    } else {
+        (next.run(request).await, None)
+    };
+    let json_snapshot = response.status().is_success()
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"));
+    if (json_snapshot || response.status() == StatusCode::NOT_MODIFIED)
+        && let Some(cursor) = snapshot_cursor
+        && let Ok(value) = HeaderValue::from_str(&cursor)
+    {
+        response.headers_mut().insert("x-wotbox-snapshot", value);
+    }
     if !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
         && response.status().is_success()
+        && !(path.contains("/channel-packs/")
+            && (path.ends_with("/accept") || path.ends_with("/reject")))
     {
         let scopes = if path.contains("/providers/") {
             vec![ChangeScope::Providers, ChangeScope::Operations]
@@ -468,7 +530,7 @@ async fn publish_http_mutation(
 
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
-    after: Option<i64>,
+    after: Option<String>,
 }
 
 async fn events(
@@ -479,8 +541,8 @@ async fn events(
     let requested = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .or(query.after)
+        .or(query.after.as_deref())
+        .and_then(|cursor| state.changes.decode_cursor(cursor))
         .unwrap_or(0);
     let mut wake = state.changes.subscribe();
     let (sender, receiver) =
@@ -489,16 +551,10 @@ async fn events(
         let mut cursor = requested;
         let latest = state.db.latest_change_cursor().await.unwrap_or_default();
         let oldest = state.db.oldest_change_cursor().await.ok().flatten();
-        let invalid =
-            cursor > latest || oldest.is_some_and(|oldest| cursor > 0 && cursor < oldest - 1);
+        let invalid = cursor > latest
+            || oldest.map_or(cursor < latest, |oldest| cursor > 0 && cursor < oldest - 1);
         if invalid || cursor == 0 {
-            cursor = latest;
-            let data = json!({ "cursor": cursor, "scopes": ["global"], "reason": "stream_reset" });
-            if sender
-                .send(Ok(Event::default()
-                    .event("reset")
-                    .id(cursor.to_string())
-                    .data(data.to_string())))
+            if send_stream_reset(&state, &sender, &mut cursor, latest)
                 .await
                 .is_err()
             {
@@ -524,8 +580,11 @@ async fn events(
                     }
                 }
                 _ = heartbeat.tick() => {
+                    if send_change_replay(&state, &sender, &mut cursor).await.is_err() {
+                        break;
+                    }
                     let data = json!({ "cursor": cursor });
-                    if sender.send(Ok(Event::default().event("ping").id(cursor.to_string()).data(data.to_string()))).await.is_err() {
+                    if sender.send(Ok(Event::default().event("ping").id(state.changes.encode_cursor(cursor)).data(data.to_string()))).await.is_err() {
                         break;
                     }
                 }
@@ -552,6 +611,23 @@ async fn events(
     )
 }
 
+async fn send_stream_reset(
+    state: &AppState,
+    sender: &tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    cursor: &mut i64,
+    latest: i64,
+) -> std::result::Result<(), ()> {
+    *cursor = latest;
+    let data = json!({ "cursor": latest, "scopes": ["global"], "reason": "stream_reset" });
+    sender
+        .send(Ok(Event::default()
+            .event("reset")
+            .id(state.changes.encode_cursor(latest))
+            .data(data.to_string())))
+        .await
+        .map_err(|_| ())
+}
+
 async fn send_change_replay(
     state: &AppState,
     sender: &tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
@@ -565,6 +641,14 @@ async fn send_change_replay(
             .map_err(|error| {
                 tracing::warn!(%error, cursor = *cursor, "could not replay change events");
             })?;
+        let history_gap = match events.first() {
+            Some(event) => event.id > cursor.saturating_add(1),
+            None => state.db.latest_change_cursor().await.map_err(|_| ())? > *cursor,
+        };
+        if history_gap {
+            let latest = state.db.latest_change_cursor().await.map_err(|_| ())?;
+            return send_stream_reset(state, sender, cursor, latest).await;
+        }
         if events.is_empty() {
             return Ok(());
         }
@@ -612,7 +696,7 @@ async fn send_change_replay(
         sender
             .send(Ok(Event::default()
                 .event("changes")
-                .id(cursor.to_string())
+                .id(state.changes.encode_cursor(*cursor))
                 .data(data.to_string())))
             .await
             .map_err(|_| ())?;
@@ -1009,8 +1093,17 @@ async fn replan_channel_pack(
     let items = channel::replan_items(&state, pack.items).await?;
     state
         .db
-        .replace_channel_plan(id, &fingerprint, &items)
-        .await?;
+        .replace_channel_plan(
+            id,
+            pack.plan_version,
+            &fingerprint,
+            &items,
+            &preferences,
+            None,
+        )
+        .await?
+        .ok_or_else(pack_decision_conflict)?;
+    state.changes.wake();
     let mut pack = state
         .db
         .get_channel_pack(id, &fingerprint)
@@ -1043,13 +1136,20 @@ async fn attach_channel_pack_item(
         channel::resolve_release(&state, source.clone(), request.release_id, &preferences)
             .await
             .map_err(|error| AppError::bad_request("invalid_channel_match", error))?;
-    channel::persist_external_source_link(&state, &source, request.release_id, "manual", None)
-        .await?;
     channel::coordinate_pack_plan(&state, &mut pack.items, &preferences).await;
     state
         .db
-        .replace_channel_plan(id, &fingerprint, &pack.items)
-        .await?;
+        .replace_channel_plan(
+            id,
+            request.plan_version,
+            &fingerprint,
+            &pack.items,
+            &preferences,
+            Some((&source, request.release_id)),
+        )
+        .await?
+        .ok_or_else(pack_decision_conflict)?;
+    state.changes.wake();
     let mut pack = state
         .db
         .get_channel_pack(id, &fingerprint)
@@ -1067,13 +1167,43 @@ async fn reject_channel_pack(
     Path(id): Path<Uuid>,
     Json(request): Json<DecideChannelPack>,
 ) -> Result<Json<ChannelPack>, AppError> {
-    let fingerprint =
-        channel::preference_fingerprint(&state, &state.db.get_runtime_preferences().await?)?;
-    let pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
-    state
-        .db
-        .decide_channel_pack(pack.id, ChannelPackDecision::Rejected)
-        .await?;
+    let preferences = state.db.get_runtime_preferences().await?;
+    let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
+    let receipt = json!({"decision": "rejected", "version": request.plan_version});
+    if state.db.pack_receipt(id, &receipt).await?.is_none() {
+        match load_open_pack(&state, id, request.plan_version, &fingerprint).await {
+            Ok(pack) => {
+                pack_decision_result(
+                    state
+                        .db
+                        .commit_channel_pack_decision(
+                            pack,
+                            receipt.clone(),
+                            None,
+                            None,
+                            &fingerprint,
+                            ChannelPackDecision::Rejected,
+                            &preferences,
+                            &state.profiles,
+                            &HashMap::new(),
+                        )
+                        .await?,
+                )?;
+            }
+            Err(error) if state.db.pack_receipt(id, &receipt).await?.is_none() => {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
+    pack_decision_result(
+        state
+            .db
+            .pack_receipt(id, &receipt)
+            .await?
+            .ok_or_else(pack_decision_conflict)?,
+    )?;
+    state.changes.wake();
     Ok(Json(
         state
             .db
@@ -1089,15 +1219,31 @@ async fn accept_channel_pack(
     Path(id): Path<Uuid>,
     Json(request): Json<DecideChannelPack>,
 ) -> Result<(StatusCode, Json<ChannelBatchResult>), AppError> {
-    let preferences = state.db.get_runtime_preferences().await?;
-    let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
-    let mut pack = load_open_pack(&state, id, request.plan_version, &fingerprint).await?;
-    hydrate_pack_jobs(&state, &mut pack).await?;
-    channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
-    project_pack_fulfillment(&state, &mut pack).await?;
     let selected = request
         .ordinals
         .map(|ordinals| ordinals.into_iter().collect::<HashSet<_>>());
+    let canonical_selection = selected
+        .as_ref()
+        .map(|ordinals| ordinals.iter().copied().collect::<BTreeSet<_>>());
+    let receipt = json!({"decision": "accepted", "version": request.plan_version, "ordinals": canonical_selection});
+    if let Some(result) = state.db.pack_receipt(id, &receipt).await? {
+        return Ok((StatusCode::ACCEPTED, Json(pack_decision_result(result)?)));
+    }
+    let preferences = state.db.get_runtime_preferences().await?;
+    let fingerprint = channel::preference_fingerprint(&state, &preferences)?;
+    let mut pack = match load_open_pack(&state, id, request.plan_version, &fingerprint).await {
+        Ok(pack) => pack,
+        Err(error) => {
+            return match state.db.pack_receipt(id, &receipt).await? {
+                Some(result) => Ok((StatusCode::ACCEPTED, Json(pack_decision_result(result)?))),
+                None => Err(error),
+            };
+        }
+    };
+    let input_revision = state.db.pack_input_revision().await?;
+    hydrate_pack_jobs(&state, &mut pack).await?;
+    channel::hydrate_pack_downloads(&state, &mut pack.items).await?;
+    project_pack_fulfillment(&state, &mut pack).await?;
     if selected.as_ref().is_some_and(HashSet::is_empty) {
         return Err(AppError::bad_request(
             "empty_channel_selection",
@@ -1117,83 +1263,71 @@ async fn accept_channel_pack(
             ));
         }
     }
-    let mut jobs = Vec::new();
-    let mut submitted = 0;
-    for item in &mut pack.items {
-        if !item.selectable {
-            continue;
-        }
-        if selected
-            .as_ref()
-            .is_some_and(|ordinals| !ordinals.contains(&item.ordinal))
+    let mut capacity_clients = HashSet::new();
+    for item in &pack.items {
+        if item.selectable
+            && selected
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&item.ordinal))
+            && let Some(plan) = &item.plan
         {
-            item.plan_state = crate::model::PackItemPlanState::Excluded;
-            item.plan = None;
-            item.reason = Some("Excluded from the accepted pack by the user".into());
-            state.db.update_channel_pack_item(pack.id, item).await?;
-            continue;
+            get_tracker(&state, Some(&plan.tracker))?;
+            let profile = state.profiles.get(&plan.profile).ok_or_else(|| {
+                AppError::bad_request("unknown_download_profile", "Unknown download profile")
+            })?;
+            if plan.size.is_some_and(|size| size > 0) {
+                capacity_clients.insert(profile.client.as_str());
+            }
         }
-        let mut job = None;
-        if let Some(plan) = &item.plan {
-            let request = CreateDownload {
-                tracker: plan.tracker.clone(),
-                torrent_id: plan.torrent_id,
-                profile: plan.profile.clone(),
-                use_token: plan.use_token,
-            };
-            let key = format!(
-                "channel-pack:{}:item:{}:plan:{}",
-                pack.id, item.ordinal, pack.plan_version
-            );
-            job = Some(enqueue_download(state.clone(), request, Some(&key)).await?);
-        }
-        if let Some(replacement) = item.replacement.as_ref() {
-            let target_download = replacement
-                .downloads
-                .iter()
-                .find(|download| download.live.progress >= 1.0)
-                .or_else(|| replacement.downloads.first());
-            let import_id = state
-                .db
-                .create_replacement_import(CreateReplacementImport {
-                    download_job_id: job.as_ref().map(|job| job.id),
-                    target_client: target_download.map(|download| download.live.client.as_str()),
-                    target_info_hash: target_download
-                        .map(|download| download.live.info_hash.as_str()),
-                    release_id: item.release.as_ref().and_then(|release| release.id),
-                    tracker: &replacement.tracker,
-                    torrent_id: replacement.torrent_id,
-                    display_name: &item.source.title,
-                    target_complete: target_download
-                        .is_some_and(|download| download.live.progress >= 1.0),
-                    sources: &item.source.trumped_downloads,
-                    cleanup_mode: preferences.imports.trumped_cleanup,
-                })
-                .await?;
-            background::enqueue_import_processing(&state, import_id).await?;
-        }
-        item.plan_state = crate::model::PackItemPlanState::Submitted;
-        item.job_id = job.as_ref().map(|job| job.id);
-        item.job = job.clone();
-        state.db.update_channel_pack_item(pack.id, item).await?;
-        if let Some(job) = job {
-            jobs.push(job);
-        }
-        submitted += 1;
     }
-    state
-        .db
-        .decide_channel_pack(pack.id, ChannelPackDecision::Accepted)
-        .await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ChannelBatchResult {
-            pack_id: pack.id,
-            submitted,
-            skipped: pack.items.len().saturating_sub(submitted),
-            jobs,
-        }),
-    ))
+    let mut free_bytes = HashMap::new();
+    for client in capacity_clients {
+        if let Some(adapter) = state.download_clients.get(client)
+            && let Ok(bytes) = adapter.free_space().await
+            && bytes >= 0
+        {
+            free_bytes.insert(client.to_owned(), bytes);
+        }
+    }
+    let result = pack_decision_result(
+        state
+            .db
+            .commit_channel_pack_decision(
+                pack,
+                receipt,
+                selected.as_ref(),
+                Some(input_revision),
+                &fingerprint,
+                ChannelPackDecision::Accepted,
+                &preferences,
+                &state.profiles,
+                &free_bytes,
+            )
+            .await?,
+    )?;
+    state.background_jobs.wake();
+    state.changes.wake();
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
+fn pack_decision_conflict() -> AppError {
+    AppError::conflict(
+        "pack_state_changed",
+        "The pack changed or already has a different decision",
+    )
+}
+
+fn pack_decision_result(result: PackDecisionResult) -> Result<ChannelBatchResult, AppError> {
+    match result {
+        PackDecisionResult::Committed(result) => Ok(result),
+        PackDecisionResult::Conflict => Err(pack_decision_conflict()),
+        PackDecisionResult::CapacityChanged(client) => Err(AppError::conflict(
+            "pack_capacity_changed",
+            format!(
+                "Available space on {client} is already reserved. Refresh the pack before accepting."
+            ),
+        )),
+    }
 }
 
 async fn hydrate_pack_jobs(state: &AppState, pack: &mut ChannelPack) -> Result<(), AppError> {
@@ -1348,64 +1482,8 @@ async fn start_channel_run(
                 "A refresh is already running for this channel",
             )
         })?;
-    if let Some(mut current) = state.db.get_channel(&config.id).await? {
-        current.last_attempt_at = Some(Utc::now());
-        current.last_error = None;
-        current.updated_at = Utc::now();
-        state.db.put_channel(&current).await?;
-    }
-    state
-        .publish(
-            ChangeSet::new("channel_run_started", [ChangeScope::Channels])
-                .with_resources(["channels"]),
-        )
-        .await;
-    let task_state = state.clone();
-    let task_run = run.clone();
-    tokio::spawn(async move {
-        let outcome =
-            channel::refresh_channel(task_state.clone(), config.clone(), task_run.id).await;
-        match outcome {
-            Ok((pack_id, status)) => {
-                let _ = task_state
-                    .db
-                    .finish_channel_run(task_run.id, status.clone(), Some(pack_id), None)
-                    .await;
-                if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
-                    if status == ChannelRunStatus::Successful {
-                        current.last_successful_at = Some(Utc::now());
-                    }
-                    current.last_error = None;
-                    current.failure_count = 0;
-                    current.updated_at = Utc::now();
-                    let _ = task_state.db.put_channel(&current).await;
-                }
-            }
-            Err(error) => {
-                let message = truncate(&error.to_string(), 500);
-                tracing::error!(channel = %config.id, %message, "channel refresh failed");
-                let _ = task_state
-                    .db
-                    .finish_channel_run(task_run.id, ChannelRunStatus::Failed, None, Some(&message))
-                    .await;
-                if let Ok(Some(mut current)) = task_state.db.get_channel(&config.id).await {
-                    current.last_error = Some(message);
-                    current.failure_count = current.failure_count.saturating_add(1);
-                    current.updated_at = Utc::now();
-                    let _ = task_state.db.put_channel(&current).await;
-                }
-            }
-        }
-        task_state
-            .publish(
-                ChangeSet::new(
-                    "channel_run_finished",
-                    [ChangeScope::Channels, ChangeScope::Catalog],
-                )
-                .with_resources(["channels"]),
-            )
-            .await;
-    });
+    state.background_jobs.wake();
+    state.changes.wake();
     Ok(run)
 }
 
@@ -2020,6 +2098,7 @@ struct GroupQuery {
     #[serde(default)]
     refresh: bool,
     torrent: Option<i64>,
+    tracker: Option<String>,
 }
 
 #[utoipa::path(
@@ -2043,6 +2122,26 @@ async fn release(
         .get_release_detail(id)
         .await?
         .ok_or_else(|| AppError::not_found("release_not_found", "Release was not found"))?;
+    if let (Some(torrent_id), Some(tracker)) = (query.torrent, query.tracker.as_deref())
+        && !detail.variants.iter().any(|variant| {
+            variant.tracker.eq_ignore_ascii_case(tracker) && variant.torrent_id == torrent_id
+        })
+        && let Some(source) = detail
+            .release
+            .sources
+            .iter()
+            .find(|source| source.tracker.eq_ignore_ascii_case(tracker))
+        && let Some(cached) = state.db.get_canonical(&source.tracker, torrent_id).await?
+        && cached
+            .value
+            .release
+            .tracker
+            .eq_ignore_ascii_case(&source.tracker)
+        && cached.value.release.group_id == source.group_id
+        && cached.value.variant.torrent_id == torrent_id
+    {
+        detail.variants.push(cached.value.variant);
+    }
     enrich_variant_downloads(&state, &mut detail.variants).await?;
     for source in detail.release.sources.clone() {
         enrich_variant_library(
@@ -2053,31 +2152,12 @@ async fn release(
         )
         .await?;
     }
-    if let Some(torrent_id) = query.torrent
-        && let Some(variant) = detail
-            .variants
-            .iter()
-            .find(|variant| variant.torrent_id == torrent_id)
-            .cloned()
-        && !detail
-            .variants
-            .iter()
-            .any(|known| known.tracker == variant.tracker && known.torrent_id == torrent_id)
-    {
-        detail.variants.push(variant);
-    }
     apply_download_eligibility(&state, &mut detail.variants).await?;
     if query.refresh {
         for source in detail.release.sources.clone() {
             if state.trackers.contains_key(&source.tracker) {
-                let refresh_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) =
-                        refresh_group(refresh_state, source.tracker, source.group_id).await
-                    {
-                        tracing::warn!(%error, "canonical release source refresh failed");
-                    }
-                });
+                background::enqueue_release_refresh(&state, &source.tracker, source.group_id)
+                    .await?;
             }
         }
     }
@@ -2398,13 +2478,7 @@ async fn group(
         }
         apply_download_eligibility(&state, &mut response.data.variants).await?;
         if stale {
-            let refresh_state = state.clone();
-            let refresh_tracker = tracker_name.clone();
-            tokio::spawn(async move {
-                if let Err(error) = refresh_group(refresh_state, refresh_tracker, id).await {
-                    tracing::warn!(%error, "asynchronous release refresh failed");
-                }
-            });
+            background::enqueue_release_refresh(&state, &tracker_name, id).await?;
         }
         return Ok(Json(response));
     }
@@ -3138,10 +3212,22 @@ pub(crate) async fn refresh_library_projection(state: &Arc<AppState>) -> Result<
     if dirty.is_empty() && ready {
         return Ok(false);
     }
-    let full = !ready || dirty.iter().any(|row| row.release_id == "*");
+    let requested = dirty
+        .iter()
+        .filter_map(|row| Uuid::parse_str(&row.release_id).ok())
+        .collect::<Vec<_>>();
+    let full = !ready || requested.len() != dirty.len();
     let changed;
     if full {
-        let releases = build_projected_library_releases(state, None).await?;
+        let (_, snapshot) = state
+            .db
+            .read_snapshot(async {
+                let revision = state.db.library_projection_input_revision().await?;
+                let releases = build_projected_library_releases(state, None).await?;
+                Ok::<_, anyhow::Error>((revision, releases))
+            })
+            .await?;
+        let (input_revision, releases) = snapshot?;
         let artists = build_artist_summaries(&releases);
         let relations = library_projection_relations(&releases);
         let affected = artists
@@ -3154,79 +3240,59 @@ pub(crate) async fn refresh_library_projection(state: &Arc<AppState>) -> Result<
             .collect::<HashSet<_>>();
         changed = state
             .db
-            .store_library_projection(true, &dirty, &releases, &artists, &relations, &affected)
+            .store_library_projection(
+                true,
+                Some(input_revision),
+                &dirty,
+                &releases,
+                &artists,
+                &relations,
+                &affected,
+            )
             .await?;
     } else {
-        let requested = dirty
-            .iter()
-            .filter_map(|row| Uuid::parse_str(&row.release_id).ok())
+        let releases = build_projected_library_releases(state, Some(&requested)).await?;
+        let relations = library_projection_relations(&releases);
+        let mut affected = state
+            .db
+            .projected_artist_keys_for_releases(&requested)
+            .await?;
+        affected.extend(relations.iter().map(|relation| relation.0.clone()));
+        let mut related_ids = state
+            .db
+            .projected_release_ids_for_artist_keys(&affected)
+            .await?;
+        related_ids.extend(requested.iter().copied());
+        let mut related = state
+            .db
+            .projected_library_releases_for_ids(&related_ids.iter().copied().collect::<Vec<_>>())
+            .await?;
+        let requested_set = requested.iter().copied().collect::<HashSet<_>>();
+        related.retain(|release| {
+            release
+                .release
+                .id
+                .is_none_or(|id| !requested_set.contains(&id))
+        });
+        related.extend(releases.iter().cloned());
+        let artists = build_artist_summaries(&related)
+            .into_iter()
+            .filter(|artist| {
+                let key = artist.id.map(|id| id.to_string()).unwrap_or_else(|| {
+                    format!("{}:{}", artist.tracker.to_ascii_lowercase(), artist.key)
+                });
+                affected.contains(&key)
+            })
             .collect::<Vec<_>>();
-        if requested.len() != dirty.len() {
-            tracing::warn!("invalid library projection key; rebuilding the complete projection");
-            let releases = build_projected_library_releases(state, None).await?;
-            let artists = build_artist_summaries(&releases);
-            let relations = library_projection_relations(&releases);
-            let affected = artists
-                .iter()
-                .map(|artist| {
-                    artist.id.map(|id| id.to_string()).unwrap_or_else(|| {
-                        format!("{}:{}", artist.tracker.to_ascii_lowercase(), artist.key)
-                    })
-                })
-                .collect::<HashSet<_>>();
-            changed = state
-                .db
-                .store_library_projection(true, &dirty, &releases, &artists, &relations, &affected)
-                .await?;
-        } else {
-            let releases = build_projected_library_releases(state, Some(&requested)).await?;
-            let relations = library_projection_relations(&releases);
-            let mut affected = state
-                .db
-                .projected_artist_keys_for_releases(&requested)
-                .await?;
-            affected.extend(relations.iter().map(|relation| relation.0.clone()));
-            let mut related_ids = state
-                .db
-                .projected_release_ids_for_artist_keys(&affected)
-                .await?;
-            related_ids.extend(requested.iter().copied());
-            let mut related = state
-                .db
-                .projected_library_releases_for_ids(
-                    &related_ids.iter().copied().collect::<Vec<_>>(),
-                )
-                .await?;
-            let requested_set = requested.iter().copied().collect::<HashSet<_>>();
-            related.retain(|release| {
-                release
-                    .release
-                    .id
-                    .is_none_or(|id| !requested_set.contains(&id))
-            });
-            related.extend(releases.iter().cloned());
-            let artists = build_artist_summaries(&related)
-                .into_iter()
-                .filter(|artist| {
-                    let key = artist.id.map(|id| id.to_string()).unwrap_or_else(|| {
-                        format!("{}:{}", artist.tracker.to_ascii_lowercase(), artist.key)
-                    });
-                    affected.contains(&key)
-                })
-                .collect::<Vec<_>>();
-            changed = state
-                .db
-                .store_library_projection(false, &dirty, &releases, &artists, &relations, &affected)
-                .await?;
-        }
+        changed = state
+            .db
+            .store_library_projection(
+                false, None, &dirty, &releases, &artists, &relations, &affected,
+            )
+            .await?;
     }
     if changed {
-        state
-            .publish(
-                ChangeSet::new("library_projection_updated", [ChangeScope::Catalog])
-                    .with_resources(["library"]),
-            )
-            .await;
+        state.changes.wake();
     }
     Ok(changed)
 }
@@ -3259,6 +3325,19 @@ fn apply_private_validator(response: &mut Response, etag: &str) -> Result<(), Ap
 fn cache_not_modified(etag: &str) -> Result<Response, AppError> {
     let mut response = StatusCode::NOT_MODIFIED.into_response();
     apply_private_validator(&mut response, etag)?;
+    Ok(response)
+}
+
+fn validated_json(headers: &HeaderMap, value: &impl Serialize) -> Result<Response, AppError> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = serde_json::to_vec(value).map_err(anyhow::Error::from)?;
+    let etag = format!("\"{}\"", hex::encode(Sha256::digest(&bytes)));
+    if request_etag_matches(headers, &etag) {
+        return cache_not_modified(&etag);
+    }
+    let mut response = ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+    apply_private_validator(&mut response, &etag)?;
     Ok(response)
 }
 
@@ -3570,52 +3649,13 @@ fn build_library_releases(records: Vec<crate::db::LibraryRecord>) -> Vec<Library
         .collect()
 }
 
-fn library_release_matches(release: &LibraryRelease, query: &LibraryQuery) -> bool {
-    if query
-        .tracker
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .is_some_and(|tracker| {
-            !release
-                .release
-                .sources
-                .iter()
-                .any(|source| source.tracker.eq_ignore_ascii_case(tracker))
-        })
-    {
-        return false;
+fn library_release_filter(query: &LibraryQuery) -> LibraryProjectionFilter {
+    LibraryProjectionFilter {
+        tracker: query.tracker.clone().filter(|value| !value.is_empty()),
+        format: query.format.clone().filter(|value| !value.is_empty()),
+        availability: query.availability.clone().filter(|value| !value.is_empty()),
+        ..LibraryProjectionFilter::default()
     }
-    if query
-        .format
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .is_some_and(|format| {
-            !release.variants.iter().any(|variant| {
-                variant
-                    .format
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(format))
-            })
-        })
-    {
-        return false;
-    }
-    if let Some(availability) = query
-        .availability
-        .as_deref()
-        .filter(|value| !value.is_empty() && *value != "all")
-    {
-        let matches = matches!(
-            (availability, release.availability),
-            ("present", LibraryAvailability::Present)
-                | ("partial", LibraryAvailability::Partial)
-                | ("missing", LibraryAvailability::Missing)
-        );
-        if !matches {
-            return false;
-        }
-    }
-    true
 }
 
 fn artist_sort_name(name: &str) -> String {
@@ -3805,49 +3845,12 @@ fn sort_library_releases(releases: &mut [LibraryRelease], sort: &str) {
     }
 }
 
-async fn library_index_status(state: &Arc<AppState>) -> Result<LibraryIndexStatus, AppError> {
-    let releases = state.db.projected_library_singles().await?;
-    let mut deduplication = DeduplicationIndexStatus::default();
-    let single_keys = releases
-        .iter()
-        .filter(|release| {
-            release
-                .release
-                .release_type
-                .as_deref()
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
-        })
-        .map(|release| (release.release.tracker.clone(), release.release.group_id))
-        .collect::<Vec<_>>();
-    let coverages = state.db.get_single_coverages(&single_keys).await?;
-    for release in releases.iter().filter(|release| {
-        release
-            .release
-            .release_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("single"))
-    }) {
-        deduplication.total += 1;
-        if release.release.album_coverage.is_some() {
-            deduplication.checked += 1;
-            deduplication.hidden += 1;
-            continue;
-        }
-        let key = (release.release.tracker.clone(), release.release.group_id);
-        let state_name = coverages.get(&key).map(|stored| stored.state.as_str());
-        match state_name {
-            Some("ready") => deduplication.checked += 1,
-            Some("resolving") => deduplication.resolving += 1,
-            Some("failed") => deduplication.failed += 1,
-            _ => deduplication.pending += 1,
-        }
-    }
-    enrich_deduplication_queue_status(state, &mut deduplication).await?;
-    Ok(LibraryIndexStatus {
-        last_successful_scan_at: state.db.last_successful_download_scan().await?,
-        unresolved_credits: state.db.projected_unresolved_credit_count().await? as usize,
-        deduplication,
-    })
+#[utoipa::path(get, path = "/api/v1/library/status", responses((status = 200, body = LibraryIndexStatus)))]
+async fn library_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    validated_json(&headers, &state.db.library_index_status().await?)
 }
 
 #[utoipa::path(
@@ -3859,85 +3862,47 @@ async fn library_artists(
     headers: HeaderMap,
     Query(query): Query<LibraryQuery>,
 ) -> Result<Response, AppError> {
-    let (revision, _) = state.db.library_projection_state().await?;
-    let etag = format!("\"library-index-v1-{revision}\"");
-    if request_etag_matches(&headers, &etag) {
-        return Ok(cache_not_modified(&etag)?);
-    }
     let needle = query
         .q
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
-    let has_release_filters = query
-        .tracker
-        .as_deref()
-        .is_some_and(|value| !value.is_empty())
-        || query
-            .format
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        || query
-            .availability
-            .as_deref()
-            .is_some_and(|value| !value.is_empty() && value != "all");
-    let filtered = if has_release_filters || needle.is_some() {
-        let mut releases = state
-            .db
-            .projected_library_releases_filtered(&LibraryProjectionFilter {
-                search_terms: needle.iter().cloned().collect(),
-                tracker: query.tracker.clone(),
-                format: query.format.clone(),
-                availability: query.availability.clone(),
-                ..LibraryProjectionFilter::default()
-            })
-            .await?;
-        localize_release_artworks(&state, &mut releases).await?;
-        releases
-            .into_iter()
-            .filter(|release| library_release_matches(release, &query))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let mut artists = if has_release_filters {
-        build_artist_summaries(&filtered)
-    } else {
-        state.db.projected_library_artists().await?
-    };
-    localize_artist_artworks(&state, &mut artists).await?;
-    if let Some(needle) = &needle {
-        artists.retain(|artist| artist.name.to_lowercase().contains(needle));
-    }
-    let artist_total = artists.len();
+    let filter = library_release_filter(&query);
     let limit = query.limit.clamp(1, 5_000);
     let offset = query.offset.min(100_000);
-    let artists = artists.into_iter().skip(offset).take(limit).collect();
-
-    let mut releases = if let Some(needle) = &needle {
-        filtered
-            .iter()
-            .filter(|release| release.release.title.to_lowercase().contains(needle))
-            .cloned()
-            .collect::<Vec<_>>()
+    let (mut artists, artist_total) = state
+        .db
+        .projected_library_artist_page(&filter, needle.as_deref(), limit, offset)
+        .await?;
+    localize_artist_artworks(&state, &mut artists).await?;
+    let (mut releases, release_total) = if needle.is_some() {
+        state
+            .db
+            .projected_library_release_page(
+                &filter,
+                needle.as_deref(),
+                None,
+                query.sort.as_deref().unwrap_or("year_desc"),
+                limit,
+                offset,
+            )
+            .await?
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
-    sort_library_releases(&mut releases, query.sort.as_deref().unwrap_or("year_desc"));
-    let release_total = releases.len();
-    let releases = releases.into_iter().skip(offset).take(limit).collect();
-    let index = library_index_status(&state).await?;
-    let mut response = Json(LibraryArtistsPage {
-        artists,
-        releases,
-        artist_total,
-        release_total,
-        index,
-    })
-    .into_response();
-    apply_private_validator(&mut response, &etag)?;
-    Ok(response)
+    localize_release_artworks(&state, &mut releases).await?;
+    let index = state.db.library_index_status().await?;
+    validated_json(
+        &headers,
+        &LibraryArtistsPage {
+            artists,
+            releases,
+            artist_total,
+            release_total,
+            index,
+        },
+    )
 }
 
 #[utoipa::path(
@@ -3957,11 +3922,6 @@ async fn library_artist(
     Path(id): Path<uuid::Uuid>,
     Query(query): Query<LibraryQuery>,
 ) -> Result<Response, AppError> {
-    let (revision, _) = state.db.library_projection_state().await?;
-    let etag = format!("\"library-artist-v1-{id}-{revision}\"");
-    if request_etag_matches(&headers, &etag) {
-        return Ok(cache_not_modified(&etag)?);
-    }
     let artist_key = id.to_string();
     let mut summary = state
         .db
@@ -3969,39 +3929,24 @@ async fn library_artist(
         .await?
         .ok_or_else(|| AppError::not_found("artist_not_found", "Library artist not found"))?;
     localize_artist_artworks(&state, std::slice::from_mut(&mut summary)).await?;
-    let release_ids = state
-        .db
-        .projected_library_release_ids_for_artist(&artist_key)
-        .await?;
-    let mut artist_releases = state
-        .db
-        .projected_library_releases_for_ids(&release_ids)
-        .await?;
-    localize_release_artworks(&state, &mut artist_releases).await?;
     let needle = query
         .q
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
-    let mut items = artist_releases
-        .into_iter()
-        .filter(|release| library_release_matches(release, &query))
-        .filter(|release| {
-            needle
-                .as_ref()
-                .is_none_or(|needle| release.release.title.to_lowercase().contains(needle))
-        })
-        .collect::<Vec<_>>();
-    sort_library_releases(&mut items, query.sort.as_deref().unwrap_or("year_desc"));
-    let total = items.len();
-    let limit = query.limit.clamp(1, 5_000);
-    let offset = query.offset.min(100_000);
-    let items = items
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
+    let (mut items, total) = state
+        .db
+        .projected_library_release_page(
+            &library_release_filter(&query),
+            needle.as_deref(),
+            Some(&artist_key),
+            query.sort.as_deref().unwrap_or("year_desc"),
+            query.limit.clamp(1, 5_000),
+            query.offset.min(100_000),
+        )
+        .await?;
+    localize_release_artworks(&state, &mut items).await?;
     let mut catalog = local_library_catalog(&state, id).await?;
     let mut known = catalog
         .groups
@@ -4050,17 +3995,17 @@ async fn library_artist(
         .filter(|group| group.roles.contains(&ArtistCatalogRole::Primary))
         .count();
     catalog.appearance_count = catalog.groups.len().saturating_sub(catalog.primary_count);
-    let index = library_index_status(&state).await?;
-    let mut response = Json(LibraryArtistPage {
-        artist: summary,
-        items,
-        catalog,
-        total,
-        index,
-    })
-    .into_response();
-    apply_private_validator(&mut response, &etag)?;
-    Ok(response)
+    let index = state.db.library_index_status().await?;
+    validated_json(
+        &headers,
+        &LibraryArtistPage {
+            artist: summary,
+            items,
+            catalog,
+            total,
+            index,
+        },
+    )
 }
 
 async fn refresh_library_artist(
@@ -4097,11 +4042,48 @@ async fn refresh_library_artist(
 async fn library_asset(
     State(state): State<Arc<AppState>>,
     Path((source_hash, variant)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let asset = state
         .db
         .library_asset(&source_hash)
+        .await?
+        .ok_or_else(|| AppError::not_found("asset_not_found", "Library asset was not found"))?;
+    let hash = asset
+        .blob_hash
+        .as_deref()
+        .ok_or_else(|| AppError::not_found("asset_not_found", "Library asset was not found"))?;
+    let extension = asset.original_extension.as_deref().unwrap_or_default();
+    if state
+        .asset_store
+        .versioned_path(hash, asset.materializer_version, &variant, extension)
+        .is_none()
+    {
+        return Err(AppError::not_found(
+            "asset_not_found",
+            "Library asset was not found",
+        ));
+    }
+    let url = format!(
+        "{}/api/v1/asset-blobs/{hash}/{}/{variant}",
+        state.base_path.trim_end_matches('/'),
+        asset.materializer_version
+    );
+    let mut response = axum::response::Redirect::temporary(&url).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    Ok(response)
+}
+
+async fn library_asset_blob(
+    State(state): State<Arc<AppState>>,
+    Path((hash, version, variant)): Path<(String, i32, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let asset = state
+        .db
+        .library_asset_blob(&hash, version)
         .await?
         .ok_or_else(|| AppError::not_found("asset_not_found", "Library asset was not found"))?;
     let blob_hash = asset
@@ -4114,28 +4096,29 @@ async fn library_asset(
         .ok_or_else(|| AppError::not_found("asset_not_found", "Library asset was not found"))?;
     let path = state
         .asset_store
-        .path(blob_hash, &variant, extension)
+        .versioned_path(blob_hash, version, &variant, extension)
         .ok_or_else(|| AppError::not_found("asset_not_found", "Library asset was not found"))?;
-    let etag = format!("\"{blob_hash}-{variant}\"");
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|value| value.trim() == etag))
-    {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        response.headers_mut().insert(
-            header::ETAG,
-            HeaderValue::from_str(&etag).map_err(anyhow::Error::from)?,
-        );
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            state
+                .db
+                .repair_missing_library_asset(&asset.source_url, blob_hash)
+                .await?;
+            state.background_jobs.wake();
+            return Err(AppError::unavailable("asset_unavailable", error));
+        }
+        Err(error) => return Err(AppError::unavailable("asset_unavailable", error)),
+    };
+    let etag = format!("\"{blob_hash}-{}-{variant}\"", asset.materializer_version);
+    if request_etag_matches(&headers, &etag) {
+        let mut response = cache_not_modified(&etag)?;
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, max-age=31536000, immutable"),
         );
         return Ok(response);
     }
-    let mut file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|error| AppError::unavailable("asset_unavailable", error))?;
     let length = file
         .metadata()
         .await
@@ -4514,22 +4497,26 @@ async fn enqueue_download(
     idempotency_key: Option<&str>,
 ) -> Result<DownloadJob, AppError> {
     get_tracker(&state, Some(&request.tracker))?;
-    if !state.profiles.contains_key(&request.profile) {
-        return Err(AppError::bad_request(
-            "unknown_download_profile",
-            "Unknown download profile",
-        ));
-    }
-    let (job, _created) = state
+    let profile = state.profiles.get(&request.profile).ok_or_else(|| {
+        AppError::bad_request("unknown_download_profile", "Unknown download profile")
+    })?;
+    let job = state
         .db
-        .create_job(
+        .accept_download(
             &request.tracker,
             request.torrent_id,
-            &request.profile,
+            profile,
             request.use_token,
             idempotency_key,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if error.is::<DownloadRequestConflict>() {
+                AppError::conflict("idempotency_conflict", error)
+            } else {
+                AppError::from(error)
+            }
+        })?;
     state.background_jobs.wake();
     Ok(job)
 }
@@ -4551,334 +4538,18 @@ async fn download_job(
         .ok_or_else(|| AppError::not_found("download_job_not_found", "Download job not found"))
 }
 
-fn download_stage_path(state: &AppState, job_id: Uuid) -> PathBuf {
-    state.download_staging_dir.join(format!("{job_id}.torrent"))
-}
-
-fn write_staged_download(path: &StdPath, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("download staging path has no parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("persist staged torrent {}", path.display()))?;
-    Ok(())
-}
-
-pub(crate) async fn cleanup_download_stage(state: &AppState, job_id: Uuid) {
-    let path = download_stage_path(state, job_id);
-    if let Err(error) = tokio::fs::remove_file(&path).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(job_id = %job_id, %error, path = %path.display(), "could not remove staged torrent");
-    }
-}
-
-async fn cleanup_orphaned_download_stages(state: &AppState) -> Result<()> {
-    let incomplete = state
-        .db
-        .list_jobs()
-        .await?
-        .into_iter()
-        .filter(|job| {
-            matches!(
-                job.state,
-                DownloadState::Queued | DownloadState::FetchingMetadata | DownloadState::Submitting
-            )
-        })
-        .map(|job| job.id)
-        .collect::<HashSet<_>>();
-    let mut entries = tokio::fs::read_dir(&state.download_staging_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let job_id = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .and_then(|value| Uuid::parse_str(value).ok());
-        if job_id.is_none_or(|job_id| !incomplete.contains(&job_id)) {
-            tokio::fs::remove_file(&path)
-                .await
-                .with_context(|| format!("remove orphaned download stage {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-async fn download_torrent_payload_for_job(
-    tracker: &dyn TrackerClient,
-    job: &DownloadJob,
-) -> Result<(Vec<u8>, String)> {
-    // Gazelle applies a freeleech token to the torrent-file request itself, so
-    // the first request must carry the final token decision. The returned file
-    // is also sufficient to calculate the missing info hash.
-    let bytes = tracker
-        .download_torrent(job.torrent_id, job.use_token)
-        .await?;
-    let info_hash = torrent_info_hash(&bytes)?;
-    Ok((bytes, info_hash))
-}
-
-pub(crate) async fn process_download(state: Arc<AppState>, job: DownloadJob) -> Result<()> {
-    let profile = state
-        .profiles
-        .get(&job.profile)
-        .ok_or_else(|| anyhow!("download profile disappeared from configuration"))?;
-    let client = state
-        .download_clients
-        .get(&profile.client)
-        .ok_or_else(|| anyhow!("download client disappeared from configuration"))?;
-    let stage_path = download_stage_path(&state, job.id);
-    let staged_payload = match tokio::fs::read(&stage_path).await {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("read staged torrent"),
-    };
-
-    if let Some(info_hash) = job.info_hash.as_deref() {
-        if let Some(existing) = client
-            .download_with_class(info_hash, RequestClass::Download)
-            .await?
-        {
-            let state_value = if existing.live.progress >= 1.0 {
-                DownloadState::Complete
-            } else {
-                DownloadState::Active
-            };
-            state
-                .db
-                .update_progress(
-                    job.id,
-                    state_value,
-                    existing.live.progress,
-                    existing.live.download_speed,
-                    existing.live.upload_speed,
-                    existing.live.eta,
-                )
-                .await?;
-            cleanup_download_stage(&state, job.id).await;
-            return Ok(());
-        }
-        if let Some(bytes) = staged_payload.as_ref() {
-            let file_name = format!("{}-{}.torrent", job.tracker, job.torrent_id);
-            client
-                .add_torrent(bytes.clone(), &file_name, profile)
-                .await?;
-            state
-                .db
-                .set_job_state(job.id, DownloadState::Active, None)
-                .await?;
-            cleanup_download_stage(&state, job.id).await;
-            return Ok(());
-        }
-    }
-
-    state
-        .db
-        .set_job_state(job.id, DownloadState::FetchingMetadata, None)
-        .await?;
-    let tracker = state
-        .trackers
-        .get(&job.tracker)
-        .ok_or_else(|| anyhow!("tracker disappeared from configuration"))?;
-
-    let (mut metadata, mut canonical, raw) = tracker
-        .torrent_with_class(job.torrent_id, RequestClass::Download)
-        .await?;
-    let preferences = state.db.get_runtime_preferences().await?;
-    let token_available_or_unknown = metadata.can_use_token || !metadata.token_eligibility_known;
-    let eligibility = preferences.release.eligibility(
-        &job.tracker,
-        canonical.variant.format.as_deref(),
-        canonical.variant.encoding.as_deref(),
-        canonical.variant.media.as_deref(),
-        canonical.variant.size,
-        canonical.variant.leech_status,
-        token_available_or_unknown,
-    );
-    if !eligibility.eligible {
-        let message = match eligibility.reason {
-            crate::model::DownloadEligibilityReason::BelowQualityCutoff => format!(
-                "release quality '{}' is below the configured cutoff",
-                crate::model::ReleasePreferences::quality_class(
-                    canonical.variant.format.as_deref(),
-                    canonical.variant.encoding.as_deref(),
-                )
-            ),
-            crate::model::DownloadEligibilityReason::BelowMediaCutoff => format!(
-                "release media '{}' is below the configured cutoff",
-                canonical.variant.media.as_deref().unwrap_or("Other")
-            ),
-            crate::model::DownloadEligibilityReason::TrackerDisabled => {
-                format!("downloads from {} are disabled by preferences", job.tracker)
-            }
-            crate::model::DownloadEligibilityReason::FreeleechRequired => {
-                format!(
-                    "{} is configured for already-free torrents only",
-                    job.tracker
-                )
-            }
-            crate::model::DownloadEligibilityReason::TokenUnavailable => {
-                "a freeleech token is required but unavailable for this torrent".into()
-            }
-            crate::model::DownloadEligibilityReason::TokenCostUnknown => {
-                "an OPS freeleech token was requested, but the torrent size is unavailable".into()
-            }
-            crate::model::DownloadEligibilityReason::Eligible => {
-                "torrent is not eligible under the configured tracker policy".into()
-            }
-        };
-        return Err(anyhow!(message));
-    }
-    if eligibility.requires_token && !job.use_token {
-        return Err(anyhow!(
-            "a freeleech token is required by the configured tracker policy"
-        ));
-    }
-    if job.use_token && !eligibility.requires_token {
-        let policy = preferences.release.tracker_policy(&job.tracker);
-        if matches!(
-            policy.mode,
-            crate::model::TrackerDownloadMode::Disabled
-                | crate::model::TrackerDownloadMode::FreeleechOnly
-        ) {
-            return Err(anyhow!(
-                "freeleech token use is disabled by the configured tracker policy"
-            ));
-        }
-    }
-    if job.use_token && eligibility.token_cost.is_none() {
-        return Err(anyhow!(
-            "freeleech token cost is unknown because the tracker has no supported cost model or the torrent size is unavailable"
-        ));
-    }
-    if job.use_token && metadata.token_eligibility_known && !metadata.can_use_token {
-        return Err(anyhow!("torrent is not eligible for a freeleech token"));
-    }
-    let mut payload = staged_payload;
-    let mut submission_started = false;
-    let info_hash = if let Some(info_hash) = metadata
-        .info_hash
-        .clone()
-        .or_else(|| canonical.variant.info_hash.clone())
-    {
-        info_hash.to_ascii_lowercase()
-    } else if let Some(bytes) = payload.as_ref() {
-        torrent_info_hash(bytes)?
-    } else {
-        state
-            .db
-            .set_job_state(job.id, DownloadState::Submitting, None)
-            .await?;
-        submission_started = true;
-        let (bytes, info_hash) = download_torrent_payload_for_job(tracker.as_ref(), &job).await?;
-        payload = Some(bytes);
-        info_hash
-    };
-    metadata.info_hash = Some(info_hash.clone());
-    canonical.variant.info_hash = Some(info_hash.clone());
-    state
-        .db
-        .put_snapshot(
-            &job.tracker,
-            "torrent",
-            &job.torrent_id.to_string(),
-            &metadata,
-            &raw,
-            Utc::now(),
-            Utc::now() + ChronoDuration::minutes(15),
-        )
-        .await?;
-    state
-        .db
-        .put_canonical(
-            &canonical,
-            Utc::now(),
-            Utc::now() + ChronoDuration::hours(24),
-        )
-        .await?;
-    state
-        .db
-        .update_job_metadata(job.id, metadata.group_id, &info_hash, &metadata.name)
-        .await?;
-    state
-        .db
-        .seed_download_link(
-            &profile.client,
-            &info_hash,
-            &job.tracker,
-            metadata.group_id,
-            metadata.torrent_id,
-            true,
-        )
-        .await?;
-
-    if let Some(existing) = client
-        .download_with_class(&info_hash, RequestClass::Download)
-        .await?
-    {
-        let state_value = if existing.live.progress >= 1.0 {
-            DownloadState::Complete
-        } else {
-            DownloadState::Active
-        };
-        state
-            .db
-            .update_progress(
-                job.id,
-                state_value,
-                existing.live.progress,
-                existing.live.download_speed,
-                existing.live.upload_speed,
-                existing.live.eta,
-            )
-            .await?;
-        cleanup_download_stage(&state, job.id).await;
-        return Ok(());
-    }
-
-    let bytes = if let Some(payload) = payload {
-        payload
-    } else {
-        if !submission_started {
-            state
-                .db
-                .set_job_state(job.id, DownloadState::Submitting, None)
-                .await?;
-        }
-        tracker
-            .download_torrent(job.torrent_id, job.use_token)
-            .await?
-    };
-    if !stage_path.exists() {
-        write_staged_download(&stage_path, &bytes)?;
-    }
-    let file_name = format!("{}-{}.torrent", job.tracker, job.torrent_id);
-    client.add_torrent(bytes, &file_name, profile).await?;
-    state
-        .db
-        .set_job_state(job.id, DownloadState::Active, None)
-        .await?;
-    cleanup_download_stage(&state, job.id).await;
-    Ok(())
-}
-
-pub fn spawn_channel_scheduler(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_channel_scheduler(
+    state: Arc<AppState>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = stop.changed() => break,
+                _ = interval.tick() => {}
+            }
             let channels = match state.db.list_channels().await {
                 Ok(channels) => channels,
                 Err(error) => {
@@ -5618,7 +5289,11 @@ pub(crate) async fn live_downloads_by_hash(
         })
 }
 
-async fn refresh_group(state: Arc<AppState>, tracker_name: String, id: i64) -> Result<()> {
+pub(crate) async fn refresh_group(
+    state: Arc<AppState>,
+    tracker_name: String,
+    id: i64,
+) -> Result<()> {
     let tracker = state
         .trackers
         .get(&tracker_name)
@@ -6395,7 +6070,8 @@ fn truncate(value: &str, max: usize) -> String {
         background_jobs, cancel_background_job, retry_background_job,
         account, accounts, search, release, cross_seed_plans, downloads, imports, download_detail_compatibility, create_download,
         download_job,
-        library_artists, library_artist, artist_catalog, channels, update_channel, refresh_channel,
+        library_artists,
+        library_status, library_artist, artist_catalog, channels, update_channel, refresh_channel,
         channel_run, channel_packs, channel_pack, replan_channel_pack, attach_channel_pack_item,
         accept_channel_pack, reject_channel_pack
     ),
@@ -6439,6 +6115,7 @@ struct ApiDoc;
 
 #[cfg(test)]
 mod tests {
+    use crate::submission::{download_torrent_payload_for_job, write_staged_download};
     use std::sync::Mutex as StdMutex;
 
     use super::*;

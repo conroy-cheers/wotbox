@@ -13,6 +13,9 @@ const server = http.createServer((request, response) => {
   }
   if (url.pathname === "/api/v2/sync/maindata") {
     response.end(JSON.stringify({
+      rid: 1,
+      full_update: (url.searchParams.get("rid") ?? "0") === "0",
+      torrents: {},
       server_state: { free_space_on_disk: 1_000_000_000_000 }
     }));
     return;

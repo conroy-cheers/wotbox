@@ -1,12 +1,14 @@
 use std::{
+    collections::HashMap,
     io::Cursor,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
 use anyhow::{Context, Result as AnyResult};
-use image::{GenericImageView, ImageFormat, ImageReader, Limits};
+use image::{ImageFormat, ImageReader, Limits};
 use reqwest::{StatusCode, Url, redirect::Policy};
 use sha2::{Digest, Sha256};
 
@@ -64,21 +66,37 @@ pub struct MaterializedAsset {
 #[derive(Clone)]
 pub struct AssetStore {
     root: PathBuf,
+    blob_locks: Arc<Mutex<HashMap<(String, i32), Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AssetStore {
     pub fn new(root: PathBuf) -> AnyResult<Self> {
         std::fs::create_dir_all(root.join("blobs"))
             .with_context(|| format!("create Library asset store {}", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            blob_locks: Default::default(),
+        })
     }
 
     pub fn source_hash(source_url: &str) -> String {
         hex::encode(Sha256::digest(source_url.as_bytes()))
     }
 
+    #[cfg(test)]
     pub fn path(&self, blob_hash: &str, variant: &str, extension: &str) -> Option<PathBuf> {
-        if blob_hash.len() != 64
+        self.versioned_path(blob_hash, MATERIALIZER_VERSION, variant, extension)
+    }
+
+    pub fn versioned_path(
+        &self,
+        blob_hash: &str,
+        version: i32,
+        variant: &str,
+        extension: &str,
+    ) -> Option<PathBuf> {
+        if !(1..=MATERIALIZER_VERSION).contains(&version)
+            || blob_hash.len() != 64
             || !blob_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             || !matches!(variant, "original" | "128" | "512")
             || !matches!(extension, "jpg" | "png" | "gif" | "webp")
@@ -90,35 +108,70 @@ impl AssetStore {
         } else {
             format!("{blob_hash}-{variant}.webp")
         };
-        Some(self.root.join("blobs").join(&blob_hash[..2]).join(filename))
+        Some(blob_directory(&self.root, blob_hash, version).join(filename))
     }
 
-    pub async fn materialize(&self, source_url: &str) -> AssetResult<MaterializedAsset> {
+    pub async fn lock_blob(
+        &self,
+        hash: &str,
+        version: i32,
+    ) -> Arc<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut locks = self.blob_locks.lock().expect("blob lock map");
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            let slot = locks.entry((hash.to_owned(), version)).or_default();
+            slot.upgrade().unwrap_or_else(|| {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                *slot = Arc::downgrade(&lock);
+                lock
+            })
+        };
+        Arc::new(lock.lock_owned().await)
+    }
+
+    pub async fn materialize(
+        &self,
+        source_url: &str,
+    ) -> AssetResult<(MaterializedAsset, Arc<tokio::sync::OwnedMutexGuard<()>>)> {
         let source_hash = Self::source_hash(source_url);
         let bytes = fetch_public_image(source_url).await?;
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || materialize_bytes(&root, source_hash, bytes))
-            .await
-            .map_err(|error| {
-                AssetMaterializationError::new(
-                    AssetFailureKind::Retryable,
-                    "materializer_join_failed",
-                    format!("join image materialization task: {error}"),
-                )
-            })?
+        let blob_hash = hex::encode(Sha256::digest(&bytes));
+        let publication = self.lock_blob(&blob_hash, MATERIALIZER_VERSION).await;
+        tokio::task::spawn_blocking(move || {
+            let asset = materialize_bytes(&root, source_hash, bytes)?;
+            Ok((asset, publication))
+        })
+        .await
+        .map_err(|error| {
+            AssetMaterializationError::new(
+                AssetFailureKind::Retryable,
+                "materializer_join_failed",
+                format!("join image materialization task: {error}"),
+            )
+        })?
     }
 
-    pub async fn remove_blob(&self, blob_hash: &str, extension: &str) -> AnyResult<()> {
+    pub async fn remove_blob(
+        &self,
+        pruning: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        blob_hash: &str,
+        extension: &str,
+        version: i32,
+    ) -> AnyResult<()> {
         let paths = [
-            self.path(blob_hash, "original", extension),
-            self.path(blob_hash, "128", extension),
-            self.path(blob_hash, "512", extension),
+            self.versioned_path(blob_hash, version, "original", extension),
+            self.versioned_path(blob_hash, version, "128", extension),
+            self.versioned_path(blob_hash, version, "512", extension),
         ];
         if paths.iter().any(Option::is_none) {
             anyhow::bail!("invalid Library asset blob identity");
         }
         let paths = paths.map(Option::unwrap);
+        let pruning = pruning.clone();
         tokio::task::spawn_blocking(move || {
+            // The unlink can outlive the awaiting worker if its lease is cancelled.
+            let _pruning = pruning;
             for path in paths {
                 match std::fs::remove_file(path) {
                     Ok(()) => {}
@@ -307,6 +360,17 @@ fn public_ipv4([a, b, c, _d]: [u8; 4]) -> bool {
         || (a == 203 && b == 0 && c == 113))
 }
 
+fn blob_directory(root: &Path, hash: &str, version: i32) -> PathBuf {
+    // Version one is the on-disk layout used by existing installations.
+    let directory = root.join("blobs");
+    let directory = if version == 1 {
+        directory
+    } else {
+        directory.join(format!("v{version}"))
+    };
+    directory.join(&hash[..2])
+}
+
 fn materialize_bytes(
     root: &Path,
     source_hash: String,
@@ -337,22 +401,25 @@ fn materialize_bytes(
     limits.max_image_height = Some(MAX_DIMENSION);
     limits.max_alloc = Some(512 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().map_err(|error| {
-        AssetMaterializationError::new(
-            AssetFailureKind::Unsupported,
-            "decode_failed",
-            format!("decode artwork: {error}"),
-        )
-    })?;
-    let (width, height) = image.dimensions();
-    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+    let (width, height) = ImageReader::with_format(Cursor::new(&bytes), format)
+        .into_dimensions()
+        .map_err(|error| {
+            unsupported("decode_failed", format!("read artwork dimensions: {error}"))
+        })?;
+    if width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_PIXELS
+    {
         return Err(unsupported(
             "decoded_too_large",
-            "artwork exceeds the 64 megapixel decoded limit",
+            "artwork exceeds its decoded size limit",
         ));
     }
+    let image = reader
+        .decode()
+        .map_err(|error| unsupported("decode_failed", format!("decode artwork: {error}")))?;
     let blob_hash = hex::encode(Sha256::digest(&bytes));
-    let directory = root.join("blobs").join(&blob_hash[..2]);
+    let directory = blob_directory(root, &blob_hash, MATERIALIZER_VERSION);
     std::fs::create_dir_all(&directory).map_err(|error| retryable("store_write_failed", error))?;
     atomic_write(&directory.join(format!("{blob_hash}.{extension}")), &bytes)
         .map_err(|error| retryable("store_write_failed", error))?;

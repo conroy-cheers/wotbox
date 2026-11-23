@@ -57,12 +57,14 @@ export function releaseViewPath(
   source: ReleaseSource = "search",
   attachment?: ReleaseAttachment,
   expanded = false,
-  showClientDetails = false
+  showClientDetails = false,
+  tracker?: string
 ): string {
   return browserViewPath(
     `/releases/${encodeURIComponent(releaseId ?? "unresolved")}`,
     {
       torrent: torrentId,
+      tracker,
       client: attachment?.client,
       hash: attachment?.infoHash,
       from: source,
@@ -70,6 +72,17 @@ export function releaseViewPath(
       details: showClientDetails ? "client" : undefined
     }
   );
+}
+
+export function selectReleaseVariant<T extends { tracker: string; torrentId: number }>(
+  variants: readonly T[],
+  torrentId: number | undefined,
+  tracker?: string
+): T | undefined {
+  if (torrentId == null) return undefined;
+  const matches = variants.filter((variant) => variant.torrentId === torrentId
+    && (tracker == null || variant.tracker.toLowerCase() === tracker.toLowerCase()));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 export function selectReleaseAttachment<T extends ReleaseAttachment>(

@@ -47,7 +47,7 @@
       if ($availability !== "all") params.set("availability", $availability);
       return {
         queryKey: ["library", $search, $tracker, $format, $availability, $limit] as const,
-        queryFn: () => api<LibraryArtistsPage>(`/api/v1/library/artists?${params}`),
+        queryFn: ({ signal }: { signal: AbortSignal }) => api<LibraryArtistsPage>(`/api/v1/library/artists?${params}`, { signal }),
         staleTime: 30_000
       };
     }
@@ -288,7 +288,7 @@
                 <TrackerLinks sources={item.release.sources} tracker={item.release.tracker} groupId={item.release.groupId} />
                 <div class="variant-chips">
                   {#each item.variants as variant}
-                    <a href={item.release.id ? appPath(`/releases/${item.release.id}?torrent=${variant.torrentId}&from=library`) : undefined}>
+                    <a href={item.release.id ? appPath(`/releases/${item.release.id}?torrent=${variant.torrentId}&tracker=${encodeURIComponent(variant.tracker)}&from=library`) : undefined}>
                       {[variant.format, variant.encoding].filter(Boolean).join(" · ") || "Unknown format"}
                     </a>
                   {/each}

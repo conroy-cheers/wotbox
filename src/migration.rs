@@ -44,6 +44,14 @@ impl MigratorTrait for Migrator {
             Box::new(IncrementalLibraryProjectionSchema),
             Box::new(ProjectionTriggerSemantics),
             Box::new(ProjectionSemanticUpdates),
+            Box::new(AcquisitionTransactions),
+            Box::new(PackCapacityReservations),
+            Box::new(DirtyLibraryAdmissions),
+            Box::new(InventoryGenerations),
+            Box::new(VersionedAssetBlobs),
+            Box::new(PhysicalImportTargets),
+            Box::new(StagedLibraryProjection),
+            Box::new(LibraryStatusRevision),
         ]
     }
 }
@@ -1805,4 +1813,525 @@ async fn create_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager.create_index(index).await?;
     }
     Ok(())
+}
+
+struct AcquisitionTransactions;
+
+impl MigrationName for AcquisitionTransactions {
+    fn name(&self) -> &str {
+        "m20260901_000023_acquisition_transactions"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for AcquisitionTransactions {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        create_entity(
+            manager,
+            &schema,
+            crate::entity::channel_pack_receipt::Entity,
+        )
+        .await?;
+        for (column, kind) in [("scan_section", "INTEGER"), ("scan_root", "TEXT")] {
+            if !manager.has_column("import_supersessions", column).await? {
+                manager
+                    .get_connection()
+                    .execute_unprepared(&format!(
+                        "ALTER TABLE import_supersessions ADD COLUMN {column} {kind}"
+                    ))
+                    .await?;
+            }
+        }
+        manager.get_connection().execute_unprepared(
+            "CREATE INDEX idx_import_supersessions_source ON import_supersessions(source_client, source_info_hash);
+             CREATE INDEX idx_download_jobs_profile_hash ON download_jobs(profile, info_hash);
+             CREATE TABLE library_admission_cursor (id INTEGER PRIMARY KEY, release_id TEXT NOT NULL);
+             CREATE TABLE library_blob_tombstones (blob_hash TEXT PRIMARY KEY, extension TEXT NOT NULL);
+             CREATE TABLE download_request_receipts (
+                 request_key TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES download_jobs(id),
+                 tracker TEXT NOT NULL, torrent_id INTEGER NOT NULL, profile TEXT NOT NULL, use_token INTEGER NOT NULL
+             );
+             CREATE TABLE download_destinations (
+                 job_id TEXT PRIMARY KEY REFERENCES download_jobs(id), profile_json TEXT NOT NULL,
+                 client TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE INDEX idx_download_destinations_client ON download_destinations(client, job_id);
+             INSERT INTO download_request_receipts
+                 SELECT idempotency_key, id, tracker, torrent_id, profile, use_token FROM download_jobs
+                  WHERE idempotency_key IS NOT NULL;
+             CREATE TABLE provider_request_windows (
+                 provider_id TEXT PRIMARY KEY REFERENCES provider_states(id), windows_json TEXT NOT NULL
+             );
+             CREATE TABLE change_epoch (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO change_epoch VALUES (1, lower(hex(randomblob(16))));"
+        ).await?;
+        let connection = manager.get_connection();
+        connection.execute_unprepared(
+            "CREATE TABLE pack_input_revision (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+             INSERT INTO pack_input_revision VALUES (1, 0);"
+        ).await?;
+        for (table, fields) in [
+            ("download_jobs", &["state", "info_hash", "profile"][..]),
+            (
+                "download_release_links",
+                &[
+                    "present",
+                    "release_id",
+                    "tracker",
+                    "torrent_id",
+                    "library_added_at",
+                    "completed_at",
+                ][..],
+            ),
+            (
+                "import_tasks",
+                &["state", "release_id", "client", "info_hash"][..],
+            ),
+        ] {
+            for (op, suffix) in [
+                ("INSERT", "insert"),
+                ("UPDATE", "update"),
+                ("DELETE", "delete"),
+            ] {
+                let guard = if op == "UPDATE" {
+                    format!(
+                        "WHEN {}",
+                        fields
+                            .iter()
+                            .map(|field| format!("OLD.{field} IS NOT NEW.{field}"))
+                            .collect::<Vec<_>>()
+                            .join(" OR ")
+                    )
+                } else {
+                    String::new()
+                };
+                connection.execute_unprepared(&format!(
+                    "CREATE TRIGGER pack_input_{table}_{suffix} AFTER {op} ON {table} {guard}
+                     BEGIN UPDATE pack_input_revision SET revision = revision + 1 WHERE id = 1; END;"
+                )).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for table in ["download_jobs", "download_release_links", "import_tasks"] {
+            for operation in ["insert", "update", "delete"] {
+                manager
+                    .get_connection()
+                    .execute_unprepared(&format!("DROP TRIGGER pack_input_{table}_{operation}"))
+                    .await?;
+            }
+        }
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "DROP TABLE pack_input_revision;
+             DROP TABLE change_epoch;
+             DROP TABLE provider_request_windows;
+             DROP TABLE download_destinations;
+             DROP TABLE download_request_receipts;
+             DROP TABLE library_blob_tombstones;
+             DROP TABLE library_admission_cursor;
+             DROP INDEX idx_download_jobs_profile_hash;
+             DROP INDEX idx_import_supersessions_source;
+             ALTER TABLE import_supersessions DROP COLUMN scan_root;
+             ALTER TABLE import_supersessions DROP COLUMN scan_section;
+             DROP TABLE channel_pack_receipts;",
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+struct PackCapacityReservations;
+
+impl MigrationName for PackCapacityReservations {
+    fn name(&self) -> &str {
+        "m20260901_000024_pack_capacity_reservations"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for PackCapacityReservations {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TABLE pack_capacity_reservations (
+                 job_id TEXT PRIMARY KEY REFERENCES download_jobs(id) ON DELETE CASCADE,
+                 client TEXT NOT NULL,
+                 reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes > 0)
+             );
+             CREATE INDEX idx_pack_capacity_client ON pack_capacity_reservations(client);",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DROP TABLE pack_capacity_reservations;")
+            .await?;
+        Ok(())
+    }
+}
+
+struct DirtyLibraryAdmissions;
+
+impl MigrationName for DirtyLibraryAdmissions {
+    fn name(&self) -> &str {
+        "m20260901_000025_dirty_library_admissions"
+    }
+}
+
+const ADMISSION_DEPENDENCIES: &[(&str, &str, &str)] = &[
+    ("download_release_links", "release_id, library_added_at", "SELECT $row.release_id AS release_id WHERE $row.library_added_at IS NOT NULL"),
+    ("canonical_releases", "artwork", "SELECT $row.id AS release_id"),
+    ("canonical_release_credits", "release_id, artist_id, role", "SELECT $row.release_id AS release_id WHERE $row.role = 'primary'"),
+    ("canonical_artists", "artwork", "SELECT release_id FROM canonical_release_credits WHERE artist_id = $row.id AND role = 'primary'"),
+    ("artist_sources", "canonical_artist_id, tracker, artist_id", "SELECT release_id FROM canonical_release_credits WHERE artist_id = $row.canonical_artist_id AND role = 'primary'"),
+    ("tracker_snapshots", "tracker, resource_kind, resource_key", "
+         SELECT credit.release_id FROM artist_sources source
+         JOIN canonical_release_credits credit ON credit.artist_id = source.canonical_artist_id
+          AND credit.role = 'primary'
+         WHERE $row.resource_kind = 'artist' AND source.tracker = $row.tracker
+          AND source.artist_id = CAST($row.resource_key AS INTEGER)"),
+    ("library_asset_references", "owner_id, owner_kind, source_url", "
+         SELECT $row.owner_id AS release_id WHERE $row.owner_kind = 'release'
+         UNION ALL SELECT release_id FROM canonical_release_credits
+             WHERE artist_id = $row.owner_id AND role = 'primary' AND $row.owner_kind = 'artist'
+         UNION ALL SELECT credit.release_id FROM artist_sources artist
+             JOIN canonical_release_credits credit ON credit.artist_id = artist.canonical_artist_id
+              AND credit.role = 'primary'
+             WHERE $row.owner_kind = 'catalog'
+              AND instr($row.owner_id, lower(artist.tracker) || ':' || artist.artist_id || ':') = 1"),
+    ("library_assets", "source_url, state", "
+         SELECT release_id FROM library_admission_asset_dependencies WHERE source_url = $row.source_url"),
+];
+
+#[async_trait]
+impl MigrationTrait for DirtyLibraryAdmissions {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection.execute_unprepared(r#"
+            CREATE TABLE library_admission_dirty (release_id TEXT PRIMARY KEY);
+            CREATE VIEW library_admission_asset_dependencies AS
+                SELECT ref.source_url, ref.owner_id AS release_id FROM library_asset_references ref
+                 WHERE ref.owner_kind = 'release'
+                UNION ALL
+                SELECT ref.source_url, credit.release_id FROM library_asset_references ref
+                  JOIN canonical_release_credits credit ON credit.artist_id = ref.owner_id
+                   AND credit.role = 'primary'
+                 WHERE ref.owner_kind = 'artist'
+                UNION ALL
+                SELECT ref.source_url, credit.release_id FROM library_asset_references ref
+                  JOIN artist_sources artist
+                    ON instr(ref.owner_id, lower(artist.tracker) || ':' || artist.artist_id || ':') = 1
+                  JOIN canonical_release_credits credit ON credit.artist_id = artist.canonical_artist_id
+                   AND credit.role = 'primary'
+                 WHERE ref.owner_kind = 'catalog';
+            CREATE TRIGGER wake_dirty_admission AFTER INSERT ON library_admission_dirty
+            BEGIN
+              UPDATE background_jobs SET next_run_at = NULL
+               WHERE deduplication_key = 'reconcile-library-admissions:v1'
+                 AND state IN ('pending', 'retrying') AND next_run_at IS NOT NULL;
+            END;
+        "#).await?;
+        for (table, fields, query) in ADMISSION_DEPENDENCIES {
+            for (name, event, rows) in [
+                ("insert", "INSERT".to_owned(), &["NEW"][..]),
+                ("update", format!("UPDATE OF {fields}"), &["OLD", "NEW"][..]),
+                ("delete", "DELETE".to_owned(), &["OLD"][..]),
+            ] {
+                let queries = rows.iter().map(|row| format!(
+                    "INSERT INTO library_admission_dirty(release_id)
+                     SELECT dependency.release_id FROM ({}) AS dependency
+                      WHERE dependency.release_id IS NOT NULL AND EXISTS (
+                         SELECT 1 FROM download_release_links link
+                          WHERE link.release_id = dependency.release_id AND link.library_added_at IS NOT NULL
+                         UNION ALL SELECT 1 FROM library_admissions admitted
+                          WHERE admitted.release_id = dependency.release_id LIMIT 1
+                      ) ON CONFLICT(release_id) DO NOTHING;",
+                    query.replace("$row", row),
+                )).collect::<Vec<_>>().join("\n");
+                let guard = if name == "update" {
+                    format!(
+                        "WHEN {}",
+                        fields
+                            .split(", ")
+                            .map(|field| format!("OLD.{field} IS NOT NEW.{field}"))
+                            .collect::<Vec<_>>()
+                            .join(" OR ")
+                    )
+                } else {
+                    String::new()
+                };
+                connection
+                    .execute_unprepared(&format!(
+                    "CREATE TRIGGER dirty_admission_{table}_{name} AFTER {event} ON {table} {guard}
+                     BEGIN {queries} END;"
+                ))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        for (table, _, _) in ADMISSION_DEPENDENCIES {
+            for event in ["insert", "update", "delete"] {
+                connection
+                    .execute_unprepared(&format!("DROP TRIGGER dirty_admission_{table}_{event}"))
+                    .await?;
+            }
+        }
+        connection
+            .execute_unprepared(
+                "DROP TRIGGER wake_dirty_admission;
+            DROP VIEW library_admission_asset_dependencies; DROP TABLE library_admission_dirty;",
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+struct InventoryGenerations;
+
+impl MigrationName for InventoryGenerations {
+    fn name(&self) -> &str {
+        "m20260901_000026_inventory_generations"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for InventoryGenerations {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+            CREATE TABLE client_inventory_generations (
+                client TEXT PRIMARY KEY,
+                generation TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                published_at TEXT NOT NULL
+            );
+            CREATE TABLE client_inventory_members (
+                client TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                info_hash TEXT NOT NULL,
+                observed_json TEXT,
+                torrent_name TEXT,
+                announce_host TEXT,
+                tracker TEXT,
+                PRIMARY KEY (client, generation, info_hash)
+            ) WITHOUT ROWID;
+        "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "DROP TABLE client_inventory_members; DROP TABLE client_inventory_generations;",
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+struct VersionedAssetBlobs;
+
+impl MigrationName for VersionedAssetBlobs {
+    fn name(&self) -> &str {
+        "m20260901_000027_versioned_asset_blobs"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for VersionedAssetBlobs {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.get_connection().execute_unprepared(r#"
+            ALTER TABLE library_blob_tombstones RENAME TO legacy_blob_tombstones;
+            CREATE TABLE library_blob_tombstones (
+                blob_hash TEXT NOT NULL, extension TEXT NOT NULL, materializer_version INTEGER NOT NULL,
+                PRIMARY KEY (blob_hash, materializer_version)
+            ) WITHOUT ROWID;
+            INSERT INTO library_blob_tombstones SELECT blob_hash, extension, 1 FROM legacy_blob_tombstones;
+            DROP TABLE legacy_blob_tombstones;
+            CREATE INDEX idx_asset_blob_version ON library_assets(blob_hash, materializer_version);
+        "#).await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.get_connection().execute_unprepared(r#"
+            ALTER TABLE library_blob_tombstones RENAME TO versioned_blob_tombstones;
+            CREATE TABLE library_blob_tombstones (blob_hash TEXT PRIMARY KEY, extension TEXT NOT NULL);
+            INSERT INTO library_blob_tombstones
+                SELECT blob_hash, extension FROM versioned_blob_tombstones WHERE materializer_version = 1;
+            DROP TABLE versioned_blob_tombstones;
+            DROP INDEX idx_asset_blob_version;
+        "#).await?;
+        Ok(())
+    }
+}
+
+struct PhysicalImportTargets;
+
+impl MigrationName for PhysicalImportTargets {
+    fn name(&self) -> &str {
+        "m20260901_000028_physical_import_targets"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for PhysicalImportTargets {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+            CREATE TABLE configured_client_instances (
+                client TEXT PRIMARY KEY, instance TEXT NOT NULL
+            );
+            ALTER TABLE download_destinations ADD COLUMN client_instance TEXT;
+            ALTER TABLE import_supersessions ADD COLUMN client_instance TEXT;
+            ALTER TABLE import_tasks ADD COLUMN target_instance TEXT;
+            CREATE TABLE physical_import_targets (
+                client TEXT NOT NULL, info_hash TEXT NOT NULL, PRIMARY KEY (client, info_hash)
+            ) WITHOUT ROWID;
+            INSERT INTO physical_import_targets(client, info_hash)
+                SELECT DISTINCT client, lower(info_hash) FROM import_tasks
+                 WHERE client IS NOT NULL AND info_hash IS NOT NULL;
+            CREATE TABLE replacement_import_receipts (
+                request_key TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES import_tasks(id)
+            );
+            CREATE TABLE import_observation_aliases (
+                observation_id TEXT PRIMARY KEY REFERENCES import_tasks(id),
+                import_id TEXT NOT NULL REFERENCES import_tasks(id)
+            );
+            DROP INDEX idx_import_tasks_client_hash;
+            DROP INDEX idx_import_tasks_download_job;
+            CREATE INDEX idx_import_tasks_client_hash ON import_tasks(client, info_hash);
+            CREATE INDEX idx_import_tasks_download_job ON import_tasks(download_job_id);
+            CREATE UNIQUE INDEX idx_single_source_removal
+                ON import_supersessions(source_client, source_info_hash)
+                WHERE cleanup_state = 'removing';
+        "#,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // The new schema can hold several authorized intents for the same
+        // target. Older binaries cannot represent that data faithfully.
+        Err(DbErr::Custom(
+            "Physical import targets require a forward migration".into(),
+        ))
+    }
+}
+
+struct StagedLibraryProjection;
+
+impl MigrationName for StagedLibraryProjection {
+    fn name(&self) -> &str {
+        "m20260901_000029_staged_library_projection"
+    }
+}
+
+#[async_trait]
+impl MigrationTrait for StagedLibraryProjection {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.get_connection().execute_unprepared("
+            ALTER TABLE library_projection_state ADD COLUMN generation TEXT;
+            ALTER TABLE library_projection_state ADD COLUMN input_revision INTEGER NOT NULL DEFAULT 0;
+            CREATE TRIGGER library_projection_input_insert AFTER INSERT ON library_projection_dirty
+            BEGIN UPDATE library_projection_state SET input_revision = input_revision + 1 WHERE id = 1; END;
+            CREATE TRIGGER library_projection_input_update AFTER UPDATE ON library_projection_dirty
+            BEGIN UPDATE library_projection_state SET input_revision = input_revision + 1 WHERE id = 1; END;
+            CREATE TABLE library_projection_stage (
+                generation TEXT NOT NULL, kind TEXT NOT NULL, document_json TEXT NOT NULL
+            );
+            CREATE INDEX idx_library_projection_stage_generation ON library_projection_stage(generation, kind);
+        ").await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "
+            DROP TABLE library_projection_stage;
+            DROP TRIGGER library_projection_input_insert;
+            DROP TRIGGER library_projection_input_update;
+            ALTER TABLE library_projection_state DROP COLUMN input_revision;
+            ALTER TABLE library_projection_state DROP COLUMN generation;
+        ",
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+struct LibraryStatusRevision;
+
+impl MigrationName for LibraryStatusRevision {
+    fn name(&self) -> &str {
+        "m20260901_000030_library_status_revision"
+    }
+}
+
+const LIBRARY_STATUS_INPUTS: &[(&str, &str)] = &[
+    ("download_client_scans", "last_successful_at"),
+    ("release_track_indexes", "state"),
+    ("single_album_coverages", "state"),
+];
+
+#[async_trait]
+impl MigrationTrait for LibraryStatusRevision {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        db.execute_unprepared("CREATE TABLE library_status_revision (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+            INSERT INTO library_status_revision VALUES (1, 0);").await?;
+        for (table, column) in LIBRARY_STATUS_INPUTS {
+            for (name, operation, constraint) in [
+                ("insert", "INSERT".to_owned(), String::new()),
+                (
+                    "update",
+                    format!("UPDATE OF {column}"),
+                    format!("WHEN OLD.{column} IS NOT NEW.{column}"),
+                ),
+                ("delete", "DELETE".to_owned(), String::new()),
+            ] {
+                db.execute_unprepared(&format!(
+                    "CREATE TRIGGER library_status_{table}_{name} AFTER {operation} ON {table} {constraint}
+                     BEGIN UPDATE library_status_revision SET version = version + 1 WHERE id = 1; END;"
+                )).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        for (table, _) in LIBRARY_STATUS_INPUTS {
+            for event in ["insert", "update", "delete"] {
+                db.execute_unprepared(&format!("DROP TRIGGER library_status_{table}_{event}"))
+                    .await?;
+            }
+        }
+        db.execute_unprepared("DROP TABLE library_status_revision")
+            .await?;
+        Ok(())
+    }
 }
